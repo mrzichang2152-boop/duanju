@@ -1,0 +1,81 @@
+@import "tailwindcss";
+
+:root {
+  --background: #ffffff;
+  --foreground: #171717;
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --font-sans: var(--font-geist-sans);
+  --font-mono: var(--font-geist-mono);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --background: #0a0a0a;
+    --foreground: #ededed;
+  }
+}
+
+body {
+  background: var(--background);
+  color: var(--foreground);
+  font-family: Arial, Helvetica, sans-serif;
+}
+
+.markdown-preview table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 1rem 0;
+  font-size: 0.875rem;
+  min-width: 800px; /* Ensure table has minimum width to trigger scroll on small screens */
+}
+
+.markdown-preview th {
+  background-color: #e2e8f0; /* Darker header background */
+  border: 2px solid #94a3b8; /* Thicker, visible border */
+  padding: 1rem; /* More padding */
+  text-align: left;
+  font-weight: 700;
+  color: #0f172a;
+  white-space: nowrap; /* Keep headers on one line if possible */
+  position: sticky; /* Sticky header for vertical scrolling */
+  top: 0;
+  z-index: 10;
+}
+
+.markdown-preview td {
+  border: 1px solid #94a3b8; /* Visible border */
+  padding: 1rem; /* More padding */
+  color: #334155;
+  vertical-align: top;
+  min-width: 120px; /* Prevent columns from being too narrow */
+  line-height: 1.6;
+}
+
+.markdown-preview tr:nth-child(even) {
+  background-color: #f1f5f9;
+}
+
+.markdown-preview ul, .markdown-preview ol {
+  padding-left: 1.5rem;
+  margin: 0.5rem 0;
+}
+
+.markdown-preview li {
+  margin: 0.25rem 0;
+}
+
+.markdown-preview h1, .markdown-preview h2, .markdown-preview h3 {
+  font-weight: 600;
+  margin-top: 1.5rem;
+  margin-bottom: 0.5rem;
+  color: #0f172a;
+}
+
+.markdown-preview p {
+  margin: 0.5rem 0;
+  line-height: 1.6;
+}

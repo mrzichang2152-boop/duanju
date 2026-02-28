@@ -1,0 +1,48 @@
+# OS
+.DS_Store
+Thumbs.db
+
+# VibeCoding / AI Generated
+.vibecoding/
+.ai/
+tmp/
+*.log
+*.tmp
+temp/
+docs/scratchpad/
+
+# Python / Backend
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+.venv/
+env/
+.env
+.pytest_cache/
+htmlcov/
+dist/
+build/
+*.egg-info/
+backend/.env
+backend/*.db
+
+# Node.js / Frontend
+node_modules/
+npm-debug.log
+yarn-error.log
+.next/
+out/
+build/
+dist/
+frontend/.env
+frontend/.env.local
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Docker
+docker-compose.override.yml
