@@ -18,7 +18,7 @@ export default function ScriptResourcesPage() {
   const [generating, setGenerating] = useState(false);
   const [isModifying, setIsModifying] = useState(false);
   const [instruction, setInstruction] = useState("");
-  const [selectedModel, setSelectedModel] = useState("gemini3flash");
+  const [selectedModel, setSelectedModel] = useState("doubao-seed-2-0-pro-260215");
   const [message, setMessage] = useState<string | null>(null);
 
   const saveTimeoutRef = useRef<NodeJS.Timeout | null>(null);
@@ -207,8 +207,7 @@ export default function ScriptResourcesPage() {
                   onChange={(e) => setSelectedModel(e.target.value)}
                   className="w-full rounded-lg border border-slate-200 px-2 py-1.5 text-xs outline-none focus:border-indigo-500 sm:w-32"
                 >
-                  <option value="gemini3flash">Gemini 3 Flash</option>
-                  <option value="gemini3.1">Gemini 3.1 Pro</option>
+                  <option value="doubao-seed-2-0-pro-260215">Doubao 2.0 Pro</option>
                 </select>
                 <div className="flex flex-1 gap-2">
                   <input

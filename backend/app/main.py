@@ -1,7 +1,7 @@
 from contextlib import asynccontextmanager
 import logging
 
-from fastapi import FastAPI
+from fastapi import FastAPI, APIRouter
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.api import assets, auth, final, health, linkapi, projects, script, segments, settings as settings_api, templates
@@ -27,12 +27,18 @@ app.add_middleware(
     allow_headers=["*"],
 )
 app.include_router(health.router)
-app.include_router(auth.router, prefix="/auth", tags=["auth"])
-app.include_router(projects.router, prefix="/projects", tags=["projects"])
-app.include_router(script.router, prefix="/projects", tags=["script"])
-app.include_router(assets.router, prefix="/projects", tags=["assets"])
-app.include_router(segments.router, prefix="/projects", tags=["segments"])
-app.include_router(final.router, prefix="/projects", tags=["final"])
-app.include_router(settings_api.router, prefix="/settings", tags=["settings"])
-app.include_router(linkapi.router, prefix="/linkapi", tags=["linkapi"])
-app.include_router(templates.router, prefix="/projects", tags=["templates"])
+
+api_router = APIRouter()
+api_router.include_router(auth.router, prefix="/auth", tags=["auth"])
+api_router.include_router(projects.router, prefix="/projects", tags=["projects"])
+api_router.include_router(script.router, prefix="/projects", tags=["script"])
+api_router.include_router(assets.router, prefix="/projects", tags=["assets"])
+api_router.include_router(segments.router, prefix="/projects", tags=["segments"])
+api_router.include_router(final.router, prefix="/projects", tags=["final"])
+api_router.include_router(settings_api.router, prefix="/settings", tags=["settings"])
+api_router.include_router(linkapi.router, prefix="/linkapi", tags=["linkapi"])
+api_router.include_router(templates.router, prefix="/projects", tags=["templates"])
+
+app.include_router(api_router, prefix="/api")
+app.include_router(api_router)
+

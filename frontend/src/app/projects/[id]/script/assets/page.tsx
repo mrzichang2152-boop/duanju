@@ -179,11 +179,11 @@ export default function AssetsPage() {
       const [modelsRaw, settings] = await Promise.all([getModels(token), getSettings(token)]);
       const models = extractModels(modelsRaw);
       const filtered = filterModels(models, "image");
-      if (!filtered.includes("google/gemini-3-pro-image-preview")) {
-        filtered.unshift("google/gemini-3-pro-image-preview");
+      if (!filtered.includes("doubao-seedream-4-5-251128")) {
+        filtered.unshift("doubao-seedream-4-5-251128");
       }
       setImageModels(filtered);
-      setDefaultImageModel(settings.default_model_image);
+      setDefaultImageModel("doubao-seedream-4-5-251128");
     } catch (err) {
       setError(err instanceof Error ? err.message : "加载失败");
     } finally {

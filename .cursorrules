@@ -53,5 +53,5 @@ Your goal is to build a robust, modular, and maintainable Short Play Generation 
 4.  **Decoupling**: 各模块间解耦，方便后续的迭代与维护。
 5.  **Chinese**: 所有的回复都用中文。
 6.  **Sync Docs**: 在用户对需求进行修改的时候要同时修改 PRD 和技术文档。
-7.  **Progress Tracking**: 维护一个整体的进度列表 (`PROGRESS.md`)，记录所有的操作（功能、Bug 等）。
+7.  **Progress Tracking**: 维护一个整体的进度列表 (`PROGRESS.md`)，记录所有的操作（功能、Bug修复 等）。
 8.  **Verification**: 所有的任务都必须验证过之后再进行交付。

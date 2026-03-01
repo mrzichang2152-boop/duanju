@@ -3,17 +3,30 @@
 本文档用于追踪项目的所有变更、功能新增、Bug 修复以及待办事项。所有主要的开发活动必须在此记录。
 
 ## 待办事项 (Backlog)
-- [ ] 初始化项目结构 (Frontend/Backend)
-- [ ] 搭建 PostgreSQL 数据库与 ORM 模型
-- [ ] 实现用户认证 (Login/Register)
-- [ ] 实现 Step 1: 剧本生成与编辑 API
-- [ ] 集成 LinkAPI (文本模型)
-- [ ] 实现 Step 2: 角色/场景资产提取与生成
-- [ ] 实现 Step 3: 视频分段生成
-- [ ] 实现 Step 4: 视频合并 (FFmpeg)
-- [ ] 部署准备 (Docker/Aliyun)
+- [ ] 优化视频生成逻辑 (Step 5)
+- [ ] 完善前端错误提示与加载状态
+- [ ] 部署准备 (Docker/Aliyun) - 已部署 v5/v6
 
 ## 已完成 (Completed)
+
+### 2026-03-01 (Volcengine Migration & Fixes)
+- **后端**: Step 2/3 LLM 模型全面迁移至 Volcengine Doubao 2.0 Pro。
+- **后端**: Step 4 图片生成模型迁移至 `doubao-seedream-4-5-251128`。
+- **后端**: 修复 `linkapi.py` 中 Volcengine 参数透传逻辑 (sequential_image_generation, watermark 等)。
+- **后端**: 实现 `extract_assets_from_script` 使用 LLM 进行智能提取，替代正则表达式。
+- **后端**: 修复 Step 2 前端模型选择器，仅展示可用模型。
+- **配置**: 更新 `next.config.ts` 允许 Volcengine 图片域名。
+- **后端**: **重大变更** - 图片生成直接下载并存储为 Base64 Data URI，不再依赖临时 URL。
+- **后端**: 修复图生图 (Image-to-Image) 逻辑，支持透传 Base64 图片数据至 Volcengine。
+- **后端**: 优化 `size` 参数处理，默认使用 `2K` 并自动升级过小的尺寸 (1024x1024 -> 2048x2048 等) 以满足模型最小像素要求。
+- **后端**: **核心修复**: 实现输入 `image_url` 自动下载并转换为 Base64 Data URI，确保 "直接发送图片" 给火山引擎 API。
+- **后端**: 优化 `assets.py` 中的提示词生成逻辑，移除 `bikini`, `swimwear` 等敏感关键词，防止触发火山引擎内容安全拦截。
+- **后端**: 增强 `linkapi.py` 错误处理，增加对 `OutputImageSensitiveContentDetected` 错误码的识别，返回友好提示。
+- **验证**: 创建 `test_volc_safe.py` 验证修复后的提示词可正常生成图片。
+- **验证**: 创建 `test_volc_sensitive.py` 复现并确认敏感内容拦截机制。
+- **后端**: 修复图生图 (Image-to-Image) 参数传递错误，针对 `doubao-seedream` 模型强制使用 `image_urls` (list) 替代 `image_url`，解决参考图无效问题。
+- **验证**: 创建 `test_volc_img2img.py` 验证修复后的图生图功能，确认生成结果与参考图相关。
+- **部署**: 更新部署包 `deploy_update_v7.tar.gz`，包含上述修复。
 
 ### 2026-02-14
 - **文档**: 创建 `TECH_DESIGN.md`，定义技术架构与数据库设计。

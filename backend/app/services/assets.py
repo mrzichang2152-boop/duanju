@@ -1,17 +1,35 @@
+import json
+import ast
+import re
+from typing import Any
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.asset import Asset
 from app.models.asset_version import AssetVersion
 from app.models.script import Script
-from app.services.script_validation import (
-    _extract_props,
-    _extract_roles,
-    _extract_scenes,
-    _extract_sections,
-    _find_section,
-)
-import re
+from app.models.project import Project
+from app.services.linkapi import create_chat_completion
+
+
+def _extract_json_payload(text: str) -> dict[str, Any] | None:
+    if not text:
+        return None
+    fenced_match = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", text)
+    candidate = fenced_match.group(1) if fenced_match else text
+    start = candidate.find("{")
+    end = candidate.rfind("}")
+    if start == -1 or end == -1 or end <= start:
+        return None
+    snippet = candidate[start : end + 1]
+    try:
+        return json.loads(snippet)
+    except json.JSONDecodeError:
+        try:
+            parsed = ast.literal_eval(snippet)
+            return parsed if isinstance(parsed, dict) else None
+        except (ValueError, SyntaxError):
+            return None
 
 
 def _normalize_role_name(value: str) -> str:
@@ -155,16 +173,72 @@ async def get_asset(session: AsyncSession, asset_id: str) -> Asset | None:
     return await session.scalar(select(Asset).where(Asset.id == asset_id))
 
 
-async def extract_assets_from_script(session: AsyncSession, project_id: str) -> list[Asset]:
+async def extract_assets_from_script(
+    session: AsyncSession, project_id: str, user_id: str | None = None
+) -> list[Asset]:
     script = await session.scalar(
         select(Script).where(Script.project_id == project_id, Script.is_active == True)
     )
     if not script:
         return []
-    sections = _extract_sections(script.content)
-    roles_body = _find_section(sections, "【人物小传")
-    props_body = _find_section(sections, "【道具清单")
-    scenes_body = _find_section(sections, "【场景清单")
+
+    if not user_id:
+        project = await session.scalar(select(Project).where(Project.id == project_id))
+        if project:
+            user_id = project.user_id
+    
+    if not user_id:
+        # Should not happen ideally, but as fallback
+        return []
+
+    system_prompt = (
+        "你是专业的短剧剧本分析助手。请仔细阅读剧本，提取出所有的【角色】、【角色形象】、【道具】、【场景】信息。\n"
+        "请严格输出标准的 JSON 格式，不要包含任何 Markdown 代码块标记或其他文字。\n"
+        "JSON 结构如下：\n"
+        "{\n"
+        '  "characters": [{"name": "角色名", "description": "角色描述"}],\n'
+        '  "character_looks": [{"role": "角色名", "look": "形象名称", "description": "形象描述"}],\n'
+        '  "props": [{"name": "道具名", "description": "道具描述"}],\n'
+        '  "scenes": [{"name": "场景名", "description": "场景描述"}]\n'
+        "}\n"
+        "注意：\n"
+        "1. 角色名应去除括号备注。\n"
+        "2. 角色形象通常格式为“角色名：形象名”，请拆分。\n"
+        "3. 描述应尽可能详细，包含外貌、穿着、材质、光影等信息。\n"
+        "4. 如果剧本中没有某类信息，请返回空列表。"
+    )
+
+    try:
+        response = await create_chat_completion(
+            session,
+            user_id,
+            {
+                "model": "doubao-seed-2-0-pro-260215",  # Explicitly request Doubao 2.0
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": script.content},
+                ],
+                "temperature": 0.1,
+            },
+        )
+        content = ""
+        if isinstance(response, dict):
+             choices = response.get("choices") or []
+             if choices:
+                 content = choices[0].get("message", {}).get("content", "")
+        
+        data = _extract_json_payload(content) or {}
+    except Exception as e:
+        # Fallback or error logging
+        # For now, return empty if LLM fails, or maybe raise error?
+        # Returning empty means no assets extracted.
+        return []
+
+    extracted_characters = data.get("characters", [])
+    extracted_looks = data.get("character_looks", [])
+    extracted_props = data.get("props", [])
+    extracted_scenes = data.get("scenes", [])
+
     assets: list[Asset] = []
     existing = await list_assets(session, project_id)
     existing_map: dict[tuple[str, str], list[Asset]] = {}
@@ -172,95 +246,102 @@ async def extract_assets_from_script(session: AsyncSession, project_id: str) -> 
         existing_map.setdefault((asset.type, asset.name), []).append(asset)
     planned_keys = set(existing_map.keys())
 
-    if roles_body:
-        roles = _extract_roles(roles_body)
-        role_descriptions = _extract_role_descriptions(roles_body)
-        role_looks = _extract_role_looks(roles_body)
-        for role_name in roles.keys():
-            normalized_role = _normalize_role_name(role_name)
-            if not normalized_role:
-                continue
-            description = role_descriptions.get(normalized_role) or role_descriptions.get(role_name)
-            key = ("CHARACTER", normalized_role)
-            if key in existing_map:
-                for item in existing_map[key]:
-                    if description and description != item.description:
-                        item.description = description
-            elif key not in planned_keys:
-                assets.append(
-                    Asset(
-                        project_id=project_id,
-                        type="CHARACTER",
-                        name=normalized_role,
-                        description=description,
-                    )
+    # Process Characters
+    for item in extracted_characters:
+        name = _normalize_role_name(item.get("name", ""))
+        desc = item.get("description", "")
+        if not name:
+            continue
+        key = ("CHARACTER", name)
+        if key in existing_map:
+            for asset in existing_map[key]:
+                if desc and desc != asset.description:
+                    asset.description = desc
+        elif key not in planned_keys:
+            assets.append(
+                Asset(
+                    project_id=project_id,
+                    type="CHARACTER",
+                    name=name,
+                    description=desc,
                 )
-                planned_keys.add(key)
-            for label, look_desc in role_looks.get(normalized_role, []):
-                look_label = _normalize_look_label(label)
-                if not look_label:
-                    continue
-                look_name = f"{normalized_role}·{look_label}"
-                full_desc = look_desc
-                if description and look_desc:
-                    full_desc = f"角色描述：{description}；形象要求：{look_desc}"
-                look_key = ("CHARACTER_LOOK", look_name)
-                if look_key in existing_map:
-                    for item in existing_map[look_key]:
-                        if full_desc and full_desc != item.description:
-                            item.description = full_desc
-                elif look_key not in planned_keys:
-                    assets.append(
-                        Asset(
-                            project_id=project_id,
-                            type="CHARACTER_LOOK",
-                            name=look_name,
-                            description=full_desc or None,
-                        )
-                    )
-                    planned_keys.add(look_key)
+            )
+            planned_keys.add(key)
 
-    if props_body:
-        for prop_name, prop_desc in _extract_props_with_desc(props_body):
-            if not prop_name:
-                continue
-            key = ("PROP", prop_name)
-            if key in existing_map:
-                for item in existing_map[key]:
-                    if prop_desc and prop_desc != item.description:
-                        item.description = prop_desc
-            elif key not in planned_keys:
-                assets.append(
-                    Asset(
-                        project_id=project_id,
-                        type="PROP",
-                        name=prop_name,
-                        description=prop_desc or None,
-                    )
+    # Process Character Looks
+    for item in extracted_looks:
+        role = _normalize_role_name(item.get("role", ""))
+        look = item.get("look", "").strip()
+        desc = item.get("description", "")
+        if not role or not look:
+            continue
+        
+        # Ensure base character exists or is planned? 
+        # Actually we just add the look asset.
+        look_name = f"{role}·{look}"
+        
+        # Combine descriptions if needed, but LLM usually gives full description
+        full_desc = desc
+        
+        key = ("CHARACTER_LOOK", look_name)
+        if key in existing_map:
+            for asset in existing_map[key]:
+                if full_desc and full_desc != asset.description:
+                    asset.description = full_desc
+        elif key not in planned_keys:
+            assets.append(
+                Asset(
+                    project_id=project_id,
+                    type="CHARACTER_LOOK",
+                    name=look_name,
+                    description=full_desc,
                 )
-                planned_keys.add(key)
+            )
+            planned_keys.add(key)
 
-    if scenes_body:
-        scene_descriptions = _extract_scenes_with_desc(scenes_body)
-        for scene in _extract_scenes(scenes_body):
-            if not scene:
-                continue
-            description = scene_descriptions.get(scene)
-            key = ("SCENE", scene)
-            if key in existing_map:
-                for item in existing_map[key]:
-                    if description and description != item.description:
-                        item.description = description
-            elif key not in planned_keys:
-                assets.append(
-                    Asset(
-                        project_id=project_id,
-                        type="SCENE",
-                        name=scene,
-                        description=description,
-                    )
+    # Process Props
+    for item in extracted_props:
+        name = item.get("name", "").strip()
+        desc = item.get("description", "")
+        if not name:
+            continue
+        key = ("PROP", name)
+        if key in existing_map:
+            for asset in existing_map[key]:
+                if desc and desc != asset.description:
+                    asset.description = desc
+        elif key not in planned_keys:
+            assets.append(
+                Asset(
+                    project_id=project_id,
+                    type="PROP",
+                    name=name,
+                    description=desc,
                 )
-                planned_keys.add(key)
+            )
+            planned_keys.add(key)
+
+    # Process Scenes
+    for item in extracted_scenes:
+        name = item.get("name", "").strip()
+        desc = item.get("description", "")
+        if not name:
+            continue
+        key = ("SCENE", name)
+        if key in existing_map:
+            for asset in existing_map[key]:
+                if desc and desc != asset.description:
+                    asset.description = desc
+        elif key not in planned_keys:
+            assets.append(
+                Asset(
+                    project_id=project_id,
+                    type="SCENE",
+                    name=name,
+                    description=desc,
+                )
+            )
+            planned_keys.add(key)
 
     if assets:
         session.add_all(assets)

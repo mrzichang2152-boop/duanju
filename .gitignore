@@ -46,3 +46,11 @@ frontend/.env.local
 
 # Docker
 docker-compose.override.yml
+
+# Deployment artifacts and temporary scripts
+*.tar.gz
+deploy_*
+backup_*
+test_*
+upload_*
+copy_deploy_cmd.sh

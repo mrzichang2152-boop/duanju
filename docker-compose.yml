@@ -1,0 +1,48 @@
+version: '3.8'
+
+services:
+  backend:
+    build: ./backend
+    container_name: duanju-backend
+    restart: always
+    environment:
+      - DATABASE_URL=sqlite+aiosqlite:////app/data/db.sqlite3
+      - SECRET_KEY=changeme
+      - ACCESS_TOKEN_EXPIRE_MINUTES=10080
+      - CORS_ORIGINS=*
+    volumes:
+      - ./data:/app/data
+    ports:
+      - "8002:8000"
+    networks:
+      - duanju-net
+
+  frontend:
+    build:
+      context: ./frontend
+      args:
+        NEXT_PUBLIC_API_BASE_URL: /api
+    container_name: duanju-frontend
+    restart: always
+    ports:
+      - "3000:3000"
+    networks:
+      - duanju-net
+
+  nginx:
+    image: nginx:alpine
+    container_name: duanju-nginx
+    restart: always
+    ports:
+      - "80:80"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - frontend
+      - backend
+    networks:
+      - duanju-net
+
+networks:
+  duanju-net:
+    driver: bridge

@@ -26,7 +26,7 @@ const formatApiErrorDetail = (detail: ApiError["detail"]) => {
   return null;
 };
 
-const baseUrl = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://localhost:8002";
+const baseUrl = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://localhost:8002/api";
 
 const request = async <T>(
   path: string,
@@ -120,8 +120,12 @@ export type ScriptPayload = {
 };
 
 export type ScriptResponse = {
+  id?: string;
   project_id: string;
   content: string;
+  version?: number;
+  is_active?: boolean;
+  created_at?: string;
 };
 
 export const getScript = (token: string, id: string) =>
@@ -159,7 +163,7 @@ export const validateScript = (
   );
 
 export type ScriptGeneratePayload = {
-  mode: "format" | "complete" | "revise" | "extract_resources" | "generate_storyboard" | "step1_modify" | "step2_modify" | "suggestion_paid" | "suggestion_traffic";
+  mode: "format" | "complete" | "revise" | "extract_resources" | "generate_storyboard" | "step1_modify" | "step2_modify" | "suggestion_paid" | "suggestion_traffic" | "continuation" | "continuation_paid" | "continuation_traffic";
   content: string;
   model?: string;
   instruction?: string;
@@ -169,15 +173,113 @@ export type ScriptGenerateResponse = {
   content: string;
 };
 
-export const generateScript = (token: string, id: string, payload: ScriptGeneratePayload) =>
-  request<ScriptGenerateResponse>(
-    `/projects/${id}/script/generate`,
-    {
-      method: "POST",
-      body: JSON.stringify(payload),
+export const generateScript = (token: string, id: string, payload: ScriptGeneratePayload): Promise<ScriptGenerateResponse> => {
+  return new Promise((resolve, reject) => {
+    let content = "";
+    generateScriptStream(token, id, payload, (chunk) => {
+      if (chunk.choices?.[0]?.delta?.content) {
+        content += chunk.choices[0].delta.content;
+      }
+    })
+      .then(() => resolve({ content }))
+      .catch(reject);
+  });
+};
+
+export const generateScriptStream = async (
+  token: string,
+  id: string,
+  payload: ScriptGeneratePayload,
+  onChunk: (chunk: any) => void,
+  signal?: AbortSignal
+) => {
+  const baseUrl = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://localhost:8002/api";
+  const response = await fetch(`${baseUrl}/projects/${id}/script/generate`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${token}`,
     },
-    token
-  );
+    body: JSON.stringify(payload),
+    signal,
+  });
+
+  if (!response.ok) {
+    const errorText = await response.text();
+    let errorDetail = "Generation failed";
+    try {
+      const errorJson = JSON.parse(errorText);
+      errorDetail = formatApiErrorDetail(errorJson.detail) || errorText;
+    } catch {
+      errorDetail = errorText;
+    }
+    throw new Error(errorDetail);
+  }
+
+  if (!response.body) {
+    throw new Error("No response body");
+  }
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) {
+        break;
+      }
+
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split("\n\n");
+      buffer = lines.pop() || "";
+
+      for (const line of lines) {
+        if (line.trim().startsWith("data: ")) {
+          const data = line.trim().slice(6);
+          if (data === "[DONE]") return;
+          try {
+            const json = JSON.parse(data);
+            if (json.error) {
+              throw new Error(json.error);
+            }
+            onChunk(json);
+          } catch (e) {
+            if (e instanceof Error && JSON.parse(data).error) {
+               throw e;
+            }
+            console.error("Error parsing SSE data", e);
+          }
+        }
+      }
+    }
+  } catch (error: any) {
+    if (error.name === 'AbortError') {
+      console.log('Stream aborted');
+      return; // Silece abort error
+    }
+    throw error;
+  } finally {
+    reader.releaseLock();
+  }
+};
+
+export type ScriptHistoryItem = {
+  id: string;
+  project_id: string;
+  content: string;
+  version: number;
+  is_active: boolean;
+  created_at: string;
+};
+
+export type ScriptHistoryResponse = {
+  items: ScriptHistoryItem[];
+};
+
+export const getScriptHistory = (token: string, id: string) =>
+  request<ScriptHistoryResponse>(`/projects/${id}/script/history`, {}, token);
 
 export const extractAssets = (token: string, id: string) =>
   request<{ status: string }>(

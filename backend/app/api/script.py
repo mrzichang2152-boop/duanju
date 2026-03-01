@@ -1,7 +1,11 @@
 from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
-
+import json
+import logging
 from app.api.deps import get_current_user_id
+
+
 from app.core.db import get_db
 from app.schemas.script import (
     ScriptGenerateRequest,
@@ -10,14 +14,25 @@ from app.schemas.script import (
     ScriptResponse,
     ScriptValidationRequest,
     ScriptValidationResponse,
+    ScriptHistoryResponse,
+    ScriptHistoryItem,
 )
 from app.services.projects import get_project
 from app.services.script_validation import validate_script_with_model as run_validation
-from app.services.scripts import get_active_script, save_script
+from app.services.scripts import get_active_script, save_script, get_script_history
 from app.services.settings import get_or_create_settings
 import logging
 
-from app.services.linkapi import create_chat_completion
+from app.services.linkapi import create_chat_completion, create_chat_completion_stream
+
+from app.core.script_prompts import (
+    get_system_prompt,
+    PROMPT_SUGGESTION_PAID,
+    PROMPT_SUGGESTION_TRAFFIC,
+    PROMPT_CONTINUATION_DEFAULT,
+    PROMPT_CONTINUATION_TRAFFIC,
+    PROMPT_CONTINUATION_PAID,
+)
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -32,7 +47,16 @@ async def fetch_script(
     if not project:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="项目不存在")
     script = await get_active_script(db, project_id)
-    return ScriptResponse(project_id=project_id, content=script.content if script else "")
+    if not script:
+        return ScriptResponse(project_id=project_id, content="")
+    return ScriptResponse(
+        id=script.id,
+        project_id=project_id,
+        content=script.content,
+        version=script.version,
+        is_active=script.is_active,
+        created_at=script.created_at.isoformat() if script.created_at else None,
+    )
 
 
 @router.post("/{project_id}/script", response_model=ScriptResponse)
@@ -46,7 +70,42 @@ async def update_script(
     if not project:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="项目不存在")
     script = await save_script(db, project_id, payload.content)
-    return ScriptResponse(project_id=project_id, content=script.content)
+    return ScriptResponse(
+        id=script.id,
+        project_id=project_id,
+        content=script.content,
+        version=script.version,
+        is_active=script.is_active,
+        created_at=script.created_at.isoformat() if script.created_at else None,
+    )
+
+
+@router.get("/{project_id}/script/history", response_model=ScriptHistoryResponse)
+async def fetch_script_history(
+    project_id: str,
+    user_id: str = Depends(get_current_user_id),
+    db: AsyncSession = Depends(get_db),
+) -> ScriptHistoryResponse:
+    project = await get_project(db, user_id, project_id)
+    if not project:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="项目不存在")
+    history = await get_script_history(db, project_id)
+    
+    # Convert datetime to string
+    items = []
+    for item in history:
+        items.append(
+            ScriptHistoryItem(
+                id=item.id,
+                project_id=item.project_id,
+                content=item.content,
+                version=item.version,
+                is_active=item.is_active,
+                created_at=item.created_at.isoformat() if item.created_at else "",
+            )
+        )
+        
+    return ScriptHistoryResponse(items=items)
 
 
 @router.post("/{project_id}/script/validate", response_model=ScriptValidationResponse)
@@ -65,19 +124,7 @@ async def validate_script(
     )
 
 
-@router.post("/{project_id}/script/generate", response_model=ScriptGenerateResponse)
-async def generate_script(
-    project_id: str,
-    payload: ScriptGenerateRequest,
-    user_id: str = Depends(get_current_user_id),
-    db: AsyncSession = Depends(get_db),
-) -> ScriptGenerateResponse:
-    project = await get_project(db, user_id, project_id)
-    if not project:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="项目不存在")
-    settings = await get_or_create_settings(db, user_id)
-    model = payload.model or settings.default_model_text
-    
+def _get_generation_prompts(payload: ScriptGenerateRequest) -> tuple[str, str]:
     template_base = (
         "短剧空白剧本模板（AI生剧专用·表格版）\n"
         "\n"
@@ -143,6 +190,7 @@ async def generate_script(
         "不得把多个角色合并到角色1。角色块可按需重复且数量不设上限。"
     )
     
+    system_prompt = ""
     if payload.mode == "format":
         system_prompt = (
             "你是短剧剧本编辑助手。只做结构化整理，不新增剧情内容，不改写已有语义。"
@@ -188,13 +236,8 @@ async def generate_script(
             f"{template_storyboard}"
         )
     elif payload.mode == "step1_modify":
-        system_prompt = (
-            "你是专业的短剧剧本编辑助手。请根据用户的修改要求（如有），对提供的剧本/小说内容进行润色、修改或扩写。"
-            "你可以优化对白、调整节奏、丰富细节，或者根据用户指示进行特定修改。"
-            "请保持原文的格式风格，除非用户明确要求改变格式。"
-            "直接输出修改后的完整内容，不要包含任何解释性语言（如'好的，这是修改后的内容...'）。"
-            "输出为中文。"
-        )
+        # 动态获取行业级 Prompt
+        system_prompt = get_system_prompt(payload.instruction or "")
     elif payload.mode == "step2_modify":
         system_prompt = (
             "你是专业的短剧资源整理助手。请根据用户的修改要求，对提供的资源清单（人物小传、道具清单、场景清单）进行修改。"
@@ -205,151 +248,15 @@ async def generate_script(
             f"{role_rule}"
         )
     elif payload.mode == "suggestion_paid":
-        system_prompt = (
-            "系统角色设定\n"
-            "你是一名专注于竖屏长线付费短剧的结构变现优化专家。\n"
-            "任务\n"
-            "你需要给出剧本的修改建议\n"
-            "本剧结构：\n"
-            "前 5 集：3–5 分钟\n"
-            "后续每集：1–2 分钟\n"
-            "总集数：70–90 集\n"
-            "优化优先级排序：\n"
-            "首次付费转化率\n"
-            "复购率（连续付费能力）\n"
-            "人物依赖强度\n"
-            "情绪持续驱动力\n"
-            "结构稳定性\n"
-            "文学性与合理性不作为优先目标。\n\n"
-            "第一部分：核心变现驱动力分析\n"
-            "请分析：\n"
-            "主角是否具备“持续追随价值”？\n"
-            "是否具备人格缺陷？\n"
-            "是否具备成长承诺？\n"
-            "是否形成观众代偿通道？\n"
-            "反派压迫指数（1–10）\n"
-            "是否形成持续威胁？\n"
-            "是否会在20集后失去压迫力？\n"
-            "核心长期矛盾是否在第5集前明确？\n"
-            "本剧第一次付费动机类型属于哪种：\n"
-            "复仇兑现\n"
-            "身份曝光\n"
-            "权力翻盘\n"
-            "情感确认\n"
-            "生死揭晓\n"
-            "其他（请说明）\n"
-            "并判断该动机是否足够强烈。\n\n"
-            "第二部分：首次付费节点强度检测\n"
-            "请重点检测：\n"
-            "前 90 秒是否建立不可回避冲突？\n"
-            "前 3 集是否存在“非看不可”的未兑现承诺？\n"
-            "是否存在付费前超过 40 秒的情绪空窗？\n"
-            "是否存在“看完也能满足”的提前兑现风险？\n"
-            "预测：\n"
-            "最可能的掉量集数\n"
-            "首次付费断层原因\n"
-            "是否存在动机不足问题\n\n"
-            "第三部分：长线递增曲线检测\n"
-            "请绘制并判断：\n"
-            "情绪强度递增曲线（1–90 集）\n"
-            "反派压迫递增曲线\n"
-            "爽点释放间隔是否递减\n"
-            "20–40 集是否存在疲劳风险\n"
-            "45 集是否需要变量注入\n"
-            "60 集是否存在动力衰减\n"
-            "75 集是否存在终局预热不足\n"
-            "如存在问题，请给出结构强化方案。\n\n"
-            "第四部分：复购机制强化\n"
-            "请判断：\n"
-            "是否形成“人物依赖型追剧”？\n"
-            "是否存在关系变量可持续制造爽点？\n"
-            "是否存在阶段性情绪循环设计？\n"
-            "给出：\n"
-            "3 条结构级修改建议\n"
-            "2 段具体改写示例\n"
-            "3 个更强的付费钩子结尾示例\n\n"
-            "第五部分：变现优先级排序\n"
-            "请列出：\n"
-            "必须优先修改的三件事（按付费影响排序）\n"
-            "可提升复购率的结构调整\n"
-            "可增强人物依赖的变量植入方式\n"
-            "可增强长期付费冲动的桥段设计\n\n"
-            "核心原则\n"
-            "不删除用户类型\n"
-            "所有副类型必须服务长期变现\n"
-            "情绪承诺必须延迟兑现\n"
-            "稳定性优于极端冲突\n"
-            "爽点强度必须递增"
-        )
+        system_prompt = PROMPT_SUGGESTION_PAID
     elif payload.mode == "suggestion_traffic":
-        system_prompt = (
-            "系统角色设定\n"
-            "你是一名专注于竖屏平台算法优化的爆款结构专家。\n"
-            "任务\n"
-            "你需要给出剧本的修改建议\n"
-            "本剧结构：\n"
-            "前 5 集：3–5 分钟\n"
-            "后续每集：1–2 分钟\n"
-            "总集数：70–90 集\n"
-            "优化优先级排序：\n"
-            "前 3 秒停留率\n"
-            "前 90 秒留存率\n"
-            "单集完播率\n"
-            "情绪峰值密度\n"
-            "可传播桥段数量\n"
-            "允许合理性牺牲。\n"
-            "稳定性不是优先目标。\n\n"
-            "第一部分：开局攻击力检测\n"
-            "请检测：\n"
-            "前 3 秒是否具备视觉或信息冲击？\n"
-            "前 15 秒是否形成信息差？\n"
-            "前 90 秒是否存在强冲突？\n"
-            "第 1 集是否形成强悬念？\n"
-            "第 3 集是否形成第一次高潮？\n"
-            "若开局不炸，请给出强化方案。\n\n"
-            "第二部分：节奏与峰值密度检测\n"
-            "请判断：\n"
-            "每集是否存在明确情绪峰值？\n"
-            "爽点间隔是否超过合理区间？\n"
-            "是否存在超过 30 秒情绪缓冲段？\n"
-            "是否存在 2 集内无反转问题？\n"
-            "是否存在中段节奏塌陷？\n"
-            "预测：\n"
-            "哪一集可能爆\n"
-            "哪一集可能掉量\n"
-            "原因\n\n"
-            "第三部分：传播性强化\n"
-            "请分类设计：\n"
-            "可切片传播桥段\n"
-            "可引发评论争议类型：\n"
-            "价值观冲突\n"
-            "情感立场撕裂\n"
-            "权力压迫不公\n"
-            "认知反差\n"
-            "可制造情绪爆点的台词\n"
-            "可强化反差感的结构调整\n\n"
-            "第四部分：极限爆款重构\n"
-            "如果目标是冲峰值流量，请给出：\n"
-            "更炸裂的一句话梗概\n"
-            "更强开局版本\n"
-            "更高压中段版本\n"
-            "更极端高潮版本\n"
-            "2 段具体改写示例\n\n"
-            "第五部分：算法友好与风险检测\n"
-            "请判断：\n"
-            "前 3 秒吸引指数（1–10）\n"
-            "30 秒留存预估（高/中/低）\n"
-            "是否可拆分为 3 条以上传播切片\n"
-            "是否存在平台审核风险\n"
-            "是否存在舆情翻车风险\n"
-            "如存在风险，请给出安全强化建议。\n\n"
-            "核心原则\n"
-            "爽点密度优先\n"
-            "情绪强度可放大\n"
-            "冲突允许极端\n"
-            "峰值密度优先于逻辑\n"
-            "传播性优先于稳定性"
-        )
+        system_prompt = PROMPT_SUGGESTION_TRAFFIC
+    elif payload.mode == "continuation":
+        system_prompt = PROMPT_CONTINUATION_DEFAULT.format(template_text=template_text)
+    elif payload.mode == "continuation_traffic":
+        system_prompt = PROMPT_CONTINUATION_TRAFFIC
+    elif payload.mode == "continuation_paid":
+        system_prompt = PROMPT_CONTINUATION_PAID
     else:
         # revise mode
         system_prompt = (
@@ -360,43 +267,66 @@ async def generate_script(
             "模板如下：\n"
             f"{template_text}"
         )
-    user_prompt = payload.content
-    if payload.instruction:
-        user_prompt = f"{payload.instruction}\n\n{payload.content}"
-    try:
-        logger.info(
-            "script.generate mode=%s model=%s content_len=%s instruction_len=%s",
-            payload.mode,
-            model,
-            len(payload.content or ""),
-            len(payload.instruction or ""),
+    
+    if payload.mode == "step1_modify":
+        user_prompt = (
+            f"【剧本原文】\n{payload.content}\n\n"
+            f"【修改建议与要求】\n{payload.instruction}"
         )
-        result = await create_chat_completion(
-            db,
-            user_id,
-            {
+    else:
+        user_prompt = payload.content
+        if payload.instruction:
+            user_prompt = f"{payload.instruction}\n\n{payload.content}"
+    
+    return system_prompt, user_prompt
+
+
+@router.post("/{project_id}/script/generate")
+async def generate_script(
+    project_id: str,
+    payload: ScriptGenerateRequest,
+    user_id: str = Depends(get_current_user_id),
+    db: AsyncSession = Depends(get_db),
+):
+    project = await get_project(db, user_id, project_id)
+    if not project:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="项目不存在")
+    settings = await get_or_create_settings(db, user_id)
+    model = payload.model or settings.default_model_text
+    
+    system_prompt, user_prompt = _get_generation_prompts(payload)
+
+    logger.info(
+        "script.generate mode=%s model=%s content_len=%s instruction_len=%s",
+        payload.mode,
+        model,
+        len(payload.content or ""),
+        len(payload.instruction or ""),
+    )
+
+    async def event_generator():
+        try:
+            payload_api = {
                 "model": model,
                 "temperature": 0.2,
                 "messages": [
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_prompt},
                 ],
-            },
-        )
-        content = ""
-        if isinstance(result, dict):
-            choices = result.get("choices") or []
-            if choices:
-                message = choices[0].get("message") or {}
-                content = message.get("content") or ""
-        return ScriptGenerateResponse(content=content)
-    except ValueError as exc:
-        logger.warning("script.generate failed: %s", str(exc))
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
-    except Exception as exc:
-        logger.exception("script.generate unexpected error")
-        detail = str(exc).strip()
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=detail if detail else "Internal Server Error",
-        )
+            }
+            async for chunk in create_chat_completion_stream(db, user_id, payload_api):
+                if isinstance(chunk, dict) and "error" in chunk:
+                    # In stream, send error as a special event or just log
+                    logger.error(f"Stream error chunk: {chunk}")
+                    yield f"data: {json.dumps({'error': chunk['error']})}\n\n"
+                    break
+                
+                # Format as SSE data
+                yield f"data: {json.dumps(chunk)}\n\n"
+            
+            yield "data: [DONE]\n\n"
+        except Exception as e:
+            logger.exception("Stream generator error")
+            yield f"data: {json.dumps({'error': str(e)})}\n\n"
+
+    return StreamingResponse(event_generator(), media_type="text/event-stream")

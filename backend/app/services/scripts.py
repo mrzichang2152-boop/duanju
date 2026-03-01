@@ -13,6 +13,14 @@ async def get_active_script(session: AsyncSession, project_id: str) -> Optional[
     return result.scalars().first()
 
 
+async def get_script_history(session: AsyncSession, project_id: str) -> list[Script]:
+    result = await session.execute(
+        select(Script).where(Script.project_id == project_id).order_by(desc(Script.version))
+    )
+    return result.scalars().all()
+
+
+
 async def save_script(session: AsyncSession, project_id: str, content: str) -> Script:
     existing = await get_active_script(session, project_id)
     if existing:

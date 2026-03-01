@@ -32,7 +32,7 @@ async def extract_assets(
     project = await get_project(db, user_id, project_id)
     if not project:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="项目不存在")
-    await extract_assets_from_script(db, project_id)
+    await extract_assets_from_script(db, project_id, user_id)
     return StatusResponse(status="ready")
 
 
@@ -90,12 +90,17 @@ async def generate_asset(
         prompt = f"{asset.type}:{asset.name}"
         if asset.description:
             prompt = f"{prompt}，{asset.description}"
+    
+    # Default model logic
     model = payload.model or settings.default_model_image
-    if asset.type == "CHARACTER_LOOK" and (not model or model.startswith("dall-e")):
-        model = "gpt-image-1.5"
+    if not model or "gpt" in model or "dall-e" in model or "gemini" in model:
+         model = "doubao-seedream-4-5-251128"
+         
     request_payload = payload.options.copy() if payload.options else {}
     request_payload["model"] = model
     request_payload.setdefault("n", 1)
+    
+    # Default size logic
     model_key = (model or "").lower()
     nano_square_only = any(
         key in model_key
@@ -112,6 +117,7 @@ async def generate_asset(
         default_size = "1536x1024"
     else:
         default_size = "1024x1024"
+            
     request_payload.setdefault("size", default_size)
     try:
         if payload.ref_image_url:
@@ -234,7 +240,7 @@ async def generate_asset(
                             ) from url_size_exc
         else:
             if asset.type == "CHARACTER":
-                suffix = ", (character sheet, three views, front view, side view, back view:1.5), (full body shot:1.5), (feet included:1.2), wearing simple bikini, swimwear, (detailed skin texture:1.3), (skin pores:1.1), glowing skin, accentuate body figure, white background, standing, 三视图, 正视图, 侧视图, 背视图, 全身图片, 包含脚部, 穿着简单的比基尼泳装, 皮肤细节, 突出身材"
+                suffix = ", (character sheet, three views, front view, side view, back view:1.5), (full body shot:1.5), (feet included:1.2), wearing simple clothes, (detailed skin texture:1.3), (skin pores:1.1), glowing skin, white background, standing, 三视图, 正视图, 侧视图, 背视图, 全身图片, 包含脚部, 穿着简单, 皮肤细节"
                 if suffix not in prompt:
                     prompt = f"{prompt}{suffix}"
             request_payload["prompt"] = prompt
@@ -245,6 +251,8 @@ async def generate_asset(
                     request_payload,
                 )
             except Exception as create_exc:
+                if model == "doubao-seedream-4-5-251128":
+                     raise create_exc
                 try:
                     payload_no_size = request_payload.copy()
                     payload_no_size.pop("size", None)

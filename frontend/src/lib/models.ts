@@ -35,7 +35,11 @@ export const filterModels = (models: string[], kind: "text" | "image" | "video")
         value.includes("vision") ||
         value.includes("pix") ||
         value.includes("sd") ||
-        value.includes("diffusion")
+        value.includes("diffusion") ||
+        value.includes("dream") ||
+        value.includes("flux") ||
+        value.includes("midjourney") ||
+        value.includes("dall-e")
       );
     }
     if (kind === "video") {
