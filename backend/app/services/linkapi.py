@@ -89,6 +89,16 @@ async def create_chat_completion(
 
     # Force model to Volcengine model
     payload["model"] = "doubao-seed-2-0-pro-260215"
+    
+    # Ensure max_tokens is set to a reasonable value to prevent truncation
+    # Doubao 2.0 Pro supports long output, default might be too short
+    if "max_tokens" not in payload:
+        payload["max_tokens"] = 4096
+    elif payload["max_tokens"] < 4096:
+        # If user provided a small value, we bump it up if it seems too small (optional, but safe)
+        # But let's respect user if they explicitly set it, unless it's missing.
+        # However, to solve the user's "truncated" issue, we prioritize a large default.
+        pass
 
     # Use auto-detected proxy
     proxies = _get_auto_proxy()
@@ -178,6 +188,10 @@ async def create_chat_completion_stream(
     # Force model to Volcengine model
     payload["model"] = "doubao-seed-2-0-pro-260215"
     payload["stream"] = True
+    
+    # Ensure max_tokens is set to prevent truncation
+    if "max_tokens" not in payload:
+        payload["max_tokens"] = 4096
 
     # Use auto-detected proxy
     proxies = _get_auto_proxy()

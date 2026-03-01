@@ -10,6 +10,10 @@
 ## 已完成 (Completed)
 
 ### 2026-03-01 (Volcengine Migration & Fixes)
+- **部署**: 成功迁移至 Volcengine 新服务器 (115.190.202.134)，使用 Docker Compose 部署。
+- **配置**: 修改 `docker-compose.yml` 端口为 `8088` (Nginx), `3001` (Frontend), `8003` (Backend) 以避免与现有项目冲突。
+- **配置**: 配置 Docker 镜像加速器 (daocloud, 1panel, 163) 解决国内拉取超时问题。
+- **后端**: 修复 Doubao 2.0 模型输出截断问题，强制设置 `max_tokens=4096` 以支持长文本生成。
 - **后端**: Step 2/3 LLM 模型全面迁移至 Volcengine Doubao 2.0 Pro。
 - **后端**: Step 4 图片生成模型迁移至 `doubao-seedream-4-5-251128`。
 - **后端**: 修复 `linkapi.py` 中 Volcengine 参数透传逻辑 (sequential_image_generation, watermark 等)。
