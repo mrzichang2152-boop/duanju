@@ -145,7 +145,11 @@ async def generate_script(
     
     if payload.mode == "step0_generate":
         system_prompt = "你是一个专业的短剧编剧。请根据用户提供的主题、角色和分集大纲，创作一个完整的短剧剧本。格式要求：包含【剧本基本信息】、【人物小传】、【正文剧本】等标准部分。"
-        user_prompt = payload.instruction or payload.content
+        
+        user_prompt = payload.content
+        if payload.instruction:
+            user_prompt = f"{user_prompt}\n\n【创作要求】\n{payload.instruction}"
+
         # Use Pro model for Step 0 but disable thinking mode
         model = "doubao-seed-2-0-pro-260215"
     elif payload.mode == "step0_continue":
@@ -153,11 +157,11 @@ async def generate_script(
 请仔细区分以下信息块：
 1. 【写作规范】：必须遵守的文风、格式和禁忌。
 2. 【角色设定】：角色性格、背景和关系，必须保持一致。
-3. 【已有分集大纲】：前文剧情，续写内容必须紧接其后，逻辑连贯。
+3. 【前文剧情】：前文剧情，续写内容必须紧接其后，逻辑连贯。
 4. 【续写要求】（Instruction）：用户对后续剧情的具体指令。
 
 请只输出新生成的集的内容（例如“第X集：...”），不要重复已有的内容，也不要输出任何解释性文字。"""
-        
+
         # Combine content (Context) and instruction (User Prompt) explicitly
         context_block = payload.content
         instruction_block = payload.instruction or "请根据上下文续写下一集。"

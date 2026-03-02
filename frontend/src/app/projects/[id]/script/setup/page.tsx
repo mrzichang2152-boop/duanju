@@ -422,19 +422,19 @@ ${fullScript}
 
     // Construct full context using selected versions
     const context = `
-【基础写作规范】
+【写作规范】
 ${theme || "无"}
 
-【上文分集内容】
+【前文剧情】
 ${episodes.map((e, i) => {
   const ver = e.versions.find(v => v.id === e.selectedVersionId);
   return `第${i + 1}集：${ver?.content || ""}`;
 }).join("\n")}
 
-【角色设定信息】
+【角色设定】
 ${characters.map((c, i) => `${c.name}：${c.bio || "暂无简介"}`).join("\n")}
 
-【用户续写要求】
+【续写要求】
 ${prompt}
     `.trim();
 
