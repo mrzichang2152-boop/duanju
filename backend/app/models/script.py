@@ -1,3 +1,5 @@
+from __future__ import annotations
+from typing import Optional, Union
 from datetime import datetime
 from uuid import uuid4
 
@@ -13,6 +15,7 @@ class Script(Base):
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
     project_id: Mapped[str] = mapped_column(String(36), index=True)
     content: Mapped[str] = mapped_column(Text)
+    thinking: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     version: Mapped[int] = mapped_column(default=1)
     is_active: Mapped[bool] = mapped_column(default=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)

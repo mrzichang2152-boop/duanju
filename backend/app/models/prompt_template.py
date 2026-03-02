@@ -1,3 +1,5 @@
+from __future__ import annotations
+from typing import Optional, Union
 from datetime import datetime
 from uuid import uuid4
 
@@ -15,5 +17,5 @@ class PromptTemplate(Base):
     kind: Mapped[str] = mapped_column(String(16), index=True)
     name: Mapped[str] = mapped_column(String(128))
     content: Mapped[str] = mapped_column(Text)
-    tags: Mapped[str | None] = mapped_column(Text, nullable=True)
+    tags: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)

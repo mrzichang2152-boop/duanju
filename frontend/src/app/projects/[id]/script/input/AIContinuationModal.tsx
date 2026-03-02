@@ -160,13 +160,13 @@ export default function AIContinuationModal({
               onClick={() => handleSubmit("continuation_paid")}
               className="rounded-lg bg-indigo-600 px-6 py-2 text-sm font-medium text-white hover:bg-indigo-700"
             >
-              付费转化续写
+              付费转化续写建议
             </button>
             <button
               onClick={() => handleSubmit("continuation_traffic")}
               className="rounded-lg bg-pink-600 px-6 py-2 text-sm font-medium text-white hover:bg-pink-700"
             >
-              流量爆款续写
+              流量爆款续写建议
             </button>
           </div>
         </div>

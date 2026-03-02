@@ -1,3 +1,5 @@
+from __future__ import annotations
+from typing import Optional, Union
 from datetime import datetime
 from uuid import uuid4
 
@@ -14,5 +16,5 @@ class Asset(Base):
     project_id: Mapped[str] = mapped_column(String(36), index=True)
     type: Mapped[str] = mapped_column(String(32))
     name: Mapped[str] = mapped_column(String(255))
-    description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    description: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)

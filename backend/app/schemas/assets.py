@@ -1,10 +1,12 @@
+from __future__ import annotations
+from typing import Optional, Union
 from pydantic import BaseModel
 
 
 class AssetVersionResponse(BaseModel):
     id: str
     image_url: str
-    prompt: str | None
+    prompt: Optional[str]
     is_selected: bool
 
 
@@ -12,15 +14,15 @@ class AssetResponse(BaseModel):
     id: str
     type: str
     name: str
-    description: str | None
+    description: Optional[str]
     versions: list[AssetVersionResponse]
 
 
 class AssetGenerateRequest(BaseModel):
-    prompt: str | None = None
-    model: str | None = None
-    options: dict[str, object] | None = None
-    ref_image_url: str | None = None
+    prompt: Optional[str] = None
+    model: Optional[str] = None
+    options: Optional[dict[str, object]] = None
+    ref_image_url: Optional[str] = None
 
 
 class AssetSelectRequest(BaseModel):

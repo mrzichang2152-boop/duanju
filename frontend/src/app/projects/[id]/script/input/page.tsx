@@ -4,6 +4,7 @@ import { useEffect, useState, useRef, type ChangeEvent } from "react";
 import { useParams, useRouter } from "next/navigation";
 import { getScript, saveScript, generateScript, generateScriptStream, type ScriptGeneratePayload, getScriptHistory, type ScriptHistoryItem } from "@/lib/api";
 import { getToken } from "@/lib/auth";
+import { ScriptEditor } from "@/app/components/ScriptEditor";
 import AIContinuationModal from "./AIContinuationModal";
 
 // ... (keep scriptOptions as is, it's long and static)
@@ -254,6 +255,7 @@ export default function ScriptInputPage() {
   
   const saveTimeoutRef = useRef<NodeJS.Timeout | null>(null);
   const lastSavedContentRef = useRef("");
+  const lastSavedThinkingRef = useRef("");
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const abortControllerRef = useRef<AbortController | null>(null);
 
@@ -293,37 +295,34 @@ export default function ScriptInputPage() {
     const fetchData = async () => {
       try {
         const [scriptData, historyData] = await Promise.all([
-          getScript(token, projectId).catch(() => ({ content: "", id: null })),
+          getScript(token, projectId).catch(() => ({ content: "", id: null, thinking: "" })),
           getScriptHistory(token, projectId).catch(() => ({ items: [] }))
         ]);
 
         const currentContent = scriptData.content ?? "";
+        const currentThinking = scriptData.thinking ?? "";
         lastSavedContentRef.current = currentContent;
+        lastSavedThinkingRef.current = currentThinking;
 
         const historyVersions: ScriptVersion[] = historyData.items.map((h: any) => ({
           id: h.id,
           content: h.content,
-          thinking: "",
+          thinking: h.thinking ?? "",
           isThinkingCollapsed: true,
           isCollapsed: true,
           timestamp: new Date(h.created_at).getTime(),
           label: `Version ${h.version}`
         }));
 
-        // Combine current and history
-        // If current content matches the latest history, we might duplicate? 
-        // For simplicity, always create a "Current Draft" version at top.
-        // Or if history exists, treat history[0] as previous, and current as active.
-        
         const initialVersions = [
           {
             id: "current",
             content: currentContent,
-            thinking: "",
+            thinking: currentThinking,
             isThinkingCollapsed: true,
             isCollapsed: false,
             timestamp: Date.now(),
-            label: historyVersions.length > 0 ? `Version ${historyVersions.length + 1} (Current)` : "Version 1 (Current)"
+            label: historyVersions.length > 0 ? `Version ${historyVersions.length + 1}` : "Version 1"
           },
           ...historyVersions
         ];
@@ -344,7 +343,9 @@ export default function ScriptInputPage() {
     if (loading || !projectId || versions.length === 0) return;
     
     const activeContent = versions[0].content;
-    if (activeContent === lastSavedContentRef.current) return;
+    const activeThinking = versions[0].thinking;
+
+    if (activeContent === lastSavedContentRef.current && activeThinking === lastSavedThinkingRef.current) return;
 
     if (saveTimeoutRef.current) {
       clearTimeout(saveTimeoutRef.current);
@@ -355,8 +356,9 @@ export default function ScriptInputPage() {
       if (!token) return;
       
       try {
-        await saveScript(token, projectId, activeContent);
+        await saveScript(token, projectId, activeContent, activeThinking);
         lastSavedContentRef.current = activeContent;
+        lastSavedThinkingRef.current = activeThinking || "";
         setMessage("已自动保存");
       } catch (e) {
         console.error("Auto-save failed", e);
@@ -376,8 +378,9 @@ export default function ScriptInputPage() {
     if (!token) return;
     
     try {
-      await saveScript(token, projectId, versions[0].content);
+      await saveScript(token, projectId, versions[0].content, versions[0].thinking);
       lastSavedContentRef.current = versions[0].content;
+      lastSavedThinkingRef.current = versions[0].thinking || "";
       setMessage("已保存");
       // Optional: Refresh history?
     } catch (error) {
@@ -578,66 +581,61 @@ export default function ScriptInputPage() {
   };
 
   const handleContinuationSubmit = async (formattedAnswers: string, mode: "continuation_paid" | "continuation_traffic") => {
+    if (!projectId) return;
+    const token = getToken();
+    if (!token) {
+      router.push("/login");
+      return;
+    }
+
+    setIsContinuationModalOpen(false);
     setIsModifying(true);
-    setMessage(null);
+    setMessage("AI 正在生成续写建议...");
+    
+    // Clear existing instruction/thinking
+    setInstruction(""); 
+    setSuggestionThinking("");
+    setIsSuggestionThinkingCollapsed(false);
 
     const abortController = new AbortController();
     abortControllerRef.current = abortController;
 
-    // Create new version with existing content + separator
-    const currentContent = versions[0]?.content || "";
-    const markerTitle = mode === "continuation_paid" ? "🟢 AI 付费转化续写内容" : "🔴 AI 流量爆款续写内容";
-    const separator = `\n\n\n==================================================\n   ${markerTitle}\n==================================================\n\n`;
+    // Use suggestion mode to get advice instead of script content
+    const apiMode = mode === "continuation_paid" ? "suggestion_paid" : "suggestion_traffic";
     
-    const newVersion: ScriptVersion = {
-      id: `ver-${Date.now()}`,
-      content: currentContent + separator,
-      thinking: "",
-      isThinkingCollapsed: false,
-      isCollapsed: false,
-      timestamp: Date.now(),
-      label: `Version ${versions.length + 1} (Continuation)`
-    };
+    // Construct prompt with user's configuration
+    const prompt = formattedAnswers 
+      ? `请根据以下配置参数，为当前剧本提供续写建议：\n\n${formattedAnswers}`
+      : "请为当前剧本提供续写建议：";
 
-    setVersions(prev => [newVersion, ...prev.map(v => ({ ...v, isCollapsed: true }))]);
+    let hasCollapsedThinking = false;
 
     try {
-      const token = getToken();
-      if (!token) throw new Error("未登录");
-
       await generateScriptStream(token, projectId, {
-        mode: mode,
-        content: currentContent,
+        mode: apiMode,
+        content: versions[0]?.content || "",
         model: selectedModel,
-        instruction: formattedAnswers + (instruction ? `\n\n用户额外补充：${instruction}` : ""),
+        instruction: prompt,
       }, (chunk) => {
-         setVersions(prev => {
-          const current = [...prev];
-          const active = { ...current[0] };
-          
-          if (chunk.choices?.[0]?.delta?.reasoning_content) {
-            active.thinking += chunk.choices[0].delta.reasoning_content;
+        if (chunk.choices?.[0]?.delta?.reasoning_content) {
+          setSuggestionThinking(prev => prev + chunk.choices[0].delta.reasoning_content);
+        }
+        if (chunk.choices?.[0]?.delta?.content) {
+          if (!hasCollapsedThinking) {
+             setIsSuggestionThinkingCollapsed(true);
+             hasCollapsedThinking = true;
           }
-          
-          if (chunk.choices?.[0]?.delta?.content) {
-             if (active.thinking && !active.isThinkingCollapsed) {
-               active.isThinkingCollapsed = true;
-             }
-             active.content += chunk.choices[0].delta.content;
-          }
-          
-          current[0] = active;
-          return current;
-        });
+          setInstruction(prev => prev + chunk.choices[0].delta.content);
+        }
       }, abortController.signal);
       
-      setMessage("续写完成");
-      setIsContinuationModalOpen(false);
+      setMessage("续写建议已生成");
     } catch (error: any) {
       if (error.name === 'AbortError') {
-        setMessage("续写已取消");
+        setMessage("生成已取消");
       } else {
-        setMessage(`续写失败: ${error.message}`);
+        setMessage(`生成建议失败: ${error.message}`);
+        console.error(error);
       }
     } finally {
       setIsModifying(false);
@@ -982,18 +980,15 @@ export default function ScriptInputPage() {
                             </div>
                          )}
                          
-                         <textarea
-                            value={version.content}
-                            onChange={(e) => {
-                               const newContent = e.target.value;
+                         <ScriptEditor
+                            content={version.content}
+                            onChange={(newContent) => {
                                setVersions(prev => {
                                   const newVersions = [...prev];
                                   newVersions[index] = { ...newVersions[index], content: newContent };
                                   return newVersions;
                                });
                             }}
-                            className="w-full min-h-[600px] resize-y border-none p-0 text-sm outline-none focus:ring-0 leading-relaxed"
-                            placeholder="剧本内容..."
                          />
                       </div>
                    )}

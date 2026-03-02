@@ -1,4 +1,5 @@
-from typing import Any
+from __future__ import annotations
+from typing import Optional, Union, Any
 import os
 import socket
 import asyncio
@@ -15,7 +16,7 @@ from app.services.settings import get_api_key, get_or_create_settings
 logger = logging.getLogger(__name__)
 
 
-def _get_auto_proxy() -> str | None:
+def _get_auto_proxy() -> Optional[str]:
     # 1. Environment variables
     if os.environ.get("HTTPS_PROXY"):
         return os.environ.get("HTTPS_PROXY")
@@ -88,13 +89,14 @@ async def create_chat_completion(
     logger.info("Using Volcengine Key: %s... (len=%d)", api_key[:10], len(api_key))
 
     # Force model to Volcengine model
-    payload["model"] = "doubao-seed-2-0-pro-260215"
+    if "model" not in payload:
+        payload["model"] = "doubao-seed-2-0-pro-260215"
     
     # Ensure max_tokens is set to a reasonable value to prevent truncation
     # Doubao 2.0 Pro supports long output, default might be too short
     if "max_tokens" not in payload:
-        payload["max_tokens"] = 4096
-    elif payload["max_tokens"] < 4096:
+        payload["max_tokens"] = 65536
+    elif payload["max_tokens"] < 65536:
         # If user provided a small value, we bump it up if it seems too small (optional, but safe)
         # But let's respect user if they explicitly set it, unless it's missing.
         # However, to solve the user's "truncated" issue, we prioritize a large default.
@@ -103,9 +105,19 @@ async def create_chat_completion(
     # Use auto-detected proxy
     proxies = _get_auto_proxy()
     
-    transport = httpx.AsyncHTTPTransport(retries=2, proxy=proxies)
+    # Check if target is Volcengine (domestic) or model is doubao
+    is_volcengine = "doubao" in payload.get("model", "") or "volces.com" in "ark.cn-beijing.volces.com"
+    
+    if is_volcengine:
+        # Volcengine is domestic, force DIRECT connection (bypass proxy and env vars)
+        logger.info("Volcengine model detected, bypassing proxy for direct connection.")
+        transport = httpx.AsyncHTTPTransport(retries=2)
+        client_kwargs = {"timeout": 1200.0, "transport": transport, "trust_env": False}
+    else:
+        transport = httpx.AsyncHTTPTransport(retries=2, proxy=proxies)
+        client_kwargs = {"timeout": 1200.0, "transport": transport}
 
-    async with httpx.AsyncClient(timeout=300.0, transport=transport) as client:
+    async with httpx.AsyncClient(**client_kwargs) as client:
         async def send(url: str, request_payload: dict[str, Any]) -> httpx.Response:
             headers = {
                 "Authorization": f"Bearer {api_key}",
@@ -118,7 +130,7 @@ async def create_chat_completion(
             )
 
         async def send_with_retries(url: str, request_payload: dict[str, Any]) -> httpx.Response:
-            last_exc: httpx.HTTPError | None = None
+            last_exc: httpx.Optional[HTTPError] = None
             for attempt in range(5):
                 try:
                     return await send(url, request_payload)
@@ -191,11 +203,22 @@ async def create_chat_completion_stream(
     
     # Ensure max_tokens is set to prevent truncation
     if "max_tokens" not in payload:
-        payload["max_tokens"] = 4096
+        payload["max_tokens"] = 65536
 
     # Use auto-detected proxy
     proxies = _get_auto_proxy()
-    transport = httpx.AsyncHTTPTransport(retries=2, proxy=proxies)
+    
+    # Check if target is Volcengine (domestic) or model is doubao
+    is_volcengine = "doubao" in payload.get("model", "") or "volces.com" in "ark.cn-beijing.volces.com"
+    
+    if is_volcengine:
+        # Volcengine is domestic, force DIRECT connection
+        logger.info("Volcengine model detected (stream), bypassing proxy for direct connection.")
+        transport = httpx.AsyncHTTPTransport(retries=2)
+        client_kwargs = {"timeout": 1200.0, "transport": transport, "trust_env": False}
+    else:
+        transport = httpx.AsyncHTTPTransport(retries=2, proxy=proxies)
+        client_kwargs = {"timeout": 1200.0, "transport": transport}
 
     # Volcengine Endpoint
     endpoint = "https://ark.cn-beijing.volces.com/api/v3"
@@ -212,7 +235,7 @@ async def create_chat_completion_stream(
         "Content-Type": "application/json",
     }
 
-    async with httpx.AsyncClient(timeout=120.0, transport=transport) as client:
+    async with httpx.AsyncClient(**client_kwargs) as client:
         try:
             async with client.stream("POST", url, headers=headers, json=payload) as response:
                 if response.status_code != 200:
@@ -352,9 +375,13 @@ async def create_image(
     
     # Use auto-detected proxy
     proxies = _get_auto_proxy()
-    transport = httpx.AsyncHTTPTransport(retries=2, proxy=proxies)
+    
+    # Volcengine is domestic, force DIRECT connection
+    logger.info("Volcengine image generation, bypassing proxy.")
+    transport = httpx.AsyncHTTPTransport(retries=2)
+    client_kwargs = {"timeout": 120.0, "transport": transport, "trust_env": False}
 
-    async with httpx.AsyncClient(timeout=120.0, transport=transport) as client:
+    async with httpx.AsyncClient(**client_kwargs) as client:
         try:
             response = await client.post(
                 f"{endpoint}/images/generations",
@@ -446,7 +473,7 @@ def _normalize_image_response(data: dict[str, Any]) -> dict[str, Any]:
             for part in content:
                 part_type = part.get("type")
                 if part_type in {"image_url", "image", "output_image", "output_image_url"}:
-                    image_url: str | dict[str, Any] | None = (
+                    image_url: Optional[Union[str, dict[str, Any]]] = (
                         part.get("image_url", {}).get("url")
                         or part.get("image")
                         or part.get("url")

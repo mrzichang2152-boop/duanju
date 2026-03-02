@@ -1,3 +1,5 @@
+from __future__ import annotations
+from typing import Optional, Union
 from pydantic import BaseModel
 
 
@@ -11,9 +13,9 @@ class SettingsResponse(BaseModel):
 
 
 class SettingsUpdate(BaseModel):
-    endpoint: str | None = None
-    api_key: str | None = None
-    default_model_text: str | None = None
-    default_model_image: str | None = None
-    default_model_video: str | None = None
-    allow_sync: bool | None = None
+    endpoint: Optional[str] = None
+    api_key: Optional[str] = None
+    default_model_text: Optional[str] = None
+    default_model_image: Optional[str] = None
+    default_model_video: Optional[str] = None
+    allow_sync: Optional[bool] = None

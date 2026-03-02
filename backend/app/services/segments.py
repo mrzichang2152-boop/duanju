@@ -1,3 +1,5 @@
+from __future__ import annotations
+from typing import Optional, Union
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -17,7 +19,7 @@ async def list_segment_versions(session: AsyncSession, segment_id: str) -> list[
     return list(result.scalars().all())
 
 
-async def get_segment(session: AsyncSession, segment_id: str) -> Segment | None:
+async def get_segment(session: AsyncSession, segment_id: str) -> Optional[Segment]:
     return await session.scalar(select(Segment).where(Segment.id == segment_id))
 
 
@@ -86,7 +88,7 @@ async def create_segments_from_script(session: AsyncSession, project_id: str) ->
 
 
 async def create_segment_version(
-    session: AsyncSession, segment_id: str, video_url: str, prompt: str | None = None
+    session: AsyncSession, segment_id: str, video_url: str, prompt: Optional[str] = None
 ) -> SegmentVersion:
     version = SegmentVersion(
         segment_id=segment_id, video_url=video_url, prompt=prompt, is_selected=False

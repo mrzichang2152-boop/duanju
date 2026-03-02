@@ -1,3 +1,5 @@
+from __future__ import annotations
+from typing import Optional, Union
 from datetime import datetime
 
 from sqlalchemy import select
@@ -21,12 +23,12 @@ async def get_or_create_settings(session: AsyncSession, user_id: str) -> UserSet
 async def update_settings(
     session: AsyncSession,
     user_id: str,
-    endpoint: str | None,
-    api_key: str | None,
-    default_model_text: str | None,
-    default_model_image: str | None,
-    default_model_video: str | None,
-    allow_sync: bool | None,
+    endpoint: Optional[str],
+    api_key: Optional[str],
+    default_model_text: Optional[str],
+    default_model_image: Optional[str],
+    default_model_video: Optional[str],
+    allow_sync: Optional[bool],
 ) -> UserSettings:
     settings = await get_or_create_settings(session, user_id)
     if endpoint is not None:
@@ -47,7 +49,7 @@ async def update_settings(
     return settings
 
 
-async def get_api_key(session: AsyncSession, user_id: str) -> str | None:
+async def get_api_key(session: AsyncSession, user_id: str) -> Optional[str]:
     settings = await get_or_create_settings(session, user_id)
     if not settings.api_key_encrypted:
         return None

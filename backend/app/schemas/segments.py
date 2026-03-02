@@ -1,10 +1,12 @@
+from __future__ import annotations
+from typing import Optional, Union
 from pydantic import BaseModel
 
 
 class SegmentVersionResponse(BaseModel):
     id: str
     video_url: str
-    prompt: str | None
+    prompt: Optional[str]
     status: str
     is_selected: bool
 
@@ -18,10 +20,10 @@ class SegmentResponse(BaseModel):
 
 
 class SegmentGenerateRequest(BaseModel):
-    segment_id: str | None = None
-    prompt: str | None = None
-    model: str | None = None
-    options: dict[str, object] | None = None
+    segment_id: Optional[str] = None
+    prompt: Optional[str] = None
+    model: Optional[str] = None
+    options: Optional[dict[str, object]] = None
 
 
 class SegmentSelectRequest(BaseModel):

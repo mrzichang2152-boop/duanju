@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useState, useRef } from "react";
 import { useParams } from "next/navigation";
 import {
   Segment,
@@ -9,9 +9,37 @@ import {
   generateSegment,
   getModels,
   getSettings,
+  saveScript,
 } from "@/lib/api";
 import { getToken } from "@/lib/auth";
 import { extractModels, filterModels } from "@/lib/models";
+
+function AutoResizeTextarea({ value, onChange, className }: { value: string, onChange: (v: string) => void, className?: string }) {
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
+
+  const adjustHeight = useCallback(() => {
+    const textarea = textareaRef.current;
+    if (textarea) {
+      textarea.style.height = 'auto';
+      textarea.style.height = `${textarea.scrollHeight}px`;
+    }
+  }, []);
+
+  useEffect(() => {
+    adjustHeight();
+  }, [value, adjustHeight]);
+
+  return (
+    <textarea
+      ref={textareaRef}
+      value={value}
+      onChange={(e) => onChange(e.target.value)}
+      className={className}
+      rows={1}
+      style={{ resize: 'none', overflow: 'hidden' }}
+    />
+  );
+}
 
 export default function VideoPage() {
   const params = useParams<{ id: string }>();
@@ -19,10 +47,17 @@ export default function VideoPage() {
   const [segments, setSegments] = useState<Segment[]>([]);
   const [scriptContent, setScriptContent] = useState("");
   const [error, setError] = useState<string | null>(null);
+  const [message, setMessage] = useState<string | null>(null);
   const [generatingSegmentId, setGeneratingSegmentId] = useState<string | null>(null);
   const [videoModels, setVideoModels] = useState<string[]>([]);
   const [defaultVideoModel, setDefaultVideoModel] = useState("");
   const [selectedModel, setSelectedModel] = useState("");
+
+  const [tableHeaders, setTableHeaders] = useState<string[]>([]);
+  const [tableRows, setTableRows] = useState<string[][]>([]);
+  const [tableRange, setTableRange] = useState<{start: number, end: number} | null>(null);
+  const [isSaving, setIsSaving] = useState(false);
+  const [originalScriptLines, setOriginalScriptLines] = useState<string[]>([]);
 
   const loadConfig = useCallback(async () => {
     const token = getToken();
@@ -58,6 +93,7 @@ export default function VideoPage() {
       ]);
       setSegments(segmentsData);
       setScriptContent(scriptData.content || "");
+      parseTable(scriptData.content || "");
     } catch (err) {
       setError(err instanceof Error ? err.message : "加载失败");
     }
@@ -66,6 +102,138 @@ export default function VideoPage() {
   useEffect(() => {
     void loadData();
   }, [loadData]);
+
+  const parseTable = (markdown: string) => {
+    const lines = markdown.split('\n');
+    setOriginalScriptLines(lines);
+
+    let headers: string[] = [];
+    let rows: string[][] = [];
+    let headerFound = false;
+    let tableEnded = false;
+    let startLine = -1;
+    let endLine = -1;
+
+    const cleanSplit = (line: string) => {
+      const placeholder = "___PIPE___";
+      const protectedLine = line.replace(/\\\|/g, placeholder);
+      const parts = protectedLine.split('|').map(p => p.replace(new RegExp(placeholder, 'g'), '|'));
+      if (parts.length > 0 && parts[0].trim() === '') parts.shift();
+      if (parts.length > 0 && parts[parts.length - 1].trim() === '') parts.pop();
+      return parts;
+    };
+
+    const unescapeCell = (cell: string) => {
+      return cell.trim().replace(/<br\s*\/?>/gi, '\n');
+    };
+    
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i];
+      const trimmed = line.trim();
+      
+      if (!trimmed) {
+         if (headerFound) {
+             tableEnded = true;
+             endLine = i; // End at the empty line
+             break; 
+         }
+         continue;
+      }
+      
+      if (tableEnded && headerFound) break;
+
+      if (trimmed.startsWith('|') && trimmed.endsWith('|')) {
+         if (!headerFound) {
+             if (trimmed.includes("画面生成提示词") || trimmed.includes("画面内容")) {
+                startLine = i;
+                const parts = cleanSplit(trimmed);
+                headers = parts.map(p => p.trim());
+                headerFound = true;
+             }
+             continue;
+         }
+
+         if (headerFound) {
+            // Skip separator line
+            if (trimmed.replace(/\||-|:|\s/g, '') === '') continue;
+
+            const parts = cleanSplit(trimmed);
+            const row = parts.map(unescapeCell);
+            rows.push(row);
+            endLine = i + 1; // Update end line continuously
+         }
+      } else {
+         if (headerFound) {
+             tableEnded = true;
+             endLine = i;
+             break;
+         }
+      }
+    }
+    
+    if (headerFound && rows.length > 0) {
+        setTableHeaders(headers);
+        setTableRows(rows);
+        setTableRange({ start: startLine, end: endLine });
+    } else {
+        setTableHeaders([]);
+        setTableRows([]);
+        setTableRange(null);
+    }
+  };
+
+  const handleCellChange = (rowIndex: number, cellIndex: number, value: string) => {
+    const newRows = [...tableRows];
+    newRows[rowIndex] = [...newRows[rowIndex]];
+    newRows[rowIndex][cellIndex] = value;
+    setTableRows(newRows);
+  };
+
+  const handleSave = async () => {
+    if (!projectId || !tableRange) return;
+    const token = getToken();
+    if (!token) return;
+
+    setIsSaving(true);
+    setMessage(null);
+    setError(null);
+
+    try {
+        const escapeCell = (cell: string) => {
+            return cell.replace(/\|/g, '\\|').replace(/\n/g, '<br>');
+        };
+
+        // Reconstruct table markdown
+        const headerLine = `| ${tableHeaders.join(' | ')} |`;
+        const separatorLine = `| ${tableHeaders.map(() => '---').join(' | ')} |`;
+        const rowLines = tableRows.map(row => `| ${row.map(escapeCell).join(' | ')} |`);
+        
+        const newTableLines = [headerLine, separatorLine, ...rowLines];
+        
+        // Merge with original lines
+        const newLines = [
+            ...originalScriptLines.slice(0, tableRange.start),
+            ...newTableLines,
+            ...originalScriptLines.slice(tableRange.end)
+        ];
+        
+        const newContent = newLines.join('\n');
+        
+        await saveScript(token, projectId, newContent);
+        setScriptContent(newContent);
+        setOriginalScriptLines(newLines);
+        // Update range end
+        setTableRange({ 
+            start: tableRange.start, 
+            end: tableRange.start + newTableLines.length 
+        });
+        setMessage("保存成功");
+    } catch (err) {
+        setError(err instanceof Error ? err.message : "保存失败");
+    } finally {
+        setIsSaving(false);
+    }
+  };
 
   const runGenerateOne = async (segmentId: string) => {
     if (!projectId) return;
@@ -87,58 +255,7 @@ export default function VideoPage() {
     }
   };
 
-  const parseMarkdownTable = (markdown: string) => {
-    const lines = markdown.split('\n');
-    const tableRows: string[][] = [];
-    let headers: string[] = [];
-    let headerFound = false;
-    let tableEnded = false;
-    
-    for (const line of lines) {
-      const trimmed = line.trim();
-      if (!trimmed) {
-         if (headerFound) tableEnded = true;
-         continue;
-      }
-      
-      if (tableEnded && headerFound) break;
-
-      if (trimmed.startsWith('|') && trimmed.endsWith('|')) {
-         if (!headerFound) {
-             if (trimmed.includes("画面生成提示词") || trimmed.includes("画面内容")) {
-                // Split by | and filter out empty strings from start/end
-                const parts = trimmed.split('|');
-                if (parts.length > 0 && parts[0].trim() === '') parts.shift();
-                if (parts.length > 0 && parts[parts.length - 1].trim() === '') parts.pop();
-                headers = parts.map(p => p.trim());
-                headerFound = true;
-             }
-             continue;
-         }
-
-         if (headerFound) {
-            // Skip separator line
-            if (trimmed.replace(/\||-|:|\s/g, '') === '') continue;
-
-            const parts = trimmed.split('|');
-            if (parts.length > 0 && parts[0].trim() === '') parts.shift();
-            if (parts.length > 0 && parts[parts.length - 1].trim() === '') parts.pop();
-            
-            const row = parts.map(p => p.trim());
-            tableRows.push(row);
-         }
-      } else {
-         if (headerFound) tableEnded = true;
-      }
-    }
-    
-    return { headers, rows: tableRows };
-  };
-
-  const { headers, rows } = parseMarkdownTable(scriptContent);
-
-  // If no table found, we might want to show a warning or fallback
-  const hasTable = headers.length > 0 && rows.length > 0;
+  const hasTable = tableHeaders.length > 0 && tableRows.length > 0;
 
   const getSegmentForRow = (rowIndex: number) => {
     // order_index is 1-based
@@ -156,12 +273,27 @@ export default function VideoPage() {
     }
     return null;
   };
+  
+  const getColumnWidthClass = (header: string) => {
+      if (header.includes("画面生成提示词") || header.includes("画面内容")) return "min-w-[400px]";
+      if (header.includes("对白") || header.includes("动作")) return "min-w-[200px]";
+      return "min-w-[100px]";
+  };
 
   return (
     <div className="space-y-6">
       <div className="flex items-center justify-between">
         <h1 className="text-2xl font-semibold">Step 5: 分段视频工作台</h1>
         <div className="flex items-center gap-4">
+           {hasTable && (
+               <button
+                 onClick={handleSave}
+                 disabled={isSaving}
+                 className="rounded-lg bg-indigo-50 px-4 py-2 text-sm font-medium text-indigo-600 hover:bg-indigo-100 disabled:opacity-50"
+               >
+                 {isSaving ? "保存中..." : "保存修改"}
+               </button>
+           )}
            <select 
              value={selectedModel}
              onChange={(e) => setSelectedModel(e.target.value)}
@@ -186,22 +318,28 @@ export default function VideoPage() {
           {error}
         </div>
       )}
+      
+      {message && (
+        <div className="rounded-lg bg-green-50 p-4 text-sm text-green-600">
+          {message}
+        </div>
+      )}
 
       {hasTable ? (
         <div className="overflow-x-auto rounded-xl border border-slate-200 bg-white shadow-sm">
           <table className="w-full text-left text-sm">
             <thead className="bg-slate-50 text-slate-700">
               <tr>
-                {headers.map((h, i) => (
-                  <th key={i} className="whitespace-nowrap px-4 py-3 font-semibold">
+                {tableHeaders.map((h, i) => (
+                  <th key={i} className={`whitespace-nowrap px-4 py-3 font-semibold ${getColumnWidthClass(h)}`}>
                     {h}
                   </th>
                 ))}
-                <th className="px-4 py-3 font-semibold text-right">生成视频</th>
+                <th className="px-4 py-3 font-semibold text-right min-w-[160px]">生成视频</th>
               </tr>
             </thead>
             <tbody className="divide-y divide-slate-100">
-              {rows.map((row, rowIndex) => {
+              {tableRows.map((row, rowIndex) => {
                 const segment = getSegmentForRow(rowIndex);
                 const videoUrl = getVideoUrl(segment);
                 const isGenerating = generatingSegmentId === segment?.id || segment?.status === "PENDING_GENERATION"; 
@@ -209,16 +347,20 @@ export default function VideoPage() {
                 return (
                   <tr key={rowIndex} className="hover:bg-slate-50">
                     {row.map((cell, cellIndex) => (
-                      <td key={cellIndex} className="max-w-xs truncate px-4 py-3 text-slate-600" title={cell}>
-                        {cell}
+                      <td key={cellIndex} className="px-4 py-3 align-top">
+                        <AutoResizeTextarea
+                            value={cell}
+                            onChange={(val) => handleCellChange(rowIndex, cellIndex, val)}
+                            className="w-full bg-transparent outline-none focus:bg-white focus:ring-1 focus:ring-indigo-500 rounded px-1 py-0.5"
+                        />
                       </td>
                     ))}
-                    <td className="px-4 py-3 min-w-[200px]">
+                    <td className="px-4 py-3 align-top">
                       <div className="flex flex-col items-end gap-2">
                         {segment ? (
                           <>
                              {videoUrl ? (
-                               <div className="relative h-24 w-40 overflow-hidden rounded-lg bg-black border border-slate-200">
+                               <div className="relative h-24 w-40 overflow-hidden rounded-lg bg-black border border-slate-200 group">
                                  <video 
                                    src={videoUrl} 
                                    controls 

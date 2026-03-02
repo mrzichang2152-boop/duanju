@@ -1,3 +1,5 @@
+from __future__ import annotations
+from typing import Optional, Union
 import json
 
 from sqlalchemy import select
@@ -7,7 +9,7 @@ from app.models.prompt_template import PromptTemplate
 
 
 async def list_templates(
-    session: AsyncSession, project_id: str, kind: str | None = None
+    session: AsyncSession, project_id: str, kind: Optional[str] = None
 ) -> list[PromptTemplate]:
     statement = select(PromptTemplate).where(PromptTemplate.project_id == project_id)
     if kind:
@@ -52,7 +54,7 @@ async def update_template(
     name: str,
     content: str,
     tags: list[str],
-) -> PromptTemplate | None:
+) -> Optional[PromptTemplate]:
     template = await session.scalar(
         select(PromptTemplate).where(
             PromptTemplate.id == template_id, PromptTemplate.project_id == project_id

@@ -99,6 +99,37 @@ export const login = (payload: LoginPayload) =>
     body: JSON.stringify(payload),
   });
 
+export type CharacterProfile = {
+  name: string;
+  bio: string;
+};
+
+export type ScriptParseResponse = {
+  theme: string;
+  characters: CharacterProfile[];
+  episodes: string[];
+};
+
+export const parseScriptFile = async (token: string, file: File): Promise<ScriptParseResponse> => {
+  const formData = new FormData();
+  formData.append("file", file);
+
+  const response = await fetch(`${baseUrl}/projects/parse`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${token}`,
+    },
+    body: formData,
+  });
+
+  if (!response.ok) {
+    const errorText = await response.text();
+    throw new Error(`File parsing failed: ${errorText}`);
+  }
+
+  return response.json();
+};
+
 export const getProjects = (token: string) =>
   request<Project[]>("/projects", {}, token);
 
@@ -123,6 +154,7 @@ export type ScriptResponse = {
   id?: string;
   project_id: string;
   content: string;
+  thinking?: string;
   version?: number;
   is_active?: boolean;
   created_at?: string;
@@ -131,12 +163,12 @@ export type ScriptResponse = {
 export const getScript = (token: string, id: string) =>
   request<ScriptResponse>(`/projects/${id}/script`, {}, token);
 
-export const saveScript = (token: string, id: string, content: string) =>
+export const saveScript = (token: string, id: string, content: string, thinking?: string) =>
   request<ScriptResponse>(
     `/projects/${id}/script`,
     {
       method: "POST",
-      body: JSON.stringify({ content }),
+      body: JSON.stringify({ content, thinking }),
     },
     token
   );
@@ -163,7 +195,7 @@ export const validateScript = (
   );
 
 export type ScriptGeneratePayload = {
-  mode: "format" | "complete" | "revise" | "extract_resources" | "generate_storyboard" | "step1_modify" | "step2_modify" | "suggestion_paid" | "suggestion_traffic" | "continuation" | "continuation_paid" | "continuation_traffic";
+  mode: "format" | "complete" | "revise" | "extract_resources" | "generate_storyboard" | "step1_modify" | "step2_modify" | "suggestion_paid" | "suggestion_traffic" | "continuation" | "continuation_paid" | "continuation_traffic" | "step0_generate" | "step0_continue" | "step0_modify";
   content: string;
   model?: string;
   instruction?: string;

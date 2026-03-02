@@ -5,6 +5,7 @@ import { usePathname } from "next/navigation";
 import Link from "next/link";
 
 const steps = [
+  { id: "setup", name: "Step 0: 脚本向导", path: "setup" },
   { id: "input", name: "Step 1: 修改剧本", path: "input" },
   { id: "resources", name: "Step 2: 提取资源", path: "resources" },
   { id: "storyboard", name: "Step 3: 生成分镜", path: "storyboard" },

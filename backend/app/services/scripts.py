@@ -1,3 +1,4 @@
+from __future__ import annotations
 from typing import Optional
 
 from sqlalchemy import desc, select
@@ -21,7 +22,7 @@ async def get_script_history(session: AsyncSession, project_id: str) -> list[Scr
 
 
 
-async def save_script(session: AsyncSession, project_id: str, content: str) -> Script:
+async def save_script(session: AsyncSession, project_id: str, content: str, thinking: Optional[str] = None) -> Script:
     existing = await get_active_script(session, project_id)
     if existing:
         existing.is_active = False
@@ -29,7 +30,7 @@ async def save_script(session: AsyncSession, project_id: str, content: str) -> S
         version = existing.version + 1
     else:
         version = 1
-    script = Script(project_id=project_id, content=content, version=version, is_active=True)
+    script = Script(project_id=project_id, content=content, thinking=thinking, version=version, is_active=True)
     session.add(script)
     await session.commit()
     await session.refresh(script)

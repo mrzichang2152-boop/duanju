@@ -1,6 +1,7 @@
+from __future__ import annotations
 import json
 import re
-from typing import Any
+from typing import Optional, Union, Any
 import ast
 
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -36,7 +37,7 @@ def _normalize_title(value: str) -> str:
     return re.sub(r"[\\s\\u3000]+", "", value)
 
 
-def _find_section(sections: dict[str, str], prefix: str) -> str | None:
+def _find_section(sections: dict[str, str], prefix: str) -> Optional[str]:
     normalized_prefix = _normalize_title(prefix)
     for title, body in sections.items():
         if _normalize_title(title).startswith(normalized_prefix):
@@ -46,7 +47,7 @@ def _find_section(sections: dict[str, str], prefix: str) -> str | None:
 
 def _extract_roles(body: str) -> dict[str, list[str]]:
     roles: dict[str, list[str]] = {}
-    current_role: str | None = None
+    current_role: Optional[str] = None
     for raw_line in body.splitlines():
         line = raw_line.strip()
         if not line:
@@ -112,7 +113,7 @@ def _extract_scenes_blocks(body: str) -> list[tuple[str, str]]:
     return blocks
 
 
-def _extract_field(block: str, label: str) -> str | None:
+def _extract_field(block: str, label: str) -> Optional[str]:
     match = re.search(rf"{re.escape(label)}[:：]\\s*(.+)", block)
     if not match:
         return None
@@ -194,7 +195,7 @@ def validate_script(content: str) -> ValidationResult:
     return ValidationResult(valid, errors, warnings)
 
 
-def _extract_json_payload(text: str) -> dict[str, Any] | None:
+def _extract_json_payload(text: str) -> Optional[dict[str, Any]]:
     if not text:
         return None
     fenced_match = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", text)
@@ -215,7 +216,7 @@ def _extract_json_payload(text: str) -> dict[str, Any] | None:
 
 
 async def validate_script_with_model(
-    session: AsyncSession, user_id: str, content: str, model: str | None
+    session: AsyncSession, user_id: str, content: str, model: Optional[str]
 ) -> ValidationResult:
     settings = await get_or_create_settings(session, user_id)
     use_model = model or settings.default_model_text

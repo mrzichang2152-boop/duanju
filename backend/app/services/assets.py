@@ -1,7 +1,8 @@
+from __future__ import annotations
 import json
 import ast
 import re
-from typing import Any
+from typing import Optional, Union, Any
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -12,7 +13,7 @@ from app.models.project import Project
 from app.services.linkapi import create_chat_completion
 
 
-def _extract_json_payload(text: str) -> dict[str, Any] | None:
+def _extract_json_payload(text: str) -> Optional[dict[str, Any]]:
     if not text:
         return None
     fenced_match = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", text)
@@ -44,7 +45,7 @@ def _normalize_look_label(value: str) -> str:
 
 def _extract_role_descriptions(body: str) -> dict[str, str]:
     roles: dict[str, str] = {}
-    current_role: str | None = None
+    current_role: Optional[str] = None
     buffer: list[str] = []
     for raw_line in body.splitlines():
         line = raw_line.strip()
@@ -73,7 +74,7 @@ def _extract_role_descriptions(body: str) -> dict[str, str]:
 
 def _extract_role_looks(body: str) -> dict[str, list[tuple[str, str]]]:
     looks: dict[str, list[tuple[str, str]]] = {}
-    current_role: str | None = None
+    current_role: Optional[str] = None
     for raw_line in body.splitlines():
         line = raw_line.strip()
         if not line:
@@ -126,7 +127,7 @@ def _extract_props_with_desc(body: str) -> list[tuple[str, str]]:
 
 def _extract_scenes_with_desc(body: str) -> dict[str, str]:
     scenes: dict[str, str] = {}
-    current_scene: str | None = None
+    current_scene: Optional[str] = None
     buffer: list[str] = []
     for raw_line in body.splitlines():
         line = raw_line.strip()
@@ -169,12 +170,12 @@ async def list_asset_versions(session: AsyncSession, asset_id: str) -> list[Asse
     return list(result.scalars().all())
 
 
-async def get_asset(session: AsyncSession, asset_id: str) -> Asset | None:
+async def get_asset(session: AsyncSession, asset_id: str) -> Optional[Asset]:
     return await session.scalar(select(Asset).where(Asset.id == asset_id))
 
 
 async def extract_assets_from_script(
-    session: AsyncSession, project_id: str, user_id: str | None = None
+    session: AsyncSession, project_id: str, user_id: Optional[str] = None
 ) -> list[Asset]:
     script = await session.scalar(
         select(Script).where(Script.project_id == project_id, Script.is_active == True)
@@ -352,7 +353,7 @@ async def extract_assets_from_script(
 
 
 async def create_asset_version(
-    session: AsyncSession, asset_id: str, image_url: str, prompt: str | None = None
+    session: AsyncSession, asset_id: str, image_url: str, prompt: Optional[str] = None
 ) -> AssetVersion:
     version = AssetVersion(asset_id=asset_id, image_url=image_url, prompt=prompt, is_selected=False)
     session.add(version)

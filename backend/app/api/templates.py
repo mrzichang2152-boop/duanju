@@ -1,3 +1,5 @@
+from __future__ import annotations
+from typing import Optional, Union
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -16,7 +18,7 @@ router = APIRouter()
 @router.get("/{project_id}/templates", response_model=list[TemplateResponse])
 async def fetch_templates(
     project_id: str,
-    kind: str | None = Query(default=None),
+    kind: Optional[str] = Query(default=None),
     user_id: str = Depends(get_current_user_id),
     db: AsyncSession = Depends(get_db),
 ) -> list[TemplateResponse]:
@@ -25,7 +27,7 @@ async def fetch_templates(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="项目不存在")
     templates = await list_templates(db, project_id, kind)
 
-    def parse_tags(raw: str | None) -> list[str]:
+    def parse_tags(raw: Optional[str]) -> list[str]:
         if not raw:
             return []
         try:
