@@ -4,6 +4,19 @@ import { useState, useRef, useEffect } from "react";
 import { useParams, useRouter } from "next/navigation";
 import { generateScript, saveScript, parseScriptFile, CharacterProfile } from "@/lib/api";
 import { getToken } from "@/lib/auth";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
+
+// Helper for UUID generation (safe for HTTP context)
+const generateUUID = () => {
+  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+    return crypto.randomUUID();
+  }
+  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(c) {
+    var r = Math.random() * 16 | 0, v = c == 'x' ? r : (r & 0x3 | 0x8);
+    return v.toString(16);
+  });
+};
 
 // AutoResizeTextarea component
 function AutoResizeTextarea({
@@ -116,9 +129,9 @@ export default function SetupPage() {
 
   // Initialize with one empty episode
   const [episodes, setEpisodes] = useState<Episode[]>(() => {
-    const verId = crypto.randomUUID();
+    const verId = generateUUID();
     return [{
-      id: crypto.randomUUID(),
+      id: generateUUID(),
       versions: [{ id: verId, content: "", createdAt: Date.now() }],
       selectedVersionId: verId
     }];
@@ -176,18 +189,18 @@ export default function SetupPage() {
       
       if (result.episodes.length > 0) {
         const newEpisodes: Episode[] = result.episodes.map(content => {
-          const verId = crypto.randomUUID();
+          const verId = generateUUID();
           return {
-            id: crypto.randomUUID(),
+            id: generateUUID(),
             versions: [{ id: verId, content, createdAt: Date.now(), prompt: "Initial Import" }],
             selectedVersionId: verId
           };
         });
         setEpisodes(newEpisodes);
       } else {
-        const verId = crypto.randomUUID();
+        const verId = generateUUID();
         setEpisodes([{
-          id: crypto.randomUUID(),
+          id: generateUUID(),
           versions: [{ id: verId, content: "", createdAt: Date.now() }],
           selectedVersionId: verId
         }]);
@@ -224,9 +237,9 @@ export default function SetupPage() {
   };
 
   const handleAddEpisode = () => {
-    const verId = crypto.randomUUID();
+    const verId = generateUUID();
     setEpisodes([...episodes, {
-      id: crypto.randomUUID(),
+      id: generateUUID(),
       versions: [{ id: verId, content: "", createdAt: Date.now() }],
       selectedVersionId: verId
     }]);
@@ -315,7 +328,7 @@ ${fullScript}
       });
 
       // Add new version
-      const newVerId = crypto.randomUUID();
+      const newVerId = generateUUID();
       const newVersion: EpisodeVersion = {
         id: newVerId,
         content: result.content, // Assuming result.content is the new episode text
@@ -377,9 +390,9 @@ ${prompt}
         instruction: prompt
       });
       
-      const verId = crypto.randomUUID();
+      const verId = generateUUID();
       const newEpisode: Episode = {
-        id: crypto.randomUUID(),
+        id: generateUUID(),
         versions: [{ id: verId, content: result.content, createdAt: Date.now(), prompt: "AI Continuation" }],
         selectedVersionId: verId
       };
