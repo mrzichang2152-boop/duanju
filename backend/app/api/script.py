@@ -201,8 +201,9 @@ async def generate_script(
         "temperature": 0.7
     }
     
-    # Disable thinking mode for Step 0
-    if payload.mode in ["step0_generate", "step0_continue", "step0_modify"]:
+    # Disable thinking mode for Step 0 only if explicitly requested or for legacy compatibility
+    # User requested thinking mode for step0_modify, so we allow it there.
+    if payload.mode in ["step0_generate"]:
         api_payload["thinking"] = {"type": "disabled"}
 
     async def event_generator():
@@ -210,10 +211,13 @@ async def generate_script(
             async for chunk in create_chat_completion_stream(db, user_id, api_payload):
                  # Check if chunk is a dict (parsed JSON) or raw bytes/string
                 if isinstance(chunk, dict):
-                    content = chunk.get("choices", [{}])[0].get("delta", {}).get("content", "")
-                    if content:
+                    delta = chunk.get("choices", [{}])[0].get("delta", {})
+                    content = delta.get("content", "")
+                    reasoning = delta.get("reasoning_content", "")
+                    
+                    if content or reasoning:
                         # Yield SSE format
-                        yield f"data: {json.dumps({'choices': [{'delta': {'content': content}}]})}\n\n"
+                        yield f"data: {json.dumps({'choices': [{'delta': {'content': content, 'reasoning_content': reasoning}}]})}\n\n"
                 elif isinstance(chunk, str):
                      # If it's already a string, assume it's content
                      yield f"data: {json.dumps({'choices': [{'delta': {'content': chunk}}]})}\n\n"

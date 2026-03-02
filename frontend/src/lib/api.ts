@@ -203,17 +203,22 @@ export type ScriptGeneratePayload = {
 
 export type ScriptGenerateResponse = {
   content: string;
+  thinking?: string;
 };
 
 export const generateScript = (token: string, id: string, payload: ScriptGeneratePayload): Promise<ScriptGenerateResponse> => {
   return new Promise((resolve, reject) => {
     let content = "";
+    let thinking = "";
     generateScriptStream(token, id, payload, (chunk) => {
       if (chunk.choices?.[0]?.delta?.content) {
         content += chunk.choices[0].delta.content;
       }
+      if (chunk.choices?.[0]?.delta?.reasoning_content) {
+        thinking += chunk.choices[0].delta.reasoning_content;
+      }
     })
-      .then(() => resolve({ content }))
+      .then(() => resolve({ content, thinking }))
       .catch(reject);
   });
 };

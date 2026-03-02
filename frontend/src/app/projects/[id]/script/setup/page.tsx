@@ -2,7 +2,7 @@
 
 import { useState, useRef, useEffect } from "react";
 import { useParams, useRouter } from "next/navigation";
-import { generateScript, saveScript, parseScriptFile, CharacterProfile } from "@/lib/api";
+import { generateScript, saveScript, parseScriptFile, CharacterProfile, generateScriptStream } from "@/lib/api";
 import { getToken } from "@/lib/auth";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
@@ -119,6 +119,8 @@ export default function SetupPage() {
     content: string;
     createdAt: number;
     prompt?: string;
+    thinking?: string;
+    isThinkingCollapsed?: boolean;
   }
 
   interface Episode {
@@ -154,6 +156,7 @@ export default function SetupPage() {
   // AI Continuation State
   const [showContinueModal, setShowContinueModal] = useState(false);
   const [continuing, setContinuing] = useState(false);
+  const abortControllerRef = useRef<AbortController | null>(null);
 
   const toggleChar = (index: number) => {
     const newSet = new Set(collapsedChars);
@@ -276,6 +279,22 @@ export default function SetupPage() {
     setEpisodes(newEps);
   };
 
+  const toggleEpisodeThinking = (epIndex: number) => {
+    setEpisodes(prev => {
+      const newEps = [...prev];
+      const ep = newEps[epIndex];
+      const verIndex = ep.versions.findIndex(v => v.id === ep.selectedVersionId);
+      
+      if (verIndex !== -1) {
+        const newVersions = [...ep.versions];
+        const currentVer = newVersions[verIndex];
+        newVersions[verIndex] = { ...currentVer, isThinkingCollapsed: !currentVer.isThinkingCollapsed };
+        newEps[epIndex] = { ...ep, versions: newVersions };
+      }
+      return newEps;
+    });
+  };
+
   const handleModifyEpisode = async (epIndex: number) => {
     if (!modifyPrompt.trim()) return;
     
@@ -287,6 +306,10 @@ export default function SetupPage() {
 
     setIsModifying(true);
     setError(null);
+
+    // Create AbortController
+    const abortController = new AbortController();
+    abortControllerRef.current = abortController;
 
     // Construct Context
     // Use the *selected* version content for all episodes to form the context
@@ -307,51 +330,77 @@ ${fullScript}
     `.trim();
 
     try {
-      // We are modifying the specific episode at epIndex
-      // The instruction is the user prompt
-      // We pass the full context
-      // And we might want to explicitly say "Modify Episode X" in the instruction wrapper if the backend doesn't know X.
-      // But our backend prompt says "对【指定集数】的内容进行修改". 
-      // So we should include "请修改第X集：..." in the instruction passed to backend?
-      // Or just pass the instruction and let the system prompt handle it combined with the fact that we are focusing on it?
-      // The backend prompt uses:
-      // user_prompt = f"""{context_block}\n\n【修改要求】\n{instruction_block}"""
-      // So we should make sure the instruction is clear about WHICH episode.
-      
       const targetEpLabel = `第${epIndex + 1}集`;
       const finalInstruction = `针对${targetEpLabel}进行修改。修改要求：${modifyPrompt}`;
 
-      const result = await generateScript(token, params.id, {
-        mode: "step0_modify",
-        content: context,
-        instruction: finalInstruction
-      });
-
-      // Add new version
+      // Add new version immediately
       const newVerId = generateUUID();
       const newVersion: EpisodeVersion = {
         id: newVerId,
-        content: result.content, // Assuming result.content is the new episode text
+        content: "",
+        thinking: "",
+        isThinkingCollapsed: false,
         createdAt: Date.now(),
         prompt: modifyPrompt
       };
 
-      const newEps = [...episodes];
-      newEps[epIndex] = {
-        ...newEps[epIndex],
-        versions: [...newEps[epIndex].versions, newVersion],
-        selectedVersionId: newVerId
-      };
-      setEpisodes(newEps);
-      
-      // Reset modification state
+      setEpisodes(prevEpisodes => {
+        const newEps = [...prevEpisodes];
+        newEps[epIndex] = {
+          ...newEps[epIndex],
+          versions: [...newEps[epIndex].versions, newVersion],
+          selectedVersionId: newVerId
+        };
+        return newEps;
+      });
+
+      // Reset modification state UI but keep isModifying true until stream ends
       setModifyPrompt("");
       setModifyingEpId(null);
+
+      await generateScriptStream(token, params.id, {
+        mode: "step0_modify",
+        content: context,
+        instruction: finalInstruction
+      }, (chunk) => {
+        setEpisodes(prevEpisodes => {
+          const newEps = [...prevEpisodes];
+          const ep = newEps[epIndex];
+          const verIndex = ep.versions.findIndex(v => v.id === newVerId);
+          
+          if (verIndex !== -1) {
+            const newVersions = [...ep.versions];
+            const currentVer = { ...newVersions[verIndex] };
+
+            if (chunk.choices?.[0]?.delta?.reasoning_content) {
+              currentVer.thinking = (currentVer.thinking || "") + chunk.choices[0].delta.reasoning_content;
+            }
+            
+            if (chunk.choices?.[0]?.delta?.content) {
+              // If this is the first content chunk, collapse thinking
+              if (!currentVer.content && currentVer.thinking) {
+                 currentVer.isThinkingCollapsed = true;
+              }
+              currentVer.content += chunk.choices[0].delta.content;
+            }
+
+            newVersions[verIndex] = currentVer;
+            newEps[epIndex] = { ...ep, versions: newVersions };
+          }
+          return newEps;
+        });
+      }, abortController.signal);
+      
     } catch (err) {
-      console.error(err);
-      setError(err instanceof Error ? err.message : "修改失败");
+      if (err instanceof Error && err.name === 'AbortError') {
+        console.log("Generation aborted");
+      } else {
+        console.error(err);
+        setError(err instanceof Error ? err.message : "修改失败");
+      }
     } finally {
       setIsModifying(false);
+      abortControllerRef.current = null;
     }
   };
 
@@ -362,8 +411,14 @@ ${fullScript}
       return;
     }
 
+    // Close modal immediately
+    setShowContinueModal(false);
     setContinuing(true);
     setError(null);
+
+    // Create AbortController
+    const abortController = new AbortController();
+    abortControllerRef.current = abortController;
 
     // Construct full context using selected versions
     const context = `
@@ -384,26 +439,72 @@ ${prompt}
     `.trim();
 
     try {
-      const result = await generateScript(token, params.id, {
-        mode: "step0_continue",
-        content: context,
-        instruction: prompt
-      });
-      
+      // Create new episode immediately
+      const newEpId = generateUUID();
       const verId = generateUUID();
       const newEpisode: Episode = {
-        id: generateUUID(),
-        versions: [{ id: verId, content: result.content, createdAt: Date.now(), prompt: "AI Continuation" }],
+        id: newEpId,
+        versions: [{ 
+          id: verId, 
+          content: "", 
+          thinking: "",
+          isThinkingCollapsed: false,
+          createdAt: Date.now(), 
+          prompt: "AI Continuation" 
+        }],
         selectedVersionId: verId
       };
       
-      setEpisodes([...episodes, newEpisode]);
-      setShowContinueModal(false);
+      setEpisodes(prev => [...prev, newEpisode]);
+      const newEpIndex = episodes.length; // Index of the new episode (since we just added one, and setState is async but we use functional update below)
+
+      await generateScriptStream(token, params.id, {
+        mode: "step0_continue",
+        content: context,
+        instruction: prompt
+      }, (chunk) => {
+        setEpisodes(prevEpisodes => {
+          const newEps = [...prevEpisodes];
+          
+          // Find the episode by ID to be safe
+          const epIndex = newEps.findIndex(e => e.id === newEpId);
+          if (epIndex === -1) return newEps;
+
+          const ep = newEps[epIndex];
+          const verIndex = ep.versions.findIndex(v => v.id === verId);
+          
+          if (verIndex !== -1) {
+            const newVersions = [...ep.versions];
+            const currentVer = { ...newVersions[verIndex] };
+
+            if (chunk.choices?.[0]?.delta?.reasoning_content) {
+              currentVer.thinking = (currentVer.thinking || "") + chunk.choices[0].delta.reasoning_content;
+            }
+            
+            if (chunk.choices?.[0]?.delta?.content) {
+              if (!currentVer.content && currentVer.thinking) {
+                  currentVer.isThinkingCollapsed = true;
+              }
+              currentVer.content += chunk.choices[0].delta.content;
+            }
+
+            newVersions[verIndex] = currentVer;
+            newEps[epIndex] = { ...ep, versions: newVersions };
+          }
+          return newEps;
+        });
+      }, abortController.signal);
+      
     } catch (err) {
-      console.error(err);
-      setError(err instanceof Error ? err.message : "续写失败");
+      if (err instanceof Error && err.name === 'AbortError') {
+        console.log("Generation aborted");
+      } else {
+        console.error(err);
+        setError(err instanceof Error ? err.message : "续写失败");
+      }
     } finally {
       setContinuing(false);
+      abortControllerRef.current = null;
     }
   };
 
@@ -618,6 +719,22 @@ ${fullScript}
                         </div>
                       )}
                       
+                      {/* Thinking Display */}
+                      {currentVersion?.thinking && (
+                        <div className="mb-2 rounded-lg bg-slate-50 border border-slate-100 p-3">
+                          <div 
+                            className="flex items-center justify-between mb-2 cursor-pointer"
+                            onClick={() => toggleEpisodeThinking(index)}
+                          >
+                            <span className="text-xs font-bold text-slate-400 uppercase tracking-wider">Thinking Process</span>
+                            <span className="text-xs text-slate-400">{currentVersion.isThinkingCollapsed ? "展开" : "收起"}</span>
+                          </div>
+                          <div className={`text-sm text-slate-500 leading-relaxed font-mono ${currentVersion.isThinkingCollapsed ? 'line-clamp-2' : ''}`}>
+                            {currentVersion.thinking}
+                          </div>
+                        </div>
+                      )}
+
                       <AutoResizeTextarea
                         className="w-full p-3 border border-slate-300 rounded-lg focus:ring-2 focus:ring-slate-500 focus:border-transparent outline-none"
                         value={currentVersion?.content || ""}
