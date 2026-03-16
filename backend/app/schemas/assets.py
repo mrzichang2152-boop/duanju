@@ -15,7 +15,18 @@ class AssetResponse(BaseModel):
     type: str
     name: str
     description: Optional[str]
+    prompt: Optional[str] = None
+    model: Optional[str] = None
+    size: Optional[str] = None
+    style: Optional[str] = None
     versions: list[AssetVersionResponse]
+
+
+class AssetUpdateRequest(BaseModel):
+    prompt: Optional[str] = None
+    model: Optional[str] = None
+    size: Optional[str] = None
+    style: Optional[str] = None
 
 
 class AssetGenerateRequest(BaseModel):
@@ -23,6 +34,7 @@ class AssetGenerateRequest(BaseModel):
     model: Optional[str] = None
     options: Optional[dict[str, object]] = None
     ref_image_url: Optional[str] = None
+    style: Optional[str] = None
 
 
 class AssetSelectRequest(BaseModel):

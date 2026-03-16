@@ -17,4 +17,8 @@ class Asset(Base):
     type: Mapped[str] = mapped_column(String(32))
     name: Mapped[str] = mapped_column(String(255))
     description: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    prompt: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    model: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    size: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
+    style: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)

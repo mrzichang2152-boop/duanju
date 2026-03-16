@@ -2,15 +2,8 @@
 
 import { useEffect, useState, useRef, type ChangeEvent } from "react";
 import { useParams, useRouter } from "next/navigation";
-import { getScript, saveScript, generateScript, generateScriptStream, type ScriptGeneratePayload, getScriptHistory, type ScriptHistoryItem } from "@/lib/api";
+import { getScript, saveScript, generateScriptStream, type ScriptGeneratePayload } from "@/lib/api";
 import { getToken } from "@/lib/auth";
-import { ScriptEditor } from "@/app/components/ScriptEditor";
-import AIContinuationModal from "./AIContinuationModal";
-
-// ... (keep scriptOptions as is, it's long and static)
-// I will include scriptOptions in the replacement if I can match the whole file or just the component.
-// Since the file is truncated in read, I will use a marker to keep scriptOptions if possible, or just copy it back if I have it.
-// I have scriptOptions from the previous Read. I will include it to be safe.
 
 const scriptOptions = [
   {
@@ -216,15 +209,46 @@ const scriptOptions = [
   }
 ];
 
-interface ScriptVersion {
-  id: string;
-  content: string;
-  thinking: string;
-  isThinkingCollapsed: boolean;
-  isCollapsed: boolean;
-  timestamp: number;
-  label: string;
-}
+const TextareaAutoResize = ({ 
+  value, 
+  onChange, 
+  placeholder, 
+  disabled, 
+  className,
+  isGenerating
+}: {
+  value: string;
+  onChange: (e: ChangeEvent<HTMLTextAreaElement>) => void;
+  placeholder?: string;
+  disabled?: boolean;
+  className?: string;
+  isGenerating?: boolean;
+}) => {
+  const ref = useRef<HTMLTextAreaElement>(null);
+
+  useEffect(() => {
+            if (ref.current) {
+              // Only reset height to allow shrinking if not generating or if value is empty to prevent jitter
+              if (!isGenerating || !value) {
+                ref.current.style.height = 'auto';
+              }
+              // Set new height based on scrollHeight
+              ref.current.style.height = `${ref.current.scrollHeight}px`;
+            }
+          }, [value, isGenerating]);
+
+  return (
+    <textarea
+      ref={ref}
+      value={value}
+      onChange={onChange}
+      placeholder={placeholder}
+      disabled={disabled}
+      className={className}
+      rows={1}
+    />
+  );
+};
 
 export default function ScriptInputPage() {
   const params = useParams<{ id: string }>();
@@ -236,48 +260,133 @@ export default function ScriptInputPage() {
   const [uploading, setUploading] = useState(false);
   const [isModifying, setIsModifying] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
+  const [debugEnabled, setDebugEnabled] = useState(false);
+  const [loadDebug, setLoadDebug] = useState({
+    startedAt: "",
+    finishedAt: "",
+    error: "",
+    cacheRestored: false,
+    apiBase: process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://localhost:8002/api",
+    tokenPresent: false,
+  });
   
   // Inputs
-  const [instruction, setInstruction] = useState("");
-  const [selectedModel, setSelectedModel] = useState("doubao-pro");
+  const [selectedModel, setSelectedModel] = useState("doubao-seed-2-0-pro-260215");
+
+  useEffect(() => {
+    if (!projectId) return;
+    const key = `script-model-${projectId}`;
+    const saved = localStorage.getItem(key);
+    if (saved) {
+      setSelectedModel(saved);
+    }
+  }, [projectId]);
+
+  useEffect(() => {
+    if (!projectId || !selectedModel) return;
+    const key = `script-model-${projectId}`;
+    localStorage.setItem(key, selectedModel);
+  }, [projectId, selectedModel]);
+
+  useEffect(() => {
+    const saved = localStorage.getItem("script-load-debug") === "1";
+    setDebugEnabled(saved);
+  }, []);
+
   const [selectedOptions, setSelectedOptions] = useState<Record<string, string[]>>({});
   const [customInputs, setCustomInputs] = useState<Record<string, string>>({});
   const [selectionOrder, setSelectionOrder] = useState<Record<string, string[]>>({});
   const CUSTOM_INPUT_KEY = "___CUSTOM_INPUT___";
   
   const [isOptionsExpanded, setIsOptionsExpanded] = useState(false);
-  const [isContinuationModalOpen, setIsContinuationModalOpen] = useState(false);
   const [suggestionThinking, setSuggestionThinking] = useState("");
   const [isSuggestionThinkingCollapsed, setIsSuggestionThinkingCollapsed] = useState(true);
 
-  // Versions Management
-  const [versions, setVersions] = useState<ScriptVersion[]>([]);
+  // Script Content State (Replaces Versions)
+  const [scriptContent, setScriptContent] = useState("");
+  const [scriptThinking, setScriptThinking] = useState("");
+  const [isScriptThinkingCollapsed, setIsScriptThinkingCollapsed] = useState(true);
+
+  // Outline State
+  const [showOriginalScript, setShowOriginalScript] = useState(false);
+  const [showOutline, setShowOutline] = useState(true);
+  const [outlineContent, setOutlineContent] = useState("");
+  const [outlineThinking, setOutlineThinking] = useState("");
+  const [isOutlineThinkingCollapsed, setIsOutlineThinkingCollapsed] = useState(true);
+  const [isExtractingOutline, setIsExtractingOutline] = useState(false);
+  const [selectedSuggestionMode, setSelectedSuggestionMode] = useState<"suggestion_paid" | "suggestion_traffic" | null>(null);
+
+  // Split Script State
+  interface EpisodeVersion {
+    id: string;
+    name: string;
+    content: string;
+    thinking: string;
+    createdAt: number;
+  }
+
+  interface Episode {
+    title: string;
+    versions: EpisodeVersion[];
+    currentVersionId: string;
+    userInput: string;
+    thinking: string; // For suggestion thinking
+    isThinkingCollapsed: boolean;
+    isGenerating: boolean;
+  }
   
+  const generateId = () => Math.random().toString(36).substring(2, 15) + Math.random().toString(36).substring(2, 15);
+  
+  const [episodes, setEpisodes] = useState<Episode[]>([]);
+  const [expandedEpisodes, setExpandedEpisodes] = useState<Set<number>>(new Set()); // Default all collapsed
+  const [isSplittingScript, setIsSplittingScript] = useState(false);
+  const [showSplitScript, setShowSplitScript] = useState(true);
+
+  // Sync scriptContent with episodes whenever episodes change (e.g. version switching)
+  useEffect(() => {
+    if (episodes.length > 0) {
+      const newContent = episodes.map(ep => {
+        const currentVersion = ep.versions.find(v => v.id === ep.currentVersionId) || ep.versions[0];
+        return `${ep.title || ""}\n${currentVersion.content || ""}`;
+      }).join("\n\n");
+      
+      // Only update if content is actually different to avoid unnecessary updates
+      // Using a functional update check or just direct comparison if scriptContent is in closure
+      // We don't want to depend on scriptContent to avoid reverting manual edits unless episodes change
+      setScriptContent(prev => {
+        if (prev !== newContent) {
+            return newContent;
+        }
+        return prev;
+      });
+    }
+  }, [episodes]);
+
+  const SEPARATOR = "\n\n=== 原文剧本 (请勿删除此行) ===\n\n";
+  const scriptCacheKey = projectId ? `script-cache-${projectId}` : "";
+  const resourcesPartRef = useRef<string>("");
+
   const saveTimeoutRef = useRef<NodeJS.Timeout | null>(null);
   const lastSavedContentRef = useRef("");
   const lastSavedThinkingRef = useRef("");
-  const textareaRef = useRef<HTMLTextAreaElement>(null);
-  const abortControllerRef = useRef<AbortController | null>(null);
+  const lastSavedOutlineRef = useRef("");
+  const lastSavedEpisodesRef = useRef<Episode[]>([]);
+  const abortControllersRef = useRef<Record<number, AbortController>>({});
+  const globalAbortControllerRef = useRef<AbortController | null>(null);
 
   useEffect(() => {
     return () => {
-      if (abortControllerRef.current) {
-        abortControllerRef.current.abort();
+      if (globalAbortControllerRef.current) {
+        globalAbortControllerRef.current.abort();
       }
+      Object.values(abortControllersRef.current).forEach(c => c.abort());
     };
   }, []);
 
-  useEffect(() => {
-    if (textareaRef.current) {
-      textareaRef.current.style.height = "auto";
-      textareaRef.current.style.height = `${textareaRef.current.scrollHeight + 2}px`;
-    }
-  }, [instruction]);
-
   const stopGeneration = () => {
-    if (abortControllerRef.current) {
-      abortControllerRef.current.abort();
-      abortControllerRef.current = null;
+    if (globalAbortControllerRef.current) {
+      globalAbortControllerRef.current.abort();
+      globalAbortControllerRef.current = null;
       setIsModifying(false);
       setMessage("已停止生成");
     }
@@ -285,50 +394,148 @@ export default function ScriptInputPage() {
 
   // Initial Data Fetch
   useEffect(() => {
-    if (!projectId) return;
+    if (!projectId) {
+      setLoading(false);
+      setMessage("项目 ID 无效");
+      return;
+    }
     const token = getToken();
     if (!token) {
+      setLoading(false);
       router.push("/login");
       return;
     }
 
     const fetchData = async () => {
+      setLoadDebug((prev) => ({
+        ...prev,
+        startedAt: new Date().toISOString(),
+        finishedAt: "",
+        error: "",
+        cacheRestored: false,
+        tokenPresent: Boolean(token),
+      }));
       try {
-        const [scriptData, historyData] = await Promise.all([
-          getScript(token, projectId).catch(() => ({ content: "", id: null, thinking: "" })),
-          getScriptHistory(token, projectId).catch(() => ({ items: [] }))
-        ]);
+        const scriptData = await getScript(token, projectId);
+        
+        // Handle content loading and separation of resources
+        let currentContent = scriptData.content ?? "";
+        if (currentContent.includes(SEPARATOR)) {
+          const parts = currentContent.split(SEPARATOR);
+          resourcesPartRef.current = parts[0];
+          currentContent = parts.slice(1).join(SEPARATOR);
+        } else {
+          resourcesPartRef.current = "";
+        }
 
-        const currentContent = scriptData.content ?? "";
         const currentThinking = scriptData.thinking ?? "";
         lastSavedContentRef.current = currentContent;
         lastSavedThinkingRef.current = currentThinking;
-
-        const historyVersions: ScriptVersion[] = historyData.items.map((h: any) => ({
-          id: h.id,
-          content: h.content,
-          thinking: h.thinking ?? "",
-          isThinkingCollapsed: true,
-          isCollapsed: true,
-          timestamp: new Date(h.created_at).getTime(),
-          label: `Version ${h.version}`
-        }));
-
-        const initialVersions = [
-          {
-            id: "current",
-            content: currentContent,
-            thinking: currentThinking,
-            isThinkingCollapsed: true,
-            isCollapsed: false,
-            timestamp: Date.now(),
-            label: historyVersions.length > 0 ? `Version ${historyVersions.length + 1}` : "Version 1"
-          },
-          ...historyVersions
-        ];
+        lastSavedOutlineRef.current = scriptData.outline ?? "";
         
-        setVersions(initialVersions);
+        setScriptContent(currentContent);
+        setScriptThinking(currentThinking);
+        setIsScriptThinkingCollapsed(true);
+
+        // Always show original script if content exists and episodes are empty
+        if (currentContent && (!scriptData.episodes || scriptData.episodes.length === 0)) {
+           setShowOriginalScript(true);
+        }
+
+        if (scriptData.outline) {
+            setOutlineContent(scriptData.outline);
+        }
+
+        if (scriptData.episodes && scriptData.episodes.length > 0) {
+            const mappedEpisodes = scriptData.episodes.map((ep: any) => {
+                const versions: EpisodeVersion[] = ep.versions && ep.versions.length > 0 
+                  ? ep.versions 
+                  : [{
+                      id: generateId(),
+                      name: "原版",
+                      content: ep.content || "",
+                      thinking: ep.thinking || "",
+                      createdAt: Date.now()
+                  }];
+                
+                const currentVersionId = ep.currentVersionId || versions[0].id;
+                
+                return {
+                  title: ep.title,
+                  versions,
+                  currentVersionId,
+                  userInput: ep.userInput || "",
+                  thinking: ep.thinking || "", // Global suggestion thinking
+                  isThinkingCollapsed: ep.isThinkingCollapsed ?? true,
+                  isGenerating: false
+                };
+            });
+            setEpisodes(mappedEpisodes);
+            lastSavedEpisodesRef.current = mappedEpisodes;
+            setShowSplitScript(true);
+        } else {
+            lastSavedEpisodesRef.current = [];
+        }
+        setLoadDebug((prev) => ({
+          ...prev,
+          finishedAt: new Date().toISOString(),
+          error: "",
+          cacheRestored: false,
+        }));
+        if (scriptCacheKey) {
+          localStorage.setItem(
+            scriptCacheKey,
+            JSON.stringify({
+              content: currentContent,
+              thinking: currentThinking,
+              outline: scriptData.outline ?? "",
+              episodes: scriptData.episodes ?? [],
+            })
+          );
+        }
       } catch (e) {
+        let restored = false;
+        if (scriptCacheKey) {
+          const cached = localStorage.getItem(scriptCacheKey);
+          if (cached) {
+            try {
+              const parsed = JSON.parse(cached) as {
+                content?: string;
+                thinking?: string;
+                outline?: string;
+                episodes?: Episode[];
+              };
+              setScriptContent(parsed.content ?? "");
+              setScriptThinking(parsed.thinking ?? "");
+              setOutlineContent(parsed.outline ?? "");
+              if (Array.isArray(parsed.episodes) && parsed.episodes.length > 0) {
+                setEpisodes(parsed.episodes);
+                setShowSplitScript(true);
+              }
+              restored = true;
+            } catch {
+              restored = false;
+            }
+          }
+        }
+        if (restored) {
+          setMessage("远端加载失败，已恢复本地缓存");
+          setLoadDebug((prev) => ({
+            ...prev,
+            finishedAt: new Date().toISOString(),
+            error: e instanceof Error ? e.message : "加载失败",
+            cacheRestored: true,
+          }));
+        } else {
+          const errorMessage = e instanceof Error ? e.message : "加载失败";
+          setMessage(errorMessage);
+          setLoadDebug((prev) => ({
+            ...prev,
+            finishedAt: new Date().toISOString(),
+            error: errorMessage,
+            cacheRestored: false,
+          }));
+        }
         console.error("Fetch failed", e);
       } finally {
         setLoading(false);
@@ -338,14 +545,29 @@ export default function ScriptInputPage() {
     fetchData();
   }, [projectId]);
 
-  // Auto-save active version
   useEffect(() => {
-    if (loading || !projectId || versions.length === 0) return;
-    
-    const activeContent = versions[0].content;
-    const activeThinking = versions[0].thinking;
+    if (!projectId || loading || !scriptCacheKey) return;
+    localStorage.setItem(
+      scriptCacheKey,
+      JSON.stringify({
+        content: scriptContent,
+        thinking: scriptThinking,
+        outline: outlineContent,
+        episodes,
+      })
+    );
+  }, [projectId, loading, scriptCacheKey, scriptContent, scriptThinking, outlineContent, episodes]);
 
-    if (activeContent === lastSavedContentRef.current && activeThinking === lastSavedThinkingRef.current) return;
+  // Auto-save
+  useEffect(() => {
+    if (loading || !projectId) return;
+    
+    const episodesChanged = JSON.stringify(episodes) !== JSON.stringify(lastSavedEpisodesRef.current);
+
+    if (scriptContent === lastSavedContentRef.current && 
+        scriptThinking === lastSavedThinkingRef.current && 
+        outlineContent === lastSavedOutlineRef.current &&
+        !episodesChanged) return;
 
     if (saveTimeoutRef.current) {
       clearTimeout(saveTimeoutRef.current);
@@ -356,9 +578,20 @@ export default function ScriptInputPage() {
       if (!token) return;
       
       try {
-        await saveScript(token, projectId, activeContent, activeThinking);
-        lastSavedContentRef.current = activeContent;
-        lastSavedThinkingRef.current = activeThinking || "";
+        let finalContent = scriptContent;
+        if (resourcesPartRef.current) {
+          finalContent = resourcesPartRef.current + SEPARATOR + scriptContent;
+        }
+        // Filter out UI-only fields from episodes before saving
+        // Cast to any to bypass strict type checking for saving
+        const episodesToSave = episodes.map(({ isGenerating, ...rest }) => rest) as any[];
+        
+        await saveScript(token, projectId, finalContent, scriptThinking, undefined, outlineContent, episodesToSave);
+        
+        lastSavedContentRef.current = scriptContent;
+        lastSavedThinkingRef.current = scriptThinking || "";
+        lastSavedOutlineRef.current = outlineContent || "";
+        lastSavedEpisodesRef.current = episodes;
         setMessage("已自动保存");
       } catch (e) {
         console.error("Auto-save failed", e);
@@ -370,26 +603,41 @@ export default function ScriptInputPage() {
         clearTimeout(saveTimeoutRef.current);
       }
     };
-  }, [versions, projectId, loading]);
+  }, [scriptContent, scriptThinking, outlineContent, episodes, projectId, loading]);
 
   const save = async () => {
-    if (!projectId || versions.length === 0) return;
+    if (!projectId) return;
     const token = getToken();
     if (!token) return;
     
     try {
-      await saveScript(token, projectId, versions[0].content, versions[0].thinking);
-      lastSavedContentRef.current = versions[0].content;
-      lastSavedThinkingRef.current = versions[0].thinking || "";
+      let finalContent = scriptContent;
+      if (resourcesPartRef.current) {
+        finalContent = resourcesPartRef.current + SEPARATOR + finalContent;
+      }
+      
+      // Filter out UI-only fields from episodes before saving
+      const episodesToSave = episodes.map(({ isGenerating, ...rest }) => {
+        // Ensure content is populated from current version for downstream consumption (e.g. Step 4)
+        const currentVersion = rest.versions.find(v => v.id === rest.currentVersionId) || rest.versions[0];
+        return {
+          ...rest,
+          content: currentVersion ? currentVersion.content : ""
+        };
+      }) as any[];
+      
+      await saveScript(token, projectId, finalContent, scriptThinking, undefined, outlineContent, episodesToSave);
+      lastSavedContentRef.current = scriptContent;
+      lastSavedThinkingRef.current = scriptThinking || "";
+      lastSavedOutlineRef.current = outlineContent || "";
+      lastSavedEpisodesRef.current = episodes;
       setMessage("已保存");
-      // Optional: Refresh history?
     } catch (error) {
       setMessage("保存失败");
     }
   };
 
   const handleUpload = async (event: ChangeEvent<HTMLInputElement>) => {
-    // ... (keep existing upload logic, update versions[0])
     if (!projectId) return;
     const token = getToken();
     if (!token) return;
@@ -419,7 +667,7 @@ export default function ScriptInputPage() {
         text = await file.text();
       }
       
-      updateActiveVersion(text);
+      setScriptContent(text);
       await saveScript(token, projectId, text);
       setMessage("已导入");
     } catch (error) {
@@ -430,18 +678,6 @@ export default function ScriptInputPage() {
     }
   };
 
-  // Helper to update active version content
-  const updateActiveVersion = (newContent: string) => {
-    setVersions(prev => {
-      const newVersions = [...prev];
-      if (newVersions.length > 0) {
-        newVersions[0] = { ...newVersions[0], content: newContent };
-      }
-      return newVersions;
-    });
-  };
-
-  // ... (keep toggleOption, handleCustomInputChange, getFormattedInstruction)
   const toggleOption = (label: string, option: string) => {
     setSelectedOptions((prev) => {
       const current = prev[label] || [];
@@ -501,203 +737,391 @@ export default function ScriptInputPage() {
     return formattedText.trim();
   };
 
-  const handleModify = async () => {
-    if (!projectId || !instruction.trim()) return;
+  const handleExtractOutline = async () => {
+    if (!projectId) return;
     const token = getToken();
     if (!token) {
       router.push("/login");
       return;
     }
 
-    setIsModifying(true);
-    setMessage("AI 修改中...");
+    setIsExtractingOutline(true);
+    setOutlineContent(""); // Clear existing
+    setOutlineThinking(""); // Clear existing thinking
+    setIsOutlineThinkingCollapsed(false); // Expand initially
+    setShowOutline(true);
+    setMessage("AI 正在提炼大纲...");
 
-    // Create AbortController
     const abortController = new AbortController();
-    abortControllerRef.current = abortController;
+    globalAbortControllerRef.current = abortController;
 
-    let finalInstruction = instruction;
-    const formattedOptions = getFormattedInstruction();
-    if (formattedOptions) {
-      finalInstruction += `\n\n【高级设定】\n`;
-      finalInstruction += `${formattedOptions}\n`;
-    }
-
-    // Create new version
-    const newVersionId = `ver-${Date.now()}`;
-    const newVersion: ScriptVersion = {
-      id: newVersionId,
-      content: "",
-      thinking: "",
-      isThinkingCollapsed: false,
-      isCollapsed: false,
-      timestamp: Date.now(),
-      label: `Version ${versions.length + 1} (Generating...)`
-    };
-
-    // Collapse others
-    setVersions(prev => [newVersion, ...prev.map(v => ({ ...v, isCollapsed: true }))]);
+    let hasCollapsedThinking = false;
 
     try {
       await generateScriptStream(token, projectId, {
-        mode: "step1_modify",
-        content: versions[0]?.content || "", // Use previous active content as input
+        mode: "extract_outline",
+        content: scriptContent,
         model: selectedModel,
-        instruction: finalInstruction,
+        instruction: "",
       }, (chunk) => {
-        setVersions(prev => {
-          const current = [...prev];
-          const active = { ...current[0] };
-          
-          if (chunk.choices?.[0]?.delta?.reasoning_content) {
-            active.thinking += chunk.choices[0].delta.reasoning_content;
+        if (chunk.choices?.[0]?.delta?.reasoning_content) {
+          setOutlineThinking(prev => prev + chunk.choices[0].delta.reasoning_content);
+        }
+        if (chunk.choices?.[0]?.delta?.content) {
+          if (!hasCollapsedThinking) {
+             setIsOutlineThinkingCollapsed(true);
+             hasCollapsedThinking = true;
           }
-          
-          if (chunk.choices?.[0]?.delta?.content) {
-            // If this is the first content chunk, collapse thinking
-            if (!active.content && active.thinking) {
-               active.isThinkingCollapsed = true;
-            }
-            active.content += chunk.choices[0].delta.content;
-          }
-          
-          current[0] = active;
-          return current;
+          setOutlineContent(prev => prev + chunk.choices[0].delta.content);
+        }
+      }, abortController.signal);
+      
+      setMessage("大纲提炼完成");
+    } catch (error: any) {
+      if (error.name === 'AbortError') {
+        setMessage("提炼已取消");
+      } else {
+        setMessage(`提炼失败: ${error.message}`);
+      }
+    } finally {
+      setIsExtractingOutline(false);
+      globalAbortControllerRef.current = null;
+    }
+  };
+
+  const updateEpisodeInput = (index: number, value: string) => {
+    setEpisodes(prev => {
+       const newEpisodes = [...prev];
+       if (newEpisodes[index]) {
+          newEpisodes[index] = { ...newEpisodes[index], userInput: value };
+       }
+       return newEpisodes;
+    });
+  };
+
+  const toggleEpisodeThinking = (index: number) => {
+     setEpisodes(prev => {
+        const newEpisodes = [...prev];
+        if (newEpisodes[index]) {
+           newEpisodes[index] = { 
+              ...newEpisodes[index], 
+              isThinkingCollapsed: !newEpisodes[index].isThinkingCollapsed 
+           };
+        }
+        return newEpisodes;
+     });
+  };
+
+  const handleEpisodeModify = async (index: number, source: "mode" | "custom") => {
+     if (!projectId) return;
+     const token = getToken();
+     if (!token) {
+       router.push("/login");
+       return;
+     }
+     
+     const episode = episodes[index];
+     if (!episode || episode.isGenerating) return;
+
+     // Validation for AI Modify button
+     if (source === "mode" && !selectedSuggestionMode) {
+        setMessage("请先在“AI 辅助修改”中选择“付费优化修改建议”或“流量爆款修改建议”");
+        // Clear message after 3 seconds
+        setTimeout(() => setMessage(null), 3000);
+        return;
+     }
+
+     const currentInput = episode.userInput;
+
+     // Set generating state and clear input for output
+     setEpisodes(prev => {
+        const newEpisodes = [...prev];
+        if (newEpisodes[index]) {
+           newEpisodes[index] = { 
+              ...newEpisodes[index], 
+              isGenerating: true,
+              thinking: "",
+              isThinkingCollapsed: true 
+           };
+        }
+        return newEpisodes;
+     });
+     
+     // Determine prompt
+     let instruction = "";
+     const formattedOptions = getFormattedInstruction();
+     
+     if (source === "custom") {
+        instruction = formattedOptions 
+           ? `【用户高级设定】\n${formattedOptions}\n\n【用户指令】\n${currentInput}`
+           : `【用户指令】\n${currentInput}`;
+     } else {
+        instruction = formattedOptions 
+           ? `请根据以下配置参数，为当前剧本分集提供修改建议：\n\n${formattedOptions}`
+           : "请为当前剧本分集提供修改建议：";
+     }
+     
+     // Construct Content: Outline + Episode Content
+     const currentVersion = episode.versions.find(v => v.id === episode.currentVersionId) || episode.versions[0];
+     const contextContent = `【剧本大纲】\n${outlineContent}\n\n【当前分集】\n${currentVersion.content}`;
+     
+     // Mode
+     const mode = source === "custom" ? "step0_modify" : (selectedSuggestionMode || "suggestion_paid");
+
+     const abortController = new AbortController();
+     abortControllersRef.current[index] = abortController;
+
+     let hasCollapsedThinking = false;
+     let thinkingBuffer = "";
+
+     // If source is custom, prepare new version
+     let targetVersionId = episode.currentVersionId;
+     if (source === "custom") {
+        const newVersionId = generateId();
+        targetVersionId = newVersionId;
+        
+        setEpisodes(prev => {
+           const newEpisodes = [...prev];
+           if (newEpisodes[index]) {
+              const currentEp = { ...newEpisodes[index] };
+              const newVersion: EpisodeVersion = {
+                  id: newVersionId,
+                  name: `修改版 ${currentEp.versions.length}`, // Version name
+                  content: "",
+                  thinking: "",
+                  createdAt: Date.now()
+              };
+              currentEp.versions = [...currentEp.versions, newVersion];
+              currentEp.currentVersionId = newVersionId;
+              currentEp.isGenerating = true;
+              currentEp.userInput = ""; // Clear input for custom mode
+              newEpisodes[index] = currentEp;
+           }
+           return newEpisodes;
         });
-      }, abortController.signal);
-      
-      setMessage("AI 修改完成");
-    } catch (error: any) {
-      if (error.name === 'AbortError') {
-        setMessage("生成已取消");
-      } else {
-        setMessage(`修改失败: ${error.message}`);
-        console.error(error);
-      }
-    } finally {
-      setIsModifying(false);
-      abortControllerRef.current = null;
-    }
+     }
+
+     try {
+        await generateScriptStream(token, projectId, {
+           mode: mode,
+           content: contextContent,
+           model: selectedModel,
+           instruction: instruction
+        }, (chunk) => {
+           const reasoning = chunk.choices?.[0]?.delta?.reasoning_content;
+           const content = chunk.choices?.[0]?.delta?.content;
+
+           if (reasoning) {
+              thinkingBuffer += reasoning;
+           }
+
+           setEpisodes(prev => {
+              const newEpisodes = [...prev];
+              if (!newEpisodes[index]) return newEpisodes;
+
+              const currentEp = { ...newEpisodes[index] };
+              
+              if (source === "custom") {
+                  // Update specific version
+                  currentEp.versions = currentEp.versions.map(v => {
+                      if (v.id === targetVersionId) {
+                          return {
+                              ...v,
+                              thinking: thinkingBuffer,
+                              content: v.content + (content || "")
+                          };
+                      }
+                      return v;
+                  });
+              } else {
+                  // Suggestion Mode: Update episode thinking and userInput
+                  currentEp.thinking = thinkingBuffer;
+                  if (content) {
+                     currentEp.userInput += content;
+                  }
+              }
+              
+              newEpisodes[index] = currentEp;
+              return newEpisodes;
+           });
+        }, abortController.signal);
+     } catch (e: any) {
+        if (e.name !== 'AbortError') {
+           setMessage(`生成失败: ${e.message}`);
+        }
+     } finally {
+        setEpisodes(prev => {
+           const newEpisodes = [...prev];
+           if (newEpisodes[index]) {
+              newEpisodes[index] = { ...newEpisodes[index], isGenerating: false };
+           }
+           return newEpisodes;
+        });
+        delete abortControllersRef.current[index];
+     }
   };
 
-  const handleContinuationSubmit = async (formattedAnswers: string, mode: "continuation_paid" | "continuation_traffic") => {
+  const handleSplitScript = async () => {
     if (!projectId) return;
+    const currentScript = scriptContent;
+    if (!currentScript) {
+      setMessage("暂无剧本内容");
+      return;
+    }
+
+    setIsSplittingScript(true);
+    setEpisodes([]); // Clear existing
+    setShowSplitScript(true);
+
+    // 1. Try regex splitting first
+    // Extremely loose regex to ensure we catch all episodes regardless of what follows
+    // Matches "第x集" or "EPx" at start of line (or after newline)
+    // Does NOT enforce separators (colon, etc.) to avoid missing episodes with weird suffixes
+    const episodePattern = "(?:^|[\\r\\n]+)\\s*(第\\s*[0-9一二三四五六七八九十百零]+\\s*集|(?:EP|Ep|ep|Episode)\\s*\\d+)";
+    const matchRegex = new RegExp(episodePattern, 'gi');
+    
+    // Check if we have any occurrences
+    const matches = currentScript.match(matchRegex);
+    console.log("Split Script - Matches found:", matches);
+    
+    if (matches && matches.length > 0) {
+       // Regex split successful
+       // Use capturing group in regex to keep the delimiters (episode titles) in the result
+       const splitParts = currentScript.split(new RegExp(episodePattern, 'i'));
+       console.log("Split Script - Split parts count:", splitParts.length);
+       
+       const newEpisodes: Episode[] = [];
+       
+       // splitParts structure: 
+       // [preamble, title1, content1, title2, content2, ...]
+       // We start from i=1 to skip potential preamble (text before first episode marker)
+       for (let i = 1; i < splitParts.length; i += 2) {
+          const title = splitParts[i];
+          let content = splitParts[i+1] || "";
+          
+          // Clean up leading separators (colon, dot, whitespace) from content
+          // This handles cases like "第一集：内容" where the colon was not consumed by regex
+          content = content.replace(/^[:：.\s\t]+/, "");
+
+          if (content.trim()) {
+             const cleanContent = content.trim();
+             const initialVersion: EpisodeVersion = {
+               id: generateId(),
+               name: "原版",
+               content: cleanContent,
+               thinking: "",
+               createdAt: Date.now()
+             };
+             
+             newEpisodes.push({ 
+               title, 
+               versions: [initialVersion],
+               currentVersionId: initialVersion.id,
+               userInput: "",
+               thinking: "",
+               isThinkingCollapsed: true,
+               isGenerating: false
+             });
+          }
+       }
+       
+       if (newEpisodes.length > 0) {
+          console.log("Split Script - Successfully split into episodes:", newEpisodes.length);
+          setEpisodes(newEpisodes);
+          setExpandedEpisodes(new Set());
+          setIsSplittingScript(false);
+          setMessage("分集已完成 (本地拆分)");
+          return;
+       }
+    }
+
+    // 2. If regex fails (or only 1 episode found), call AI
     const token = getToken();
     if (!token) {
       router.push("/login");
       return;
     }
 
-    setIsContinuationModalOpen(false);
-    setIsModifying(true);
-    setMessage("AI 正在生成续写建议...");
-    
-    // Clear existing instruction/thinking
-    setInstruction(""); 
-    setSuggestionThinking("");
-    setIsSuggestionThinkingCollapsed(false);
-
+    setMessage("AI 正在拆分剧本...");
     const abortController = new AbortController();
-    abortControllerRef.current = abortController;
+    globalAbortControllerRef.current = abortController;
 
-    // Use suggestion mode to get advice instead of script content
-    const apiMode = mode === "continuation_paid" ? "suggestion_paid" : "suggestion_traffic";
-    
-    // Construct prompt with user's configuration
-    const prompt = formattedAnswers 
-      ? `请根据以下配置参数，为当前剧本提供续写建议：\n\n${formattedAnswers}`
-      : "请为当前剧本提供续写建议：";
-
-    let hasCollapsedThinking = false;
+    let fullContent = "";
 
     try {
       await generateScriptStream(token, projectId, {
-        mode: apiMode,
-        content: versions[0]?.content || "",
+        mode: "split_script", 
+        content: currentScript,
         model: selectedModel,
-        instruction: prompt,
+        instruction: "",
       }, (chunk) => {
-        if (chunk.choices?.[0]?.delta?.reasoning_content) {
-          setSuggestionThinking(prev => prev + chunk.choices[0].delta.reasoning_content);
-        }
         if (chunk.choices?.[0]?.delta?.content) {
-          if (!hasCollapsedThinking) {
-             setIsSuggestionThinkingCollapsed(true);
-             hasCollapsedThinking = true;
-          }
-          setInstruction(prev => prev + chunk.choices[0].delta.content);
+          fullContent += chunk.choices[0].delta.content;
         }
       }, abortController.signal);
       
-      setMessage("续写建议已生成");
+      // Parse fullContent
+      const aiMatches = fullContent.match(matchRegex);
+      if (aiMatches && aiMatches.length > 0) {
+         const splitParts = fullContent.split(new RegExp(episodePattern, 'i'));
+         const newEpisodes: Episode[] = [];
+         for (let i = 1; i < splitParts.length; i += 2) {
+            const title = splitParts[i];
+            const content = splitParts[i+1] || "";
+             const cleanContent = content.trim();
+             const initialVersion: EpisodeVersion = {
+               id: generateId(),
+               name: "原版",
+               content: cleanContent,
+               thinking: "",
+               createdAt: Date.now()
+             };
+             
+             newEpisodes.push({ 
+               title, 
+               versions: [initialVersion],
+               currentVersionId: initialVersion.id,
+               userInput: "",
+               thinking: "",
+               isThinkingCollapsed: true,
+               isGenerating: false
+            });
+         }
+         setEpisodes(newEpisodes);
+         setExpandedEpisodes(new Set());
+         setMessage("分集已完成");
+      } else {
+         // Fallback if AI didn't output standard format
+         const initialVersion: EpisodeVersion = {
+            id: generateId(),
+            name: "原版",
+            content: fullContent,
+            thinking: "",
+            createdAt: Date.now()
+         };
+         
+         setEpisodes([{ 
+            title: "全集", 
+            versions: [initialVersion],
+            currentVersionId: initialVersion.id,
+            userInput: "",
+            thinking: "",
+            isThinkingCollapsed: true,
+            isGenerating: false
+         }]);
+         setExpandedEpisodes(new Set());
+         setMessage("分集完成 (未识别到明确分集标记)");
+      }
+
     } catch (error: any) {
       if (error.name === 'AbortError') {
-        setMessage("生成已取消");
+        setMessage("拆分已取消");
       } else {
-        setMessage(`生成建议失败: ${error.message}`);
-        console.error(error);
+        setMessage(`拆分失败: ${error.message}`);
       }
     } finally {
-      setIsModifying(false);
-      abortControllerRef.current = null;
-    }
-  };
-
-  // Suggestion remains mostly same, just updates instruction box
-  const handleSuggestion = async (mode: "suggestion_paid" | "suggestion_traffic") => {
-    if (!projectId) return;
-    const token = getToken();
-    if (!token) {
-      router.push("/login");
-      return;
-    }
-
-    setIsModifying(true);
-    setMessage("AI 正在生成建议...");
-    setInstruction(""); // Clear existing instruction
-    setSuggestionThinking(""); // Clear existing thinking
-    setIsSuggestionThinkingCollapsed(false); // Expand thinking initially
-
-    const abortController = new AbortController();
-    abortControllerRef.current = abortController;
-
-    let finalInstruction = "";
-    const formattedOptions = getFormattedInstruction();
-    if (formattedOptions) {
-      finalInstruction += `【用户高级设定】\n`;
-      finalInstruction += `${formattedOptions}\n`;
-    }
-
-    let hasCollapsedThinking = false;
-
-    try {
-      await generateScriptStream(token, projectId, {
-        mode: mode,
-        content: versions[0]?.content || "",
-        model: selectedModel,
-        instruction: finalInstruction,
-      }, (chunk) => {
-        if (chunk.choices?.[0]?.delta?.reasoning_content) {
-          setSuggestionThinking(prev => prev + chunk.choices[0].delta.reasoning_content);
-        }
-        if (chunk.choices?.[0]?.delta?.content) {
-          if (!hasCollapsedThinking) {
-             setIsSuggestionThinkingCollapsed(true);
-             hasCollapsedThinking = true;
-          }
-          setInstruction(prev => prev + chunk.choices[0].delta.content);
-        }
-      }, abortController.signal);
-      setMessage("建议已生成");
-    } catch (error: any) {
-      if (error.name === 'AbortError') {
-        setMessage("建议生成已取消");
-      } else {
-        setMessage(`生成建议失败: ${error.message}`);
-      }
-    } finally {
-      setIsModifying(false);
-      abortControllerRef.current = null;
+      setIsSplittingScript(false);
+      globalAbortControllerRef.current = null;
     }
   };
 
@@ -706,46 +1130,21 @@ export default function ScriptInputPage() {
     router.push(`/projects/${projectId}/script/resources`);
   };
 
-  const toggleCollapse = (index: number) => {
-    setVersions(prev => {
-      const newVersions = [...prev];
-      newVersions[index] = { ...newVersions[index], isCollapsed: !newVersions[index].isCollapsed };
-      return newVersions;
-    });
-  };
-  
-  const toggleThinking = (index: number) => {
-     setVersions(prev => {
-      const newVersions = [...prev];
-      newVersions[index] = { ...newVersions[index], isThinkingCollapsed: !newVersions[index].isThinkingCollapsed };
-      return newVersions;
-    });
-  };
-
-  const handleRevert = (version: ScriptVersion) => {
-    if (confirm("确定要恢复到此版本吗？这将创建一个新的当前版本。")) {
-      const newVersionId = `ver-${Date.now()}`;
-      const newVersion: ScriptVersion = {
-        id: newVersionId,
-        content: version.content,
-        thinking: "",
-        isThinkingCollapsed: true,
-        isCollapsed: false,
-        timestamp: Date.now(),
-        label: `Restored from ${version.label}`
-      };
-      
-      setVersions(prev => [newVersion, ...prev.map(v => ({ ...v, isCollapsed: true }))]);
-      setMessage("已恢复版本");
-    }
-  };
-
   return (
     <div className="space-y-6">
       <div className="sticky top-0 z-40 flex items-center justify-between bg-white py-4 shadow-sm -mx-6 px-6">
         <h1 className="text-2xl font-semibold">Step 1: 修改剧本</h1>
         <div className="flex gap-3">
-          {/* History Button Removed */}
+          <button
+            onClick={() => {
+              const next = !debugEnabled;
+              setDebugEnabled(next);
+              localStorage.setItem("script-load-debug", next ? "1" : "0");
+            }}
+            className={`rounded-lg border px-3 py-2 text-xs ${debugEnabled ? "border-amber-300 bg-amber-50 text-amber-700" : "border-slate-200 text-slate-600 hover:bg-slate-50"}`}
+          >
+            调试{debugEnabled ? "开" : "关"}
+          </button>
           <label className="cursor-pointer rounded-lg border border-slate-200 px-4 py-2 text-sm hover:bg-slate-50">
             {uploading ? "导入中..." : "导入剧本 (.txt / .docx)"}
             <input
@@ -771,12 +1170,94 @@ export default function ScriptInputPage() {
         </div>
       </div>
 
+      {debugEnabled ? (
+        <div className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800">
+          {`projectId=${projectId || "N/A"} | api=${loadDebug.apiBase} | token=${loadDebug.tokenPresent ? "yes" : "no"} | start=${loadDebug.startedAt || "-"} | end=${loadDebug.finishedAt || "-"} | cache=${loadDebug.cacheRestored ? "yes" : "no"} | error=${loadDebug.error || "-"}`}
+        </div>
+      ) : null}
+
       {loading ? (
         <div>加载中...</div>
       ) : (
         <div className="space-y-4">
+          {/* Original Script Section */}
           <div className="rounded-xl border border-slate-200 bg-white p-4 shadow-sm">
-             {/* ... Input Section (Same as before) ... */}
+            <div className="flex items-center justify-between">
+               <h3 className="font-semibold text-slate-900">原文剧本</h3>
+               <div className="flex items-center gap-2">
+                 <button 
+                   onClick={handleExtractOutline}
+                   disabled={isExtractingOutline || !scriptContent}
+                   className="rounded-lg border border-indigo-200 bg-indigo-50 px-3 py-1 text-xs text-indigo-700 hover:bg-indigo-100 disabled:opacity-50 transition-colors"
+                 >
+                   {isExtractingOutline ? "提炼中..." : "提炼剧本大纲"}
+                 </button>
+                 <button 
+                   onClick={handleSplitScript}
+                   disabled={isSplittingScript || !scriptContent}
+                   className="rounded-lg border border-blue-200 bg-blue-50 px-3 py-1 text-xs text-blue-700 hover:bg-blue-100 disabled:opacity-50 transition-colors"
+                 >
+                   {isSplittingScript ? "拆分中..." : "剧本分集"}
+                 </button>
+                 <button 
+                   onClick={() => setShowOriginalScript(!showOriginalScript)}
+                   className="text-xs text-slate-500 hover:text-slate-700"
+                 >
+                   {showOriginalScript ? "收起" : "展开"}
+                 </button>
+               </div>
+            </div>
+            
+            {showOriginalScript && (
+               <textarea
+                  value={scriptContent}
+                  onChange={(e) => setScriptContent(e.target.value)}
+                  className="mt-3 w-full p-3 bg-slate-50 rounded-lg text-sm text-slate-700 whitespace-pre-wrap border border-slate-100 min-h-[300px] focus:outline-none focus:border-indigo-500 resize-y"
+                  placeholder="在此输入剧本内容..."
+               />
+            )}
+
+            {/* Outline Display */}
+            {(outlineContent || outlineThinking || isExtractingOutline) && (
+               <div className="mt-4 border-t border-slate-100 pt-3">
+                  <div className="flex items-center justify-between mb-2">
+                     <h4 className="font-medium text-slate-800 text-sm">剧本大纲</h4>
+                     <button 
+                       onClick={() => setShowOutline(!showOutline)}
+                       className="text-xs text-slate-500 hover:text-slate-700"
+                     >
+                       {showOutline ? "收起" : "展开"}
+                     </button>
+                  </div>
+
+                  {showOutline && (
+                    <>
+                      {outlineThinking && (
+                        <div className="rounded-lg bg-amber-50 border border-amber-100 p-3 mb-3">
+                          <div 
+                            className="flex items-center justify-between mb-2 cursor-pointer"
+                            onClick={() => setIsOutlineThinkingCollapsed(!isOutlineThinkingCollapsed)}
+                          >
+                            <span className="text-xs font-bold text-amber-500 uppercase tracking-wider">AI 思考过程</span>
+                            <span className="text-xs text-amber-500">{isOutlineThinkingCollapsed ? "展开" : "收起"}</span>
+                          </div>
+                          <div className={`text-sm text-slate-600 leading-relaxed font-mono ${isOutlineThinkingCollapsed ? 'line-clamp-2' : ''}`}>
+                            {outlineThinking}
+                          </div>
+                        </div>
+                      )}
+
+                      <div className="p-3 bg-white rounded-lg text-sm text-slate-700 whitespace-pre-wrap border border-slate-200">
+                         {outlineContent || (isExtractingOutline && !outlineThinking ? "正在提炼..." : "")}
+                      </div>
+                    </>
+                  )}
+               </div>
+            )}
+          </div>
+
+          <div className="rounded-xl border border-slate-200 bg-white p-4 shadow-sm">
+             {/* ... Input Section ... */}
             <div className="mb-3 flex items-center justify-between text-sm font-medium text-slate-900">
               <span>AI 辅助修改</span>
             </div>
@@ -858,7 +1339,7 @@ export default function ScriptInputPage() {
               
               {/* Suggestion Thinking Section */}
               {suggestionThinking && (
-                <div className="rounded-lg bg-amber-50 border border-amber-100 p-3">
+                <div className="rounded-lg bg-amber-50 border border-amber-100 p-3 mb-3">
                   <div 
                     className="flex items-center justify-between mb-2 cursor-pointer"
                     onClick={() => setIsSuggestionThinkingCollapsed(!isSuggestionThinkingCollapsed)}
@@ -872,138 +1353,199 @@ export default function ScriptInputPage() {
                 </div>
               )}
 
-              <textarea
-                ref={textareaRef}
-                value={instruction}
-                onChange={(e) => setInstruction(e.target.value)}
-                placeholder="输入修改意见（例如：增加一些对白，让节奏更紧凑...）"
-                rows={3}
-                className="w-full min-h-[80px] rounded-lg border border-slate-200 px-3 py-2 text-sm outline-none focus:border-indigo-500 resize-none overflow-hidden"
-              />
+              {/* Script Modification Thinking Section */}
+              {scriptThinking && (
+                <div className="rounded-lg bg-indigo-50 border border-indigo-100 p-3 mb-3">
+                  <div 
+                    className="flex items-center justify-between mb-2 cursor-pointer"
+                    onClick={() => setIsScriptThinkingCollapsed(!isScriptThinkingCollapsed)}
+                  >
+                    <span className="text-xs font-bold text-indigo-500 uppercase tracking-wider">AI 思考过程 (修改)</span>
+                    <span className="text-xs text-indigo-500">{isScriptThinkingCollapsed ? "展开" : "收起"}</span>
+                  </div>
+                  <div className={`text-sm text-slate-600 leading-relaxed font-mono ${isScriptThinkingCollapsed ? 'line-clamp-2' : ''}`}>
+                    {scriptThinking}
+                  </div>
+                </div>
+              )}
+
               <div className="flex items-center justify-between gap-3">
                 <div className="flex gap-3">
                   <button
-                    onClick={() => handleSuggestion("suggestion_paid")}
-                    disabled={isModifying}
-                    className="rounded-lg border border-indigo-200 bg-indigo-50 px-3 py-2 text-xs text-indigo-700 hover:bg-indigo-100 disabled:opacity-50 transition-colors"
+                    onClick={() => setSelectedSuggestionMode(prev => prev === "suggestion_paid" ? null : "suggestion_paid")}
+                    className={`rounded-lg border px-3 py-2 text-xs transition-colors disabled:opacity-50 ${
+                      selectedSuggestionMode === "suggestion_paid"
+                        ? "border-indigo-600 bg-indigo-600 text-white"
+                        : "border-indigo-200 bg-indigo-50 text-indigo-700 hover:bg-indigo-100"
+                    }`}
                   >
                     💡 付费优化修改建议
                   </button>
                   <button
-              onClick={() => handleSuggestion("suggestion_traffic")}
-              disabled={isModifying}
-              className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-700 hover:bg-amber-100 disabled:opacity-50 transition-colors"
-            >
-              🔥 流量爆款修改建议
-            </button>
-            <button
-              onClick={() => setIsContinuationModalOpen(true)}
-              disabled={isModifying}
-              className="rounded-lg border border-purple-200 bg-purple-50 px-3 py-2 text-xs text-purple-700 hover:bg-purple-100 disabled:opacity-50 transition-colors"
-            >
-              ✨ AI 续写
-            </button>
-                </div>
-                <div className="flex items-center gap-3">
-                  <select
-                    value={selectedModel}
-                    onChange={(e) => setSelectedModel(e.target.value)}
-                    className="rounded-lg border border-slate-200 px-3 py-2 text-sm outline-none focus:border-indigo-500 w-48"
+                    onClick={() => setSelectedSuggestionMode(prev => prev === "suggestion_traffic" ? null : "suggestion_traffic")}
+                    className={`rounded-lg border px-3 py-2 text-xs transition-colors disabled:opacity-50 ${
+                      selectedSuggestionMode === "suggestion_traffic"
+                        ? "border-amber-600 bg-amber-600 text-white"
+                        : "border-amber-200 bg-amber-50 text-amber-700 hover:bg-amber-100"
+                    }`}
                   >
-                    <option value="doubao-pro">Doubao Seed 2.0 Pro</option>
-                  </select>
-                  {isModifying ? (
-                    <button
-                      onClick={stopGeneration}
-                      className="whitespace-nowrap rounded-lg bg-red-500 px-4 py-2 text-sm text-white hover:bg-red-600 shadow-sm transition-colors flex items-center gap-2"
-                    >
-                      <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
-                      </svg>
-                      停止生成
-                    </button>
-                  ) : (
-                    <button
-                      onClick={handleModify}
-                      disabled={!instruction.trim()}
-                      className="whitespace-nowrap rounded-lg bg-indigo-600 px-4 py-2 text-sm text-white hover:bg-indigo-700 disabled:bg-slate-300 shadow-sm transition-colors"
-                    >
-                      AI 修改
-                    </button>
-                  )}
+                    🔥 流量爆款修改建议
+                  </button>
                 </div>
               </div>
             </div>
           </div>
 
-          {/* Versions List */}
-          <div className="space-y-4">
-             {versions.map((version, index) => (
-                <div key={version.id} className="rounded-xl border border-slate-200 bg-white shadow-sm overflow-hidden">
-                   <div 
-                      className="flex items-center justify-between bg-slate-50 px-4 py-3 cursor-pointer hover:bg-slate-100 transition-colors"
-                      onClick={() => toggleCollapse(index)}
+          {/* Split Script Display */}
+          {(showSplitScript && (episodes.length > 0 || isSplittingScript)) && (
+             <div className="rounded-xl border border-slate-200 bg-white p-4 shadow-sm">
+                <div className="flex items-center justify-between mb-4">
+                   <h3 className="font-semibold text-slate-900">剧本分集</h3>
+                   <button 
+                     onClick={() => setShowSplitScript(false)}
+                     className="text-xs text-slate-500 hover:text-slate-700"
                    >
-                      <div className="flex items-center gap-2">
-                         <span className="font-semibold text-slate-700">{version.label}</span>
-                         <span className="text-xs text-slate-400">{new Date(version.timestamp).toLocaleString()}</span>
-                         {index > 0 && (
-                            <button
-                              onClick={(e) => {
-                                e.stopPropagation();
-                                handleRevert(version);
-                              }}
-                              className="ml-2 px-2 py-1 text-xs font-medium text-indigo-600 bg-indigo-50 rounded hover:bg-indigo-100 transition-colors"
-                            >
-                              恢复此版本
-                            </button>
-                         )}
-                      </div>
-                      <span className="text-slate-500">{version.isCollapsed ? "展开 ▼" : "收起 ▲"}</span>
-                   </div>
-                   
-                   {!version.isCollapsed && (
-                      <div className="p-4 border-t border-slate-100">
-                         {/* Thinking Section */}
-                         {version.thinking && (
-                            <div className="mb-4 rounded-lg bg-slate-50 border border-slate-100 p-3">
-                               <div 
-                                  className="flex items-center justify-between mb-2 cursor-pointer"
-                                  onClick={() => toggleThinking(index)}
-                               >
-                                  <span className="text-xs font-bold text-slate-400 uppercase tracking-wider">Thinking Process</span>
-                                  <span className="text-xs text-slate-400">{version.isThinkingCollapsed ? "展开" : "收起"}</span>
+                     收起
+                   </button>
+                </div>
+                
+                {isSplittingScript && episodes.length === 0 && (
+                   <div className="text-sm text-slate-500 py-4 text-center">正在进行剧本分集...</div>
+                )}
+
+                <div className="space-y-4">
+                   {episodes.map((episode, index) => {
+                      const isExpanded = expandedEpisodes.has(index);
+                      const currentVersion = episode.versions.find(v => v.id === episode.currentVersionId) || episode.versions[0];
+                      // Use version thinking if available, otherwise fallback to episode thinking (suggestions)
+                      const displayThinking = currentVersion.thinking || episode.thinking;
+                      
+                      return (
+                      <div key={index} className="rounded-lg border border-slate-200 bg-slate-50 overflow-hidden">
+                         <div 
+                           className="bg-slate-100 px-3 py-2 border-b border-slate-200 flex justify-between items-center cursor-pointer hover:bg-slate-200 transition-colors"
+                           onClick={() => {
+                              const newSet = new Set(expandedEpisodes);
+                              if (isExpanded) {
+                                 newSet.delete(index);
+                              } else {
+                                 newSet.add(index);
+                              }
+                              setExpandedEpisodes(newSet);
+                           }}
+                         >
+                            <span className="font-medium text-sm text-slate-700">{episode.title || `第 ${index + 1} 集`}</span>
+                            <div className="flex items-center gap-3">
+                                {isExpanded && episode.versions.length > 1 && (
+                                    <div className="flex bg-white rounded-md border border-slate-200 p-0.5" onClick={(e) => e.stopPropagation()}>
+                                        {episode.versions.map((v) => (
+                                            <button
+                                                key={v.id}
+                                                onClick={() => {
+                                                    setEpisodes(prev => {
+                                                        const newEpisodes = [...prev];
+                                                        if (newEpisodes[index]) {
+                                                            newEpisodes[index] = { ...newEpisodes[index], currentVersionId: v.id };
+                                                        }
+                                                        return newEpisodes;
+                                                    });
+                                                }}
+                                                className={`px-2 py-0.5 text-xs rounded transition-colors ${
+                                                    episode.currentVersionId === v.id 
+                                                    ? "bg-indigo-100 text-indigo-700 font-medium" 
+                                                    : "text-slate-500 hover:text-slate-700 hover:bg-slate-50"
+                                                }`}
+                                            >
+                                                {v.name}
+                                            </button>
+                                        ))}
+                                    </div>
+                                )}
+                                <span className="text-xs text-slate-500">{isExpanded ? "收起" : "展开"}</span>
+                            </div>
+                         </div>
+                         {isExpanded && (
+                            <div className="p-3">
+                               {/* Thinking Section */}
+                               {displayThinking && (
+                                 <div className="rounded-lg bg-amber-50 border border-amber-100 p-3 mb-3">
+                                   <div 
+                                     className="flex items-center justify-between mb-2 cursor-pointer"
+                                     onClick={() => toggleEpisodeThinking(index)}
+                                   >
+                                     <span className="text-xs font-bold text-amber-500 uppercase tracking-wider">AI 思考过程</span>
+                                     <span className="text-xs text-amber-500">{episode.isThinkingCollapsed ? "展开" : "收起"}</span>
+                                   </div>
+                                   <div className={`text-sm text-slate-600 leading-relaxed font-mono ${episode.isThinkingCollapsed ? 'hidden' : ''}`}>
+                                     {displayThinking}
+                                   </div>
+                                 </div>
+                               )}
+
+                               <div className="w-full bg-transparent text-sm text-slate-700 whitespace-pre-wrap min-h-[100px] mb-4">
+                             {currentVersion.content}
+                           </div>
+
+                               {/* Input Box */}
+                               <div className="relative">
+                                 <TextareaAutoResize
+                                   value={episode.userInput}
+                                   onChange={(e) => updateEpisodeInput(index, e.target.value)}
+                                   className="w-full p-3 bg-white rounded-lg text-sm text-slate-700 border border-slate-200 focus:outline-none focus:border-indigo-500 resize-none overflow-hidden min-h-[80px]"
+                                   placeholder="在此输入指令，或查看 AI 修改建议..."
+                                   isGenerating={episode.isGenerating}
+                                 />
+                                 {episode.isGenerating && (
+                                    <div className="absolute right-3 bottom-3 text-xs text-slate-400 animate-pulse">
+                                       生成中...
+                                    </div>
+                                 )}
                                </div>
-                               <div className={`text-sm text-slate-500 leading-relaxed font-mono ${version.isThinkingCollapsed ? 'line-clamp-2' : ''}`}>
-                                  {version.thinking}
+
+                               {/* Buttons */}
+                               <div className="flex justify-end gap-2 mt-2">
+                                 <button
+                                   onClick={() => {
+                                      if (episode.isGenerating) {
+                                         abortControllersRef.current[index]?.abort();
+                                      } else {
+                                         handleEpisodeModify(index, "mode");
+                                      }
+                                   }}
+                                   className={`px-3 py-1.5 text-white text-xs rounded transition-colors ${
+                                      episode.isGenerating 
+                                      ? "bg-slate-400 hover:bg-slate-500" 
+                                      : "bg-indigo-600 hover:bg-indigo-700 disabled:opacity-50"
+                                   }`}
+                                 >
+                                   {episode.isGenerating ? "取消" : "AI 修改"}
+                                 </button>
+                                 <button
+                                   onClick={() => handleEpisodeModify(index, "custom")}
+                                   disabled={episode.isGenerating || !episode.userInput.trim()}
+                                   className="px-3 py-1.5 bg-slate-800 text-white text-xs rounded hover:bg-slate-900 disabled:opacity-50 transition-colors"
+                                 >
+                                   发送
+                                 </button>
                                </div>
                             </div>
                          )}
-                         
-                         <ScriptEditor
-                            content={version.content}
-                            onChange={(newContent) => {
-                               setVersions(prev => {
-                                  const newVersions = [...prev];
-                                  newVersions[index] = { ...newVersions[index], content: newContent };
-                                  return newVersions;
-                               });
-                            }}
-                         />
                       </div>
-                   )}
+                      );
+                   })}
                 </div>
-             ))}
-          </div>
+             </div>
+          )}
+
+
         </div>
       )}
 
-      {message && <div className="text-sm text-slate-600">{message}</div>}
-      <AIContinuationModal
-        isOpen={isContinuationModalOpen}
-        onClose={() => setIsContinuationModalOpen(false)}
-        onSubmit={handleContinuationSubmit}
-      />
+      {message && (
+        <div className="fixed bottom-6 left-1/2 transform -translate-x-1/2 bg-slate-800 text-white px-6 py-3 rounded-full shadow-lg z-50 text-sm font-medium animate-in fade-in slide-in-from-bottom-4">
+          {message}
+        </div>
+      )}
     </div>
   );
 }

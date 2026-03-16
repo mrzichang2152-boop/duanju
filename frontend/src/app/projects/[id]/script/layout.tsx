@@ -1,28 +1,27 @@
 "use client";
 
-import { use } from "react";
-import { usePathname } from "next/navigation";
+import { usePathname, useParams } from "next/navigation";
 import Link from "next/link";
 
 const steps = [
-  { id: "setup", name: "Step 0: 脚本向导", path: "setup" },
   { id: "input", name: "Step 1: 修改剧本", path: "input" },
   { id: "resources", name: "Step 2: 提取资源", path: "resources" },
-  { id: "storyboard", name: "Step 3: 生成分镜", path: "storyboard" },
-  { id: "assets", name: "Step 4: 生成素材", path: "assets" },
+  { id: "assets", name: "Step 3: 生成素材", path: "assets" },
+  { id: "storyboard", name: "Step 4: 生成分镜", path: "storyboard" },
   { id: "video", name: "Step 5: 生成分段视频", path: "video" },
 ];
 
 export default function ScriptLayout({
   children,
-  params,
 }: {
   children: React.ReactNode;
-  params: Promise<{ id: string }>;
 }) {
   const pathname = usePathname();
-  const { id } = use(params);
+  const params = useParams();
+  const id = params?.id as string;
   const projectId = id;
+
+  if (!pathname) return null;
 
   return (
     <div className="flex h-full flex-col">
@@ -31,12 +30,13 @@ export default function ScriptLayout({
           {steps.map((step, index) => {
             const isActive = pathname.includes(`/script/${step.path}`);
             const isCompleted = steps.findIndex(s => pathname.includes(`/script/${s.path}`)) > index;
-            
+
             return (
               <Link
                 key={step.id}
                 href={`/projects/${projectId}/script/${step.path}`}
-                className={`flex items-center gap-2 text-sm font-medium transition-colors ${
+                prefetch={false}
+                className={`flex items-center gap-2 text-sm font-medium ${
                   isActive
                     ? "text-indigo-600"
                     : isCompleted

@@ -31,10 +31,16 @@ async def create_segments_from_script(session: AsyncSession, project_id: str) ->
         return []
     
     # Check if script contains Markdown table (Step 3 format)
-    lines = script.content.splitlines()
+    # Prioritize storyboard field if available, otherwise fallback to content
+    source_content = script.storyboard if script.storyboard and script.storyboard.strip() else script.content
+    if not source_content:
+        return []
+
+    lines = source_content.splitlines()
     table_rows = []
     in_table = False
     header_found = False
+    prompt_index = 8  # Default fallback
     
     for line in lines:
         stripped = line.strip()
@@ -43,19 +49,25 @@ async def create_segments_from_script(session: AsyncSession, project_id: str) ->
         if stripped.startswith("|") and stripped.endswith("|"):
             parts = [p.strip() for p in stripped.split("|")]
             # Filter empty parts from start/end
-            parts = [p for p in parts if p]
+            # Note: split("|") on "|a|b|" gives ["", "a", "b", ""]
+            if not parts[0]: parts.pop(0)
+            if parts and not parts[-1]: parts.pop()
             
             # Check for header
-            if "画面生成提示词" in stripped and not header_found:
+            if ("画面生成提示词" in stripped or "画面内容" in stripped or "画面描述" in stripped) and not header_found:
                 header_found = True
+                # Try to find the prompt column index dynamically
+                for i, col in enumerate(parts):
+                    if "画面生成提示词" in col or "画面内容" in col or "画面描述" in col or "提示词" in col or "Prompt" in col:
+                        prompt_index = i
+                        break
                 continue
             # Check for separator line
             if set(stripped.replace("|", "").replace("-", "").strip()) == set():
                 continue
             
-            if header_found and len(parts) >= 9:
-                # Column 9 is index 8 (0-based) in parts list
-                prompt = parts[8]
+            if header_found and len(parts) > prompt_index:
+                prompt = parts[prompt_index]
                 table_rows.append(prompt)
 
     segments: list[Segment] = []

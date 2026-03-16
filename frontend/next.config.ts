@@ -28,6 +28,18 @@ const nextConfig: NextConfig = {
     ],
     dangerouslyAllowSVG: true,
   },
+  async rewrites() {
+    return [
+      {
+        source: "/static/:path*",
+        destination: "http://localhost:8002/static/:path*",
+      },
+      {
+        source: "/api/:path*",
+        destination: "http://localhost:8002/api/:path*",
+      },
+    ];
+  },
 };
 
 export default nextConfig;

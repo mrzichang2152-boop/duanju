@@ -1,0 +1,12 @@
+#!/usr/bin/expect
+
+set timeout 20
+set host "115.190.202.134"
+set user "root"
+set password "6223113Zu"
+
+spawn ssh -o StrictHostKeyChecking=no -o ConnectTimeout=20 $user@$host "cat /root/duanju_new/nginx.conf"
+expect {
+    "password:" { send "$password\r"; exp_continue }
+    eof
+}

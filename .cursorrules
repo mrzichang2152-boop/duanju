@@ -37,10 +37,6 @@ Your goal is to build a robust, modular, and maintainable Short Play Generation 
 -   **New Files**: Only create files defined in `TECH_DESIGN.md` or essential for the task.
 -   **Path**: Always use absolute paths or paths relative to the project root.
 
-# LinkAPI Integration
--   **Endpoint**: `https://docs.linkapi.ai/` (Base URL for docs reference, actual API endpoint is `https://api.linkapi.ai`).
--   **Key Management**: NEVER hardcode API keys. Use env vars (`LINKAPI_KEY`).
--   **Model Selection**: Always allow user-selected models via API parameters.
 
 # Context Awareness
 -   Read `TECH_DESIGN.md` before starting any architectural task.

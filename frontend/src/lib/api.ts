@@ -27,28 +27,71 @@ const formatApiErrorDetail = (detail: ApiError["detail"]) => {
 };
 
 const baseUrl = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://localhost:8002/api";
+const normalizeToken = (token?: string | null) => (token ?? "").trim();
+const REQUEST_TIMEOUT_MS = 15000;
+const ASSET_GENERATE_TIMEOUT_MS = 180000;
 
 const request = async <T>(
   path: string,
   options: RequestInit = {},
-  token?: string | null
+  token?: string | null,
+  timeoutMs: number = REQUEST_TIMEOUT_MS
 ): Promise<T> => {
   const headers = new Headers(options.headers);
   headers.set("Content-Type", "application/json");
-  if (token) {
-    headers.set("Authorization", `Bearer ${token}`);
+  const normalizedToken = normalizeToken(token);
+  if (normalizedToken) {
+    headers.set("Authorization", `Bearer ${normalizedToken}`);
   }
-  const response = await fetch(`${baseUrl}${path}`, {
-    ...options,
-    headers,
-  });
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+  if (options.signal) {
+    if (options.signal.aborted) {
+      controller.abort();
+    } else {
+      options.signal.addEventListener("abort", () => controller.abort(), { once: true });
+    }
+  }
+  let response: Response;
+  try {
+    response = await fetch(`${baseUrl}${path}`, {
+      ...options,
+      headers,
+      signal: controller.signal,
+    });
+  } catch (err) {
+    if (err instanceof DOMException && err.name === "AbortError") {
+      throw new Error("请求超时，请稍后重试");
+    }
+    throw err;
+  } finally {
+    clearTimeout(timeoutId);
+  }
   if (response.status === 401) {
-    if (typeof window !== "undefined") {
+    const bodyText = await response.text();
+    let detail: ApiError["detail"];
+    if (bodyText) {
+      try {
+        const parsed = JSON.parse(bodyText) as ApiError;
+        detail = parsed.detail;
+      } catch {
+        detail = bodyText;
+      }
+    }
+    const authMessage = formatApiErrorDetail(detail) ?? "登录状态校验失败，请重试";
+    const lower = authMessage.toLowerCase();
+    const shouldForceLogout =
+      normalizedToken.length > 0 &&
+      (authMessage.includes("无效 Token") ||
+        authMessage.includes("token 过期") ||
+        lower.includes("signature has expired") ||
+        lower.includes("token expired"));
+    if (shouldForceLogout && typeof window !== "undefined") {
       const { clearToken } = await import("@/lib/auth");
       clearToken();
       window.location.href = "/login";
     }
-    throw new Error("无效 Token");
+    throw new Error(authMessage);
   }
   if (!response.ok) {
     const bodyText = await response.text();
@@ -62,6 +105,9 @@ const request = async <T>(
       }
     }
     throw new Error(formatApiErrorDetail(detail) ?? "请求失败");
+  }
+  if (response.status === 204) {
+    return null as T;
   }
   return (await response.json()) as T;
 };
@@ -111,13 +157,14 @@ export type ScriptParseResponse = {
 };
 
 export const parseScriptFile = async (token: string, file: File): Promise<ScriptParseResponse> => {
+  const normalizedToken = normalizeToken(token);
   const formData = new FormData();
   formData.append("file", file);
 
   const response = await fetch(`${baseUrl}/projects/parse`, {
     method: "POST",
     headers: {
-      Authorization: `Bearer ${token}`,
+      Authorization: `Bearer ${normalizedToken}`,
     },
     body: formData,
   });
@@ -150,11 +197,23 @@ export type ScriptPayload = {
   content: string;
 };
 
+export interface Episode {
+  title: string;
+  content: string;
+  thinking: string;
+  userInput: string;
+  storyboard?: string;
+  isThinkingCollapsed?: boolean;
+}
+
 export type ScriptResponse = {
   id?: string;
   project_id: string;
   content: string;
   thinking?: string;
+  storyboard?: string;
+  outline?: string;
+  episodes?: Episode[];
   version?: number;
   is_active?: boolean;
   created_at?: string;
@@ -163,12 +222,12 @@ export type ScriptResponse = {
 export const getScript = (token: string, id: string) =>
   request<ScriptResponse>(`/projects/${id}/script`, {}, token);
 
-export const saveScript = (token: string, id: string, content: string, thinking?: string) =>
+export const saveScript = (token: string, id: string, content?: string, thinking?: string, storyboard?: string, outline?: string, episodes?: Episode[]) =>
   request<ScriptResponse>(
     `/projects/${id}/script`,
     {
       method: "POST",
-      body: JSON.stringify({ content, thinking }),
+      body: JSON.stringify({ content, thinking, storyboard, outline, episodes }),
     },
     token
   );
@@ -195,7 +254,7 @@ export const validateScript = (
   );
 
 export type ScriptGeneratePayload = {
-  mode: "format" | "complete" | "revise" | "extract_resources" | "generate_storyboard" | "step1_modify" | "step2_modify" | "suggestion_paid" | "suggestion_traffic" | "continuation" | "continuation_paid" | "continuation_traffic" | "step0_generate" | "step0_continue" | "step0_modify";
+  mode: "format" | "complete" | "revise" | "extract_resources" | "generate_storyboard" | "step1_modify" | "step2_modify" | "suggestion_paid" | "suggestion_traffic" | "continuation" | "continuation_paid" | "continuation_traffic" | "step0_generate" | "step0_continue" | "step0_modify" | "extract_outline" | "split_script";
   content: string;
   model?: string;
   instruction?: string;
@@ -206,11 +265,23 @@ export type ScriptGenerateResponse = {
   thinking?: string;
 };
 
+type ScriptStreamDelta = {
+  content?: string;
+  reasoning_content?: string;
+};
+
+type ScriptStreamChunk = {
+  choices?: Array<{
+    delta?: ScriptStreamDelta;
+  }>;
+  error?: string;
+};
+
 export const generateScript = (token: string, id: string, payload: ScriptGeneratePayload): Promise<ScriptGenerateResponse> => {
   return new Promise((resolve, reject) => {
     let content = "";
     let thinking = "";
-    generateScriptStream(token, id, payload, (chunk) => {
+    generateScriptStream(token, id, payload, (chunk: ScriptStreamChunk) => {
       if (chunk.choices?.[0]?.delta?.content) {
         content += chunk.choices[0].delta.content;
       }
@@ -240,6 +311,15 @@ export const generateScriptStream = async (
     body: JSON.stringify(payload),
     signal,
   });
+
+  if (response.status === 401) {
+    if (typeof window !== "undefined") {
+      const { clearToken } = await import("@/lib/auth");
+      clearToken();
+      window.location.href = "/login";
+    }
+    throw new Error("无效 Token，请重新登录");
+  }
 
   if (!response.ok) {
     const errorText = await response.text();
@@ -276,23 +356,26 @@ export const generateScriptStream = async (
         if (line.trim().startsWith("data: ")) {
           const data = line.trim().slice(6);
           if (data === "[DONE]") return;
+          let parsed: ScriptStreamChunk | null = null;
           try {
-            const json = JSON.parse(data);
-            if (json.error) {
-              throw new Error(json.error);
+            parsed = JSON.parse(data) as ScriptStreamChunk;
+            const streamError = typeof parsed.error === "string" ? parsed.error : "";
+            if (streamError) {
+              const normalized = streamError.replace(/^Error:\s*/i, "").trim();
+              throw new Error(normalized || "生成失败");
             }
-            onChunk(json);
+            onChunk(parsed);
           } catch (e) {
-            if (e instanceof Error && JSON.parse(data).error) {
-               throw e;
+            if (e instanceof Error && parsed && typeof parsed.error === "string") {
+              throw e;
             }
             console.error("Error parsing SSE data", e);
           }
         }
       }
     }
-  } catch (error: any) {
-    if (error.name === 'AbortError') {
+  } catch (error: unknown) {
+    if (error instanceof Error && error.name === "AbortError") {
       console.log('Stream aborted');
       return; // Silece abort error
     }
@@ -301,22 +384,6 @@ export const generateScriptStream = async (
     reader.releaseLock();
   }
 };
-
-export type ScriptHistoryItem = {
-  id: string;
-  project_id: string;
-  content: string;
-  version: number;
-  is_active: boolean;
-  created_at: string;
-};
-
-export type ScriptHistoryResponse = {
-  items: ScriptHistoryItem[];
-};
-
-export const getScriptHistory = (token: string, id: string) =>
-  request<ScriptHistoryResponse>(`/projects/${id}/script/history`, {}, token);
 
 export const extractAssets = (token: string, id: string) =>
   request<{ status: string }>(
@@ -339,17 +406,41 @@ export type Asset = {
   type: string;
   name: string;
   description: string | null;
+  prompt?: string | null;
+  model?: string | null;
+  size?: string | null;
+  style?: string | null;
   versions: AssetVersion[];
 };
 
 export const getAssets = (token: string, id: string) =>
-  request<Asset[]>(`/projects/${id}/assets`, {}, token);
+  request<Asset[]>(`/projects/${id}/assets?t=${Date.now()}`, { cache: "no-store" }, token);
+
+export const updateAssetConfig = (
+  token: string,
+  projectId: string,
+  assetId: string,
+  payload: {
+    prompt?: string;
+    model?: string;
+    size?: string;
+    style?: string;
+  }
+) =>
+  request<Asset>(
+    `/projects/${projectId}/assets/${assetId}`,
+    {
+      method: "PUT",
+      body: JSON.stringify(payload),
+    },
+    token
+  );
 
 export const generateAsset = (
   token: string,
   projectId: string,
   assetId: string,
-  payload: { prompt?: string; model?: string; ref_image_url?: string }
+  payload: { prompt?: string; model?: string; ref_image_url?: string; style?: string; options?: Record<string, any> }
 ) =>
   request<{ status: string }>(
     `/projects/${projectId}/assets/${assetId}/generate`,
@@ -357,7 +448,8 @@ export const generateAsset = (
       method: "POST",
       body: JSON.stringify(payload),
     },
-    token
+    token,
+    ASSET_GENERATE_TIMEOUT_MS
   );
 
 export const selectAssetVersion = (token: string, projectId: string, assetId: string, versionId: string) =>
@@ -366,6 +458,153 @@ export const selectAssetVersion = (token: string, projectId: string, assetId: st
     {
       method: "PUT",
       body: JSON.stringify({ version_id: versionId }),
+    },
+    token
+  );
+
+// Voice & Fish Audio API
+
+export type FishAudioModel = {
+  _id: string;
+  title: string;
+  description?: string;
+  default_text?: string;
+  cover_image?: string;
+  preview_audio?: string;
+  tags?: string[];
+  languages?: string[];
+  samples?: Array<{ audio?: string; text?: string; title?: string }>;
+};
+
+export const getFishAudioModels = (
+  token: string,
+  params?: { page?: number; size?: number; language?: string; query?: string }
+) =>
+  request<{ items: FishAudioModel[]; total: number }>(
+    `/fish-audio/models?page=${params?.page ?? 1}&size=${params?.size ?? 100}${
+      params?.language ? `&language=${encodeURIComponent(params.language)}` : ""
+    }${params?.query ? `&query=${encodeURIComponent(params.query)}` : ""}`,
+    {},
+    token,
+    45000
+  );
+
+export const generateFishAudioPreview = async (
+  token: string,
+  payload: { text: string; reference_id: string; format?: "mp3" | "wav" }
+) => {
+  const normalizedToken = normalizeToken(token);
+  const formData = new FormData();
+  formData.append("text", payload.text);
+  formData.append("reference_id", payload.reference_id);
+  formData.append("format", payload.format ?? "mp3");
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 45000);
+  let response: Response;
+  try {
+    response = await fetch(`${baseUrl}/fish-audio/tts`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${normalizedToken}`,
+      },
+      body: formData,
+      signal: controller.signal,
+    });
+  } catch (err) {
+    if (err instanceof DOMException && err.name === "AbortError") {
+      throw new Error("音色试听生成超时，请稍后重试");
+    }
+    throw err;
+  } finally {
+    clearTimeout(timeoutId);
+  }
+
+  if (!response.ok) {
+    const bodyText = await response.text();
+    let detail: ApiError["detail"];
+    if (bodyText) {
+      try {
+        const parsed = JSON.parse(bodyText) as ApiError;
+        detail = parsed.detail;
+      } catch {
+        detail = bodyText;
+      }
+    }
+    throw new Error(formatApiErrorDetail(detail) ?? "音色试听生成失败");
+  }
+
+  return response.blob();
+};
+
+export const cloneVoice = async (token: string, file: File, title: string) => {
+  const normalizedToken = normalizeToken(token);
+  const formData = new FormData();
+  formData.append("title", title);
+  formData.append("file", file);
+
+  const response = await fetch(`${baseUrl}/fish-audio/clone`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${normalizedToken}`,
+    },
+    body: formData,
+  });
+
+  if (!response.ok) {
+    const bodyText = await response.text();
+    let detail: ApiError["detail"];
+    if (bodyText) {
+      try {
+        const parsed = JSON.parse(bodyText) as ApiError;
+        detail = parsed.detail;
+      } catch {
+        detail = bodyText;
+      }
+    }
+    throw new Error(formatApiErrorDetail(detail) ?? "Voice cloning failed");
+  }
+
+  return response.json() as Promise<{ _id?: string; model_id?: string; title?: string; cover_image?: string }>;
+};
+
+export type CharacterVoice = {
+  id: string;
+  project_id: string;
+  character_name: string;
+  voice_id: string;
+  voice_type: string;
+  preview_url?: string;
+  config?: any;
+};
+
+export const getProjectVoices = (token: string, projectId: string) =>
+  request<CharacterVoice[]>(`/projects/${projectId}/voices`, {}, token);
+
+export const updateCharacterVoice = (
+  token: string,
+  projectId: string,
+  characterName: string,
+  payload: { voice_id: string; voice_type: string; preview_url?: string; config?: any }
+) =>
+  request<CharacterVoice>(
+    `/projects/${projectId}/voices/${characterName}`,
+    {
+      method: "POST",
+      body: JSON.stringify(payload),
+    },
+    token
+  );
+
+export const generateTTS = (
+  token: string,
+  projectId: string,
+  payload: { text: string; character_name: string; speed?: number; volume?: number; pitch?: number }
+) =>
+  request<{ audio_url: string }>(
+    `/projects/${projectId}/tts`,
+    {
+      method: "POST",
+      body: JSON.stringify(payload),
     },
     token
   );
@@ -415,7 +654,7 @@ export const getSegments = (token: string, id: string) =>
 export const generateSegment = (
   token: string,
   projectId: string,
-  payload: { segment_id?: string; prompt?: string; model?: string }
+  payload: { segment_id?: string; prompt?: string; model?: string; options?: any }
 ) =>
   request<{ status: string }>(
     `/projects/${projectId}/segments/generate`,

@@ -1,10 +1,12 @@
 "use client";
 
 import { useState } from "react";
+import { useRouter } from "next/navigation";
 import { createProject } from "@/lib/api";
 import { getToken } from "@/lib/auth";
 
 export default function NewProjectPage() {
+  const router = useRouter();
   const [name, setName] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
@@ -19,7 +21,7 @@ export default function NewProjectPage() {
     setLoading(true);
     try {
       const project = await createProject(token, name);
-      window.location.href = `/projects/${project.id}/script`;
+      router.push(`/projects/${project.id}/script/input`);
     } catch (err) {
       setError(err instanceof Error ? err.message : "创建失败");
     } finally {

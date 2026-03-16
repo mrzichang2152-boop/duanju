@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
+import Link from "next/link";
 import { getEmail, getToken } from "@/lib/auth";
 
 const buildInitial = (value: string | null) => {
@@ -30,9 +31,9 @@ export default function TopNav() {
 
   return (
     <nav className="flex items-center gap-4 text-sm text-slate-600">
-      <a href="/projects" className="hover:text-slate-900">
+      <Link href="/projects" className="hover:text-slate-900">
         项目
-      </a>
+      </Link>
       {isAuthed ? (
         <div className="group relative">
           <div className="flex h-8 w-8 items-center justify-center rounded-full bg-slate-900 text-xs font-semibold text-white">

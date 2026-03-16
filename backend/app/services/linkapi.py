@@ -7,8 +7,11 @@ import base64
 import json
 import logging
 import re
+import io
+from PIL import Image
 
 import httpx
+import aiofiles
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.services.settings import get_api_key, get_or_create_settings
@@ -38,13 +41,16 @@ def _get_auto_proxy() -> Optional[str]:
     # 3. Check Docker host (host.docker.internal:7897)
     try:
         host = "host.docker.internal"
-        socket.gethostbyname(host)
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.settimeout(0.1)
-        if sock.connect_ex((host, 7897)) == 0:
+        try:
+            socket.gethostbyname(host)
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(0.1)
+            if sock.connect_ex((host, 7897)) == 0:
+                sock.close()
+                return f"http://{host}:7897"
             sock.close()
-            return f"http://{host}:7897"
-        sock.close()
+        except:
+            pass
     except:
         pass
 
@@ -60,17 +66,13 @@ async def fetch_models(session: AsyncSession, user_id: str) -> dict[str, Any]:
     # Endpoint for Volcengine
     endpoint = "https://ark.cn-beijing.volces.com/api/v3"
 
-    async with httpx.AsyncClient(timeout=60.0) as client:
-        # Volcengine doesn't have a standard /models endpoint that returns OpenAI format exactly the same way,
-        # but we can mock it or try to call it. 
-        # For now, we'll return a fixed list or try to fetch if supported.
-        # Since the user only wants to use one model, we can return a mocked response.
-        return {
-            "data": [
-                {"id": "doubao-seed-2-0-pro-260215", "name": "Doubao Seed 2.0 Pro (Text)"},
-                {"id": "doubao-seedream-4-5-251128", "name": "Doubao Seedream 4.5 (Image)"}
-            ]
-        }
+    # We return a fixed list as per previous implementation to avoid complex probing
+    return {
+        "data": [
+            {"id": "doubao-seed-2-0-pro-260215", "name": "Doubao Seed 2.0 Pro (Text)"},
+            {"id": "doubao-seedream-4-5-251128", "name": "Doubao Seedream 4.5 (Image)"}
+        ]
+    }
 
 
 def _map_openrouter_model(model: str) -> str:
@@ -93,98 +95,100 @@ async def create_chat_completion(
         payload["model"] = "doubao-seed-2-0-pro-260215"
     
     # Ensure max_tokens is set to a reasonable value to prevent truncation
-    # Doubao 2.0 Pro supports long output, default might be too short
     if "max_tokens" not in payload:
-        payload["max_tokens"] = 65536
-    elif payload["max_tokens"] < 65536:
-        # If user provided a small value, we bump it up if it seems too small (optional, but safe)
-        # But let's respect user if they explicitly set it, unless it's missing.
-        # However, to solve the user's "truncated" issue, we prioritize a large default.
-        pass
-
-    # Use auto-detected proxy
-    proxies = _get_auto_proxy()
+        payload["max_tokens"] = 120000
     
-    # Check if target is Volcengine (domestic) or model is doubao
-    is_volcengine = "doubao" in payload.get("model", "") or "volces.com" in "ark.cn-beijing.volces.com"
+    # Volcengine Endpoint
+    endpoint = "https://ark.cn-beijing.volces.com/api/v3/chat/completions"
     
-    if is_volcengine:
-        # Volcengine is domestic, force DIRECT connection (bypass proxy and env vars)
-        logger.info("Volcengine model detected, bypassing proxy for direct connection.")
-        transport = httpx.AsyncHTTPTransport(retries=2)
-        client_kwargs = {"timeout": 1200.0, "transport": transport, "trust_env": False}
-    else:
-        transport = httpx.AsyncHTTPTransport(retries=2, proxy=proxies)
-        client_kwargs = {"timeout": 1200.0, "transport": transport}
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json"
+    }
+    
+    timeout = httpx.Timeout(300.0, connect=10.0)
+    client_modes = [False, True]
+    max_retries = 2
+    last_error: Exception | None = None
+    attempt_payload = dict(payload)
 
-    async with httpx.AsyncClient(**client_kwargs) as client:
-        async def send(url: str, request_payload: dict[str, Any]) -> httpx.Response:
-            headers = {
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json",
-            }
-            return await client.post(
-                url,
-                headers=headers,
-                json=request_payload,
-            )
-
-        async def send_with_retries(url: str, request_payload: dict[str, Any]) -> httpx.Response:
-            last_exc: httpx.Optional[HTTPError] = None
-            for attempt in range(5):
+    for trust_env_mode in client_modes:
+        async with httpx.AsyncClient(timeout=timeout, trust_env=trust_env_mode) as client:
+            for attempt in range(max_retries + 1):
                 try:
-                    return await send(url, request_payload)
-                except httpx.HTTPError as exc:
-                    last_exc = exc
-                    if attempt < 4:
-                        await asyncio.sleep(0.6 * (attempt + 1))
-            assert last_exc is not None
-            raise last_exc
+                    response = await client.post(
+                        endpoint,
+                        headers=headers,
+                        json=attempt_payload
+                    )
 
-        try:
-            # Volcengine Endpoint
-            endpoint = "https://ark.cn-beijing.volces.com/api/v3"
-            url = f"{endpoint}/chat/completions"
+                    if response.status_code != 200:
+                        error_text = response.text
+                        logger.error(
+                            "Volcengine API error (Attempt %s/%s, trust_env=%s): %s",
+                            attempt + 1,
+                            max_retries + 1,
+                            trust_env_mode,
+                            error_text,
+                        )
+                        error_lower = error_text.lower()
+                        should_retry_with_smaller_max_tokens = (
+                            attempt < max_retries
+                            and "max_tokens" in attempt_payload
+                            and (
+                                "max_tokens" in error_lower
+                                or "max token" in error_lower
+                                or "output token" in error_lower
+                                or "invalid_parameter" in error_lower
+                            )
+                        )
+                        if should_retry_with_smaller_max_tokens:
+                            attempt_payload = dict(attempt_payload)
+                            attempt_payload["max_tokens"] = min(int(attempt_payload.get("max_tokens", 120000)), 8192)
+                            logger.warning("Retrying chat completion with reduced max_tokens=%s", attempt_payload["max_tokens"])
+                            continue
 
-            # Volcengine requires a specific payload format that might differ slightly or require cleanup
-            
-            # 1. Remove parameters not supported by Volcengine if present
-            if "provider" in payload:
-                del payload["provider"]
-            if "transforms" in payload:
-                del payload["transforms"]
-            if "models" in payload:
-                del payload["models"]
-            if "route" in payload:
-                del payload["route"]
-                
-            # 2. Ensure model is correct
-            payload["model"] = "doubao-seed-2-0-pro-260215"
-            
-            # 3. Log the payload for debugging
-            logger.info("Sending payload to Volcengine: %s", json.dumps(payload, ensure_ascii=False))
+                        if response.status_code in (408, 409, 425, 429) or response.status_code >= 500:
+                            if attempt < max_retries:
+                                continue
+                            if not trust_env_mode:
+                                logger.warning("Switching chat completion client to trust_env=True after upstream transient HTTP failure")
+                                break
+                        try:
+                            return response.json()
+                        except Exception:
+                            response.raise_for_status()
 
-            response = await send_with_retries(
-                url,
-                payload,
-            )
+                    return response.json()
 
-        except httpx.HTTPError as exc:
-            payload_size = len(json.dumps(payload, ensure_ascii=False))
-            logger.warning("Volcengine chat completion transport error: %s", exc)
-            raise ValueError(
-                f"Volcengine 连接异常：{type(exc).__name__}（payload={payload_size}）"
-            ) from exc
-    try:
-        response.raise_for_status()
-    except httpx.HTTPStatusError as exc:
-        detail = response.text.strip() or "Volcengine 请求失败"
-        logger.warning("Volcengine chat completion failed: %s %s", response.status_code, detail)
-        raise ValueError(f"{response.status_code} {detail}") from exc
-    
-    json_response = response.json()
-    logger.info("Volcengine response received. Status: %s", response.status_code)
-    return json_response
+                except Exception as e:
+                    last_error = e
+                    err_text = str(e).lower()
+                    logger.error(
+                        "Failed to create chat completion (Attempt %s/%s, trust_env=%s): %s",
+                        attempt + 1,
+                        max_retries + 1,
+                        trust_env_mode,
+                        e,
+                    )
+                    is_retryable = (
+                        "timeout" in err_text
+                        or "timed out" in err_text
+                        or "temporarily unavailable" in err_text
+                        or "connection reset" in err_text
+                        or "server disconnected without sending a response" in err_text
+                        or "remote protocol error" in err_text
+                    )
+                    if attempt < max_retries and is_retryable:
+                        continue
+                    if not trust_env_mode and is_retryable:
+                        logger.warning("Switching chat completion client to trust_env=True due to transient connection failure")
+                        break
+                    raise e
+
+    if last_error:
+        raise last_error
+    raise RuntimeError("Failed to create chat completion")
 
 
 async def create_chat_completion_stream(
@@ -192,72 +196,225 @@ async def create_chat_completion_stream(
 ):
     # Volcengine API Key
     api_key = "6002c554-3d7f-4293-80e9-c217758ba983"
-
+    
     settings = await get_or_create_settings(session, user_id)
     
-    logger.info("Using Volcengine Key for stream: %s... (len=%d)", api_key[:10], len(api_key))
+    logger.info("Using Volcengine Key for Stream: %s...", api_key[:10])
 
     # Force model to Volcengine model
-    payload["model"] = "doubao-seed-2-0-pro-260215"
+    if "model" not in payload:
+        payload["model"] = "doubao-seed-2-0-pro-260215"
+    
+    # Ensure stream is True
     payload["stream"] = True
     
-    # Ensure max_tokens is set to prevent truncation
-    if "max_tokens" not in payload:
-        payload["max_tokens"] = 65536
-
-    # Use auto-detected proxy
-    proxies = _get_auto_proxy()
-    
-    # Check if target is Volcengine (domestic) or model is doubao
-    is_volcengine = "doubao" in payload.get("model", "") or "volces.com" in "ark.cn-beijing.volces.com"
-    
-    if is_volcengine:
-        # Volcengine is domestic, force DIRECT connection
-        logger.info("Volcengine model detected (stream), bypassing proxy for direct connection.")
-        transport = httpx.AsyncHTTPTransport(retries=2)
-        client_kwargs = {"timeout": 1200.0, "transport": transport, "trust_env": False}
-    else:
-        transport = httpx.AsyncHTTPTransport(retries=2, proxy=proxies)
-        client_kwargs = {"timeout": 1200.0, "transport": transport}
-
     # Volcengine Endpoint
-    endpoint = "https://ark.cn-beijing.volces.com/api/v3"
-    url = f"{endpoint}/chat/completions"
-
-    # Cleanup payload
-    if "provider" in payload: del payload["provider"]
-    if "transforms" in payload: del payload["transforms"]
-    if "models" in payload: del payload["models"]
-    if "route" in payload: del payload["route"]
-
+    endpoint = "https://ark.cn-beijing.volces.com/api/v3/chat/completions"
+    
     headers = {
         "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
+        "Content-Type": "application/json"
     }
+    
+    timeout = httpx.Timeout(300.0, connect=10.0)
+    client_modes = [False, True]
+    max_retries = 2
+    last_error: Exception | None = None
+    attempt_payload = dict(payload)
 
-    async with httpx.AsyncClient(**client_kwargs) as client:
-        try:
-            async with client.stream("POST", url, headers=headers, json=payload) as response:
-                if response.status_code != 200:
-                    error_text = await response.read()
-                    logger.error(f"Stream error: {response.status_code} {error_text}")
-                    yield {"error": f"Error {response.status_code}: {error_text.decode()}"}
+    for trust_env_mode in client_modes:
+        async with httpx.AsyncClient(timeout=timeout, trust_env=trust_env_mode) as client:
+            for attempt in range(max_retries + 1):
+                try:
+                    async with client.stream("POST", endpoint, headers=headers, json=attempt_payload) as response:
+                        if response.status_code != 200:
+                            error_chunks = []
+                            async for chunk in response.aiter_bytes():
+                                error_chunks.append(chunk)
+                            error_text = b"".join(error_chunks).decode("utf-8", errors="ignore")
+                            error_lower = error_text.lower()
+                            logger.error(
+                                "Volcengine API Stream error (Attempt %s/%s, trust_env=%s): %s",
+                                attempt + 1,
+                                max_retries + 1,
+                                trust_env_mode,
+                                error_text,
+                            )
+
+                            should_retry_with_smaller_max_tokens = (
+                                attempt < max_retries
+                                and "max_tokens" in attempt_payload
+                                and (
+                                    "max_tokens" in error_lower
+                                    or "max token" in error_lower
+                                    or "output token" in error_lower
+                                    or "invalid_parameter" in error_lower
+                                )
+                            )
+                            if should_retry_with_smaller_max_tokens:
+                                attempt_payload = dict(attempt_payload)
+                                attempt_payload["max_tokens"] = min(int(attempt_payload.get("max_tokens", 120000)), 8192)
+                                logger.warning("Retrying stream with reduced max_tokens=%s", attempt_payload["max_tokens"])
+                                continue
+
+                            is_retryable_status = response.status_code in (408, 409, 425, 429) or response.status_code >= 500
+                            if is_retryable_status:
+                                if attempt < max_retries:
+                                    continue
+                                if not trust_env_mode:
+                                    logger.warning("Switching stream client to trust_env=True after transient upstream HTTP failure")
+                                    break
+                            yield f"Error: {response.status_code} {error_text}"
+                            return
+
+                        async for line in response.aiter_lines():
+                            if line.startswith("data: "):
+                                data = line[6:]
+                                if data.strip() == "[DONE]":
+                                    return
+                                try:
+                                    yield json.loads(data)
+                                except json.JSONDecodeError:
+                                    continue
+                        return
+
+                except Exception as e:
+                    last_error = e
+                    err_text = str(e).lower()
+                    logger.error(
+                        "Failed to create chat completion stream (Attempt %s/%s, trust_env=%s): %s",
+                        attempt + 1,
+                        max_retries + 1,
+                        trust_env_mode,
+                        e,
+                    )
+                    is_retryable = (
+                        "timeout" in err_text
+                        or "timed out" in err_text
+                        or "temporarily unavailable" in err_text
+                        or "connection reset" in err_text
+                        or "server disconnected without sending a response" in err_text
+                        or "remote protocol error" in err_text
+                    )
+                    if attempt < max_retries and is_retryable:
+                        continue
+                    if not trust_env_mode and is_retryable:
+                        logger.warning("Switching stream client to trust_env=True due to transient connection failure")
+                        break
+                    yield f"Error: {str(e)}"
                     return
 
-                async for line in response.aiter_lines():
-                    if line.startswith("data: "):
-                        data = line[6:].strip()
-                        if data == "[DONE]":
-                            break
-                        try:
-                            chunk = json.loads(data)
-                            yield chunk
-                        except json.JSONDecodeError:
-                            pass
-        except Exception as e:
-            logger.error(f"Stream exception: {e}")
-            yield {"error": str(e)}
+    if last_error:
+        yield f"Error: {str(last_error)}"
+        return
+    yield "Error: Failed to create chat completion stream"
 
+
+
+async def _resolve_image_url(url: str) -> str:
+    # Handle both relative (/static/...) and absolute (http.../static/...) local URLs
+    if not url:
+        return url
+        
+    path_to_resolve = url
+    if url.startswith("http"):
+        # Check if it contains /static/
+        if "/static/" in url:
+            path_to_resolve = url[url.find("/static/"):]
+        else:
+            return url
+    
+    if not path_to_resolve.startswith("/static/"):
+        return url
+    
+    try:
+        # /static/assets/xxx.png -> backend/static/assets/xxx.png
+        # path is relative to backend root
+        base_dir = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
+        # remove /static/ prefix
+        rel_path = path_to_resolve[len("/static/"):]
+        if rel_path.startswith("/"):
+            rel_path = rel_path[1:]
+        file_path = os.path.join(base_dir, "static", rel_path)
+        
+        if not os.path.exists(file_path):
+            logger.error(f"Local file not found: {file_path} (original: {url})")
+            # Return None or raise error instead of returning the path string
+            # Returning the path string causes API errors because it's not a valid URL/Base64
+            return None 
+            
+        async with aiofiles.open(file_path, "rb") as f:
+            content = await f.read()
+
+        # Compress image to ensure it meets Volcengine requirements:
+        # 1. Max dimension 4096px (Doc says 6000px, but 4096 is safer for 4K)
+        # 2. Max file size 10MB (Doc says 10MB)
+        MAX_SIZE_BYTES = 9 * 1024 * 1024 # 9MB to be safe
+        MAX_DIMENSION = 4096
+        
+        try:
+            img = Image.open(io.BytesIO(content))
+            
+            # Determine output format (preserve PNG if original is PNG, otherwise JPEG)
+            output_format = img.format if img.format in ["PNG", "JPEG"] else "JPEG"
+            mime_type = f"image/{output_format.lower()}"
+            
+            # Check if processing is needed
+            needs_processing = False
+            
+            if img.width > MAX_DIMENSION or img.height > MAX_DIMENSION:
+                needs_processing = True
+                
+            if len(content) > MAX_SIZE_BYTES:
+                needs_processing = True
+                
+            if img.format not in ["PNG", "JPEG"]:
+                needs_processing = True
+                output_format = "JPEG" # Convert others to JPEG
+                mime_type = "image/jpeg"
+
+            if needs_processing:
+                # Resize if needed
+                if img.width > MAX_DIMENSION or img.height > MAX_DIMENSION:
+                    img.thumbnail((MAX_DIMENSION, MAX_DIMENSION), Image.Resampling.LANCZOS)
+                
+                # Convert mode if needed
+                if output_format == "JPEG" and img.mode in ("RGBA", "P"):
+                    img = img.convert("RGB")
+                
+                # Save to buffer
+                buffer = io.BytesIO()
+                quality = 95
+                img.save(buffer, format=output_format, quality=quality)
+                compressed_content = buffer.getvalue()
+                
+                # If still too large, reduce quality (only for JPEG)
+                if len(compressed_content) > MAX_SIZE_BYTES and output_format == "JPEG":
+                    while len(compressed_content) > MAX_SIZE_BYTES and quality > 50:
+                        quality -= 10
+                        buffer = io.BytesIO()
+                        img.save(buffer, format=output_format, quality=quality)
+                        compressed_content = buffer.getvalue()
+                
+                content = compressed_content
+                logger.info(f"Processed local image {url}: Original Size={len(content)} -> New Size={len(compressed_content)} bytes (quality={quality})")
+            
+        except Exception as e:
+            logger.warning(f"Failed to process image {url}: {e}")
+            # Fallback to original content (might fail API if too large)
+            # If original content is not JPEG/PNG, it might fail API too.
+            # But we try our best.
+            # Assume JPEG if we failed to detect/convert
+            if "mime_type" not in locals():
+                 mime_type = "image/jpeg"
+
+        b64 = base64.b64encode(content).decode("utf-8")
+        logger.info(f"Resolved local image {url} to base64 (len={len(b64)})")
+            
+        return f"data:{mime_type};base64,{b64}"
+    except Exception as e:
+        logger.error(f"Failed to resolve local image: {e}")
+        return url
 
 
 async def create_image(
@@ -265,312 +422,261 @@ async def create_image(
 ) -> dict[str, Any]:
     # Volcengine API Key
     api_key = "6002c554-3d7f-4293-80e9-c217758ba983"
+    endpoint = "https://ark.cn-beijing.volces.com/api/v3/images/generations"
     
-    settings = await get_or_create_settings(session, user_id)
+    # Create a copy of payload to avoid side effects on the original dictionary
+    payload = payload.copy()
     
-    # Volcengine Endpoint
-    endpoint = "https://ark.cn-beijing.volces.com/api/v3"
+    model = payload.get("model", "doubao-seedream-4-5-251128")
+    # Map alias to real model ID
+    if model == "doubao-seedream":
+        model = "doubao-seedream-4-5-251128"
+    payload["model"] = model
     
-    prompt = (payload.get("prompt") or "").strip()
-    # Extract prompt from messages if present (OpenAI chat format compatibility)
-    if not prompt and payload.get("messages"):
-        for msg in reversed(payload["messages"]):
-            if msg.get("content"):
-                prompt = msg["content"]
-                if isinstance(prompt, list):
-                    # Handle multimodal content list
-                    for part in prompt:
-                        if isinstance(part, dict) and part.get("type") == "text":
-                            prompt = part.get("text", "")
-                            break
-                        elif isinstance(part, str):
-                            prompt = part
-                            break
-                break
+    # Handle 'size' parameter -> width/height
+    # This is critical because Volcengine API expects width/height integers, but frontend/assets.py sends 'size' string
+    if "size" in payload and ("width" not in payload or "height" not in payload):
+        try:
+            size_str = str(payload["size"]).lower()
+            if "x" in size_str:
+                w, h = size_str.split("x")
+                payload["width"] = int(w)
+                payload["height"] = int(h)
+            elif "*" in size_str:
+                w, h = size_str.split("*")
+                payload["width"] = int(w)
+                payload["height"] = int(h)
+            logger.info(f"Parsed size '{payload['size']}' to width={payload.get('width')}, height={payload.get('height')}")
+            
+            # Remove 'size' parameter as it might be in invalid format (e.g. '*') for the API
+            # The API expects 'width' and 'height' as integers, or 'size' as specific enum strings.
+            payload.pop("size", None)
+        except Exception as e:
+            logger.warning(f"Failed to parse size '{payload.get('size')}': {e}")
 
-    # Default to a generic Doubao image model if not specified
-    # Note: User should replace this with their specific Endpoint ID for Doubao-Image (Seedream)
-    model = payload.get("model")
-    # If model is explicitly a text model, force to image model
-    if model and ("seed-2-0" in model or "flash" in model or "gpt-3" in model or "gpt-4" in model):
-         model = "doubao-seedream-4-5-251128"
-         
-    if not model or "gemini" in model or "gpt" in model:
-        model = "doubao-seedream-4-5-251128" 
+    resolved_references: list[str] = []
+    
+    # 1. Handle 'image_url' (single string)
+    if "image_url" in payload and payload["image_url"]:
+        resolved_single = await _resolve_image_url(str(payload["image_url"]))
+        if resolved_single:
+            resolved_references.append(resolved_single)
+            # Remove original key to avoid conflicts
+            payload.pop("image_url", None)
 
-    # Construct OpenAI-compatible image generation payload
-    request_payload: dict[str, Any] = {
-        "model": model,
-        "prompt": prompt,
-        "n": payload.get("n", 1),
+    # 2. Handle 'image_urls' (list of strings)
+    if "image_urls" in payload and isinstance(payload["image_urls"], list):
+        for url in payload["image_urls"]:
+            resolved = await _resolve_image_url(str(url))
+            if resolved:
+                resolved_references.append(resolved)
+        # Remove original key to avoid conflicts
+        payload.pop("image_urls", None)
+
+    # 3. Handle 'image' (string or list)
+    if "image" in payload:
+        image_value = payload["image"]
+        if isinstance(image_value, str):
+            resolved = await _resolve_image_url(image_value)
+            if resolved:
+                resolved_references.append(resolved)
+        elif isinstance(image_value, list):
+            for value in image_value:
+                resolved = await _resolve_image_url(str(value))
+                if resolved:
+                    resolved_references.append(resolved)
+        # Remove original key to avoid conflicts
+        payload.pop("image", None)
+
+    # 4. Construct payload for Doubao Seedream
+    if "doubao" in model:
+        if resolved_references:
+            payload["image"] = resolved_references[0] if len(resolved_references) == 1 else resolved_references
+
+        payload.pop("image_urls", None)
+        payload.pop("binary_data_base64", None)
+        payload["return_url"] = True
+        payload.pop("image_url", None)
+
+        logger.info(
+            "Seedream Payload Check: image_count=%d keys=%s",
+            len(resolved_references),
+            list(payload.keys())
+        )
+        
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json"
     }
     
-    # Handle size logic for Volcengine
-    size = payload.get("size", "1024x1024")
-    # If size is "2K", pass it directly as string, Volcengine supports it
-    # If size is standard resolution like "1024x1024", pass it
-    request_payload["size"] = size
-    
-    # Pass through Volcengine specific parameters
-    for key in ["sequential_image_generation", "response_format", "watermark", "image_url"]:
-        if key in payload:
-            # Special handling for image_url: Convert to Base64 if it's a remote URL
-            # This ensures we are "sending the image directly" as requested, avoiding access issues with remote URLs
-            if key == "image_url":
-                img_url = payload[key]
-                final_img_url = img_url
-                
-                if isinstance(img_url, str) and img_url.startswith("http"):
-                    try:
-                        logger.info(f"Downloading image for img2img: {img_url}")
-                        # Use a new client for download to avoid proxy/config issues
-                        async with httpx.AsyncClient(timeout=60.0) as downloader:
-                            img_resp = await downloader.get(img_url)
-                            img_resp.raise_for_status()
-                            content_type = img_resp.headers.get("Content-Type", "image/jpeg")
-                            b64_data = base64.b64encode(img_resp.content).decode("utf-8")
-                            final_img_url = f"data:{content_type};base64,{b64_data}"
-                            logger.info(f"Converted input image to Base64 (len={len(b64_data)})")
-                    except Exception as e:
-                        logger.warning(f"Failed to convert input image to Base64, falling back to URL: {e}")
-                        final_img_url = img_url
-                
-                # Volcengine Seedream model uses 'image_urls' (list) instead of 'image_url'
-                if "doubao-seedream" in model:
-                    request_payload["image_urls"] = [final_img_url]
-                    # Clean up the singular key if it was set by mistake or default
-                    if "image_url" in request_payload:
-                        del request_payload["image_url"]
-                else:
-                    request_payload[key] = final_img_url
-            else:
-                request_payload[key] = payload[key]
-            
-    # Hardcode defaults for Doubao Seedream model as requested
-    if model == "doubao-seedream-4-5-251128":
-        request_payload.setdefault("sequential_image_generation", "disabled")
-        request_payload.setdefault("response_format", "url")
-        request_payload.setdefault("watermark", True)
-        
-        # Relaxed size logic: Allow custom dimensions (WIDTHxHEIGHT) or standard aliases
-        current_size = request_payload.get("size")
-        
-        # Check for invalid small sizes and upgrade them
-        # 1024x1024 = 1MP (Too small, min 3.6MP)
-        # 1024x1536 = 1.5MP (Too small)
-        if current_size in ["1024x1024", "1024x1536", "1536x1024"]:
-            if current_size == "1024x1024":
-                request_payload["size"] = "2048x2048" # 2K Square
-            elif current_size == "1024x1536":
-                request_payload["size"] = "2048x3072" # Portrait
-            elif current_size == "1536x1024":
-                request_payload["size"] = "3072x2048" # Landscape
-            logger.info(f"Upgraded size from {current_size} to {request_payload['size']} for Seedream model")
-            
-        elif not current_size:
-             request_payload["size"] = "2K"
-        elif current_size not in ["2K", "1k", "4k"] and "x" not in str(current_size) and "*" not in str(current_size):
-             # If it's some unknown format, default to 2K to be safe
-             request_payload["size"] = "2K"
-    
-    # Use auto-detected proxy
-    proxies = _get_auto_proxy()
-    
-    # Volcengine is domestic, force DIRECT connection
-    logger.info("Volcengine image generation, bypassing proxy.")
-    transport = httpx.AsyncHTTPTransport(retries=2)
-    client_kwargs = {"timeout": 120.0, "transport": transport, "trust_env": False}
+    # Debug: Print headers (mask key)
+    masked_headers = headers.copy()
+    masked_headers["Authorization"] = "Bearer " + api_key[:5] + "..."
+    logger.info(f"Sending request to {endpoint} with headers: {masked_headers}")
 
-    async with httpx.AsyncClient(**client_kwargs) as client:
-        try:
-            response = await client.post(
-                f"{endpoint}/images/generations",
-                headers={
-                    "Content-Type": "application/json",
-                    "Authorization": f"Bearer {api_key}",
-                },
-                json=request_payload,
-                timeout=120.0,
-            )
-            if response.status_code != 200:
-                logger.error(f"Volcengine Image Generation Failed: {response.text}")
+    is_image_to_image = bool(resolved_references)
+    client_modes = [False, True]
+    last_error: Exception | None = None
+    for trust_env_mode in client_modes:
+        attempt_payload = payload.copy()
+        async with httpx.AsyncClient(timeout=300.0, trust_env=trust_env_mode) as client:
+            max_retries = 2
+            for attempt in range(max_retries + 1):
                 try:
-                    error_data = response.json()
-                    error_msg = error_data.get("error", {}).get("message", response.text)
-                    error_code = error_data.get("error", {}).get("code", "")
-                except:
-                    error_msg = response.text
-                    error_code = ""
-                
-                # Friendly error message for content safety rejection
-                if (
-                    "sensitive" in error_msg.lower() 
-                    or "blocked" in error_msg.lower() 
-                    or "compliance" in error_msg.lower()
-                    or error_code == "OutputImageSensitiveContentDetected"
-                ):
-                     raise ValueError("图片生成失败：内容包含敏感信息，请修改提示词后重试。")
-                
-                raise Exception(f"Volcengine Error: {error_msg}")
-                
-            response.raise_for_status()
-            result = _normalize_image_response(response.json())
-
-            # User Requirement: Store image content (Base64), not URL
-            # Download the generated image URL and convert to Base64 Data URI
-            if "data" in result:
-                for item in result["data"]:
-                    if "url" in item:
-                        try:
-                            # Use a separate client for downloading to avoid reusing the API client configuration
-                            # and to ensure we don't have proxy issues if the URL is accessible directly
-                            async with httpx.AsyncClient(timeout=60.0) as downloader:
-                                img_resp = await downloader.get(item["url"])
-                                img_resp.raise_for_status()
-                                content_type = img_resp.headers.get("Content-Type", "image/jpeg")
-                                b64_data = base64.b64encode(img_resp.content).decode("utf-8")
-                                item["url"] = f"data:{content_type};base64,{b64_data}"
-                                logger.info(f"Converted generated image to Base64 (len={len(b64_data)})")
-                        except Exception as e:
-                            logger.error(f"Failed to convert image to Base64: {e}")
-                            # Fallback: keep the URL, but log the error
-            
-            return result
-            
-        except httpx.HTTPError as exc:
-            logger.error("Volcengine image generation failed: %s", exc)
-            if hasattr(exc, "response") and exc.response:
-                 logger.error("Response: %s", exc.response.text)
-            raise ValueError(f"Volcengine 绘图失败：{type(exc).__name__}") from exc
-
-
-def _normalize_image_response(data: dict[str, Any]) -> dict[str, Any]:
-    if data.get("data"):
-        return data
-    images = data.get("images") or data.get("output")
-    if isinstance(images, list):
-        for item in images:
-            if isinstance(item, str):
-                return {"data": [{"url": item}]}
-            if isinstance(item, dict):
-                url = item.get("url") or item.get("image_url")
-                if url:
-                    return {"data": [{"url": url}]}
-    choices = data.get("choices") or []
-    for choice in choices:
-        message = choice.get("message") or {}
-        content = message.get("content")
-        images = message.get("images")
-        if isinstance(images, list) and images:
-            first = images[0]
-            if isinstance(first, str):
-                return {"data": [{"url": first}]}
-            if isinstance(first, dict):
-                url = first.get("url") or first.get("image_url")
-                if url:
-                    return {"data": [{"url": url}]}
-        if isinstance(content, list):
-            for part in content:
-                part_type = part.get("type")
-                if part_type in {"image_url", "image", "output_image", "output_image_url"}:
-                    image_url: Optional[Union[str, dict[str, Any]]] = (
-                        part.get("image_url", {}).get("url")
-                        or part.get("image")
-                        or part.get("url")
+                    response = await client.post(
+                        endpoint,
+                        headers=headers,
+                        json=attempt_payload
                     )
-                    if isinstance(image_url, dict):
-                        image_url = image_url.get("url") or image_url.get("image_url")
-                    if image_url:
-                        return {"data": [{"url": image_url}]}
-        elif isinstance(content, str):
-            if content.startswith("http") or content.startswith("data:image/"):
-                return {"data": [{"url": content}]}
-    return data
+                    
+                    if response.status_code != 200:
+                        error_text = response.text
+                        logger.error(f"Volcengine Image API error (Attempt {attempt+1}/{max_retries+1}, trust_env={trust_env_mode}): {error_text}")
+                        error_text_lower = error_text.lower()
+                        should_retry_without_size = (
+                            attempt < max_retries
+                            and is_image_to_image
+                            and ("width" in attempt_payload or "height" in attempt_payload)
+                            and (
+                                "width" in error_text_lower
+                                or "height" in error_text_lower
+                                or "size" in error_text_lower
+                                or "resolution" in error_text_lower
+                                or "invalid_parameter" in error_text_lower
+                                or "invalid parameter" in error_text_lower
+                                or "invalid_request_error" in error_text_lower
+                            )
+                        )
+                        if should_retry_without_size:
+                            adjusted_payload = attempt_payload.copy()
+                            adjusted_payload.pop("width", None)
+                            adjusted_payload.pop("height", None)
+                            adjusted_payload.pop("size", None)
+                            attempt_payload = adjusted_payload
+                            logger.warning("Retrying image edit without explicit width/height due to parameter validation error")
+                            continue
+                        if attempt < max_retries:
+                            logger.warning(f"Retrying request due to failure... trust_env={trust_env_mode}")
+                            continue
+                             
+                        try:
+                            error_data = response.json()
+                            if "error" in error_data:
+                                err_code = error_data["error"].get("code", "")
+                                err_msg = error_data["error"].get("message", "")
+                                if "risk" in err_msg.lower() or "safety" in err_msg.lower() or "policy" in err_msg.lower():
+                                    logger.warning(f"Safety Filter Triggered! Code: {err_code}, Msg: {err_msg}")
+                            return error_data
+                        except:
+                            response.raise_for_status()
+                            
+                    return response.json()
+                except Exception as e:
+                    last_error = e
+                    logger.error(f"Failed to create image (Attempt {attempt+1}/{max_retries+1}, trust_env={trust_env_mode}): {e}")
+                    err_text = str(e).lower()
+                    if attempt < max_retries:
+                        continue
+                    if (
+                        not trust_env_mode
+                        and "server disconnected without sending a response" in err_text
+                    ):
+                        logger.warning("Switching image generation client to trust_env=True due to disconnected response")
+                        break
+                    raise e
 
-
-async def _load_image_bytes(image_url: str) -> tuple[bytes, str, str]:
-    if image_url.startswith("data:image/"):
-        match = re.match(r"data:(image/[^;]+);base64,(.+)", image_url, re.DOTALL)
-        if not match:
-            raise ValueError("图片数据解析失败")
-        content_type = match.group(1)
-        data = base64.b64decode(match.group(2))
-        ext = content_type.split("/")[-1]
-        filename = f"image.{ext}"
-        return data, filename, content_type
-    async with httpx.AsyncClient(timeout=60.0) as client:
-        response = await client.get(image_url)
-        response.raise_for_status()
-        content_type = response.headers.get("Content-Type") or "image/png"
-        ext = content_type.split("/")[-1]
-        filename = f"image.{ext}"
-        return response.content, filename, content_type
+    if last_error:
+        raise last_error
+    raise RuntimeError("Failed to create image")
 
 
 async def create_image_edit(
-    session: AsyncSession,
-    user_id: str,
-    image_url: str,
-    payload: dict[str, Any],
+    session: AsyncSession, user_id: str, ref_image_url: str, payload: dict[str, Any]
 ) -> dict[str, Any]:
-    request_payload = {**payload, "image_url": image_url}
-    return await create_image(session, user_id, request_payload)
+    # Wrapper for Image-to-Image
+    payload["image_url"] = ref_image_url
+    return await create_image(session, user_id, payload)
 
 
 async def create_image_with_reference(
-    session: AsyncSession,
-    user_id: str,
-    image_url: str,
-    payload: dict[str, Any],
+    session: AsyncSession, user_id: str, ref_image_url: str, payload: dict[str, Any]
 ) -> dict[str, Any]:
-    request_payload = {**payload, "image_url": image_url}
-    return await create_image(session, user_id, request_payload)
+    # Wrapper for Image-to-Image
+    payload["image_url"] = ref_image_url
+    return await create_image(session, user_id, payload)
 
 
 async def create_video(
     session: AsyncSession, user_id: str, payload: dict[str, Any]
 ) -> dict[str, Any]:
-    # Volcengine API Key
-    api_key = "6002c554-3d7f-4293-80e9-c217758ba983"
-    
-    settings = await get_or_create_settings(session, user_id)
-    
-    # Volcengine Endpoint
-    endpoint = "https://ark.cn-beijing.volces.com/api/v3"
+    api_key = "sk-FasceV0bEbOdg88TFa7FpIlLubCftqTmvZJretK3fgR81cTP"
+    model = payload.get("model", "veo_3_1-4K")
+    prompt = payload.get("prompt", "")
+    image_url = payload.get("image_url")
+    model_text = str(model or "").strip()
+    model_text_lower = model_text.lower()
+    is_kling_model = model_text_lower.startswith("kling")
+    endpoint = "https://api.magic666.cn/api/v1/video/generations"
 
-    # Default to a generic Doubao video model
-    # Note: User should replace this with their specific Endpoint ID for Doubao-Video (PixelDance)
-    model = payload.get("model")
-    if not model or "sora" in model:
-        model = "doubao-video-pro"
-        
-    request_payload = payload.copy()
-    request_payload["model"] = model
+    logger.info(f"Creating video with model={model}, prompt={prompt[:20]}..., image_url={'yes' if image_url else 'no'}")
 
-    # Use auto-detected proxy
-    proxies = _get_auto_proxy()
-    transport = httpx.AsyncHTTPTransport(retries=2, proxy=proxies)
-    
-    async with httpx.AsyncClient(timeout=180.0, transport=transport) as client:
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json"
+    }
+
+    data: dict[str, Any] = {
+        "model": model,
+        "prompt": prompt,
+    }
+
+    if is_kling_model:
+        data["mode"] = payload.get("mode", "pro")
+        data["duration"] = payload.get("duration", 1)
+        data["reference_video"] = payload.get("reference_video", False)
+        data["with_audio"] = payload.get("with_audio", False)
+        if payload.get("reference_video_url"):
+            data["reference_video_url"] = payload["reference_video_url"]
+        elif image_url and data["reference_video"]:
+            data["reference_video_url"] = image_url
+        elif image_url:
+            data["image_url"] = image_url
+    else:
+        data["size"] = payload.get("size", "1280x720")
+        data["seconds"] = payload.get("seconds", 5)
+        if image_url:
+            data["image_url"] = image_url
+
+    async with httpx.AsyncClient(timeout=120.0) as client:
         try:
-            # Volcengine Video Generation Endpoint (Hypothetical OpenAI compatible or specific)
-            # Currently Volcengine might not support /v1/videos standard. 
-            # We will try a common path or log warning.
-            url = f"{endpoint}/videos/generations" 
-            
-            logger.info("Sending video generation request to Volcengine: %s", url)
-            
             response = await client.post(
-                url,
-                headers={
-                    "Authorization": f"Bearer {api_key}",
-                    "Content-Type": "application/json",
-                },
-                json=request_payload,
+                endpoint,
+                headers=headers,
+                json=data
             )
             
-            response.raise_for_status()
-            return response.json()
-        except httpx.HTTPError as exc:
-             logger.error("Volcengine video generation failed: %s", exc)
-             raise ValueError(f"Volcengine 视频生成失败：{type(exc).__name__}") from exc
+            if response.status_code != 200:
+                logger.error(f"Magic666 API error: {response.text}")
+                response.raise_for_status()
+                
+            result = response.json()
+            
+            video_url = ""
+            if "data" in result and isinstance(result["data"], list) and len(result["data"]) > 0:
+                 video_url = result["data"][0].get("url")
+            elif "url" in result:
+                 video_url = result["url"]
+            elif "video_url" in result:
+                 video_url = result["video_url"]
+            elif "output" in result and isinstance(result["output"], dict):
+                 output = result["output"]
+                 video_url = output.get("url") or output.get("video_url") or ""
+                 
+            if video_url:
+                return { "data": [ { "url": video_url } ] }
+            else:
+                return result
+
+        except Exception as e:
+            logger.error(f"Failed to create video: {e}")
+            raise e

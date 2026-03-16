@@ -21,7 +21,15 @@ from app.schemas.script import (
 )
 from app.services.projects import get_project
 from app.services.script_validation import validate_script_with_model as run_validation
-from app.services.scripts import get_active_script, save_script, get_script_history
+from app.services.scripts import (
+    get_active_script,
+    get_latest_meaningful_script,
+    has_meaningful_script_data,
+    save_script,
+    get_script_history,
+    delete_script,
+)
+from app.services.assets import list_assets
 from app.services.settings import get_or_create_settings
 from app.services.linkapi import create_chat_completion, create_chat_completion_stream
 from app.services.file_parsing import read_file_content
@@ -33,6 +41,9 @@ from app.core.script_prompts import (
     PROMPT_CONTINUATION_DEFAULT,
     PROMPT_CONTINUATION_TRAFFIC,
     PROMPT_CONTINUATION_PAID,
+    PROMPT_EXTRACT_OUTLINE,
+    PROMPT_SPLIT_SCRIPT,
+    PROMPT_STORYBOARD,
 )
 
 router = APIRouter()
@@ -48,6 +59,10 @@ async def fetch_script(
     if not project:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="项目不存在")
     script = await get_active_script(db, project_id)
+    if script and not has_meaningful_script_data(script):
+        fallback = await get_latest_meaningful_script(db, project_id)
+        if fallback:
+            script = fallback
     if not script:
         return ScriptResponse(project_id=project_id, content="")
     return ScriptResponse(
@@ -55,6 +70,9 @@ async def fetch_script(
         project_id=project_id,
         content=script.content,
         thinking=script.thinking,
+        storyboard=script.storyboard,
+        outline=script.outline,
+        episodes=json.loads(script.episodes) if script.episodes else None,
         version=script.version,
         is_active=script.is_active,
         created_at=script.created_at.isoformat() if script.created_at else None,
@@ -71,12 +89,23 @@ async def update_script(
     project = await get_project(db, user_id, project_id)
     if not project:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="项目不存在")
-    script = await save_script(db, project_id, payload.content, payload.thinking)
+    script = await save_script(
+        db, 
+        project_id, 
+        payload.content, 
+        payload.thinking, 
+        payload.storyboard,
+        payload.outline,
+        payload.episodes
+    )
     return ScriptResponse(
         id=script.id,
         project_id=project_id,
         content=script.content,
         thinking=script.thinking,
+        storyboard=script.storyboard,
+        outline=script.outline,
+        episodes=json.loads(script.episodes) if script.episodes else None,
         version=script.version,
         is_active=script.is_active,
         created_at=script.created_at.isoformat() if script.created_at else None,
@@ -100,11 +129,33 @@ async def fetch_script_history(
             id=item.id,
             project_id=item.project_id,
             content=item.content,
+            thinking=item.thinking,
+            storyboard=item.storyboard,
+            outline=item.outline,
+            episodes=json.loads(item.episodes) if item.episodes else None,
             version=item.version,
             is_active=item.is_active,
             created_at=item.created_at.isoformat() if item.created_at else ""
         ))
     return ScriptHistoryResponse(items=items)
+
+
+@router.delete("/{project_id}/script/history/{version_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_script_version_endpoint(
+    project_id: str,
+    version_id: str,
+    user_id: str = Depends(get_current_user_id),
+    db: AsyncSession = Depends(get_db),
+):
+    project = await get_project(db, user_id, project_id)
+    if not project:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="项目不存在")
+    
+    success = await delete_script(db, project_id, version_id)
+    if not success:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="脚本版本不存在")
+    
+    return None
 
 
 @router.post("/{project_id}/script/validate", response_model=ScriptValidationResponse)
@@ -126,7 +177,7 @@ async def validate_script(
     )
 
 
-@router.post("/{project_id}/script/generate", response_model=ScriptGenerateResponse)
+@router.post("/{project_id}/script/generate")
 async def generate_script(
     project_id: str,
     payload: ScriptGenerateRequest,
@@ -139,11 +190,72 @@ async def generate_script(
 
     settings = await get_or_create_settings(db, user_id)
     model = payload.model or settings.default_model_text
+    model_text = (model or "").strip()
+    model_text_lower = model_text.lower()
+    if (
+        not model_text
+        or model_text_lower == "doubao-pro"
+        or "gemini" in model_text_lower
+        or "gpt" in model_text_lower
+        or "openrouter" in model_text_lower
+    ):
+        model = "doubao-seed-2-0-pro-260215"
     
     system_prompt = get_system_prompt(payload.mode)
     user_prompt = payload.content
     
-    if payload.mode == "step0_generate":
+    if payload.mode == "generate_storyboard":
+        system_prompt = PROMPT_STORYBOARD
+        
+        # Build asset context first
+        assets = await list_assets(db, project_id)
+        asset_context = ""
+        if assets:
+            asset_context = "【可用素材库】\n请在生成分镜时，参考以下素材信息。如果当前镜头使用了某个素材（角色、道具、场景），请务必在该单元格描述的末尾加上 `[AssetID:素材ID]` 标记，以便程序自动关联图片。\n"
+            
+            # Filter out generic CHARACTER assets, only use CHARACTER_LOOK, PROP, SCENE
+            valid_asset_types = ["CHARACTER_LOOK", "PROP", "SCENE"]
+            filtered_assets = [a for a in assets if a.type in valid_asset_types]
+            
+            type_mapping = {
+                "CHARACTER_LOOK": "角色形象",
+                "PROP": "道具",
+                "SCENE": "场景"
+            }
+
+            for asset in filtered_assets:
+                desc = asset.description or "无描述"
+                # Map internal type to Chinese label for better LLM understanding
+                type_display = type_mapping.get(asset.type, asset.type)
+                asset_context += f"- [{type_display}] {asset.name} (ID: {asset.id}): {desc}\n"
+            
+            asset_context += "\n"
+            logger.info(f"Attached {len(filtered_assets)} assets to storyboard prompt (filtered from {len(assets)})")
+
+        style_instruction = (payload.instruction or "").strip()
+        style_block = f"【全局风格要求】\n{style_instruction}\n\n" if style_instruction else ""
+
+        user_prompt = (
+            f"{style_block}"
+            f"{asset_context}"
+            f"请将以下剧本转换为分镜脚本：\n\n{user_prompt}\n\n"
+            "【再次提醒】\n"
+            "请务必使用素材库中的AssetID标记角色、道具和场景。严禁省略。"
+            "如果某个角色/道具/场景在素材库中存在，必须附带 `[AssetID:xxx]`，否则视为错误。"
+        )
+    
+    if payload.mode == "suggestion_paid":
+        system_prompt = PROMPT_SUGGESTION_PAID
+        if payload.instruction:
+            user_prompt = f"{payload.instruction}\n\n当前内容：\n{payload.content}"
+    elif payload.mode == "suggestion_traffic":
+        system_prompt = PROMPT_SUGGESTION_TRAFFIC
+        if payload.instruction:
+            user_prompt = f"{payload.instruction}\n\n当前内容：\n{payload.content}"
+    elif payload.mode == "extract_outline":
+        system_prompt = PROMPT_EXTRACT_OUTLINE
+        user_prompt = f"请根据以下剧本提炼大纲：\n\n{payload.content}"
+    elif payload.mode == "step0_generate":
         system_prompt = "你是一个专业的短剧编剧。请根据用户提供的主题、角色和分集大纲，创作一个完整的短剧剧本。格式要求：包含【剧本基本信息】、【人物小传】、【正文剧本】等标准部分。"
         
         user_prompt = payload.content
@@ -192,6 +304,9 @@ async def generate_script(
 {instruction_block}"""
         
         model = "doubao-seed-2-0-pro-260215"
+    elif payload.mode == "split_script":
+        system_prompt = PROMPT_SPLIT_SCRIPT
+        user_prompt = f"请将以下剧本进行分集拆分：\n\n{payload.content}"
     elif payload.instruction:
          user_prompt = f"{payload.instruction}\n\n当前内容：\n{payload.content}"
 
@@ -202,12 +317,15 @@ async def generate_script(
             {"role": "user", "content": user_prompt}
         ],
         "stream": True,
-        "temperature": 0.7
+        "temperature": 0.7,
+        # Set a very large max_tokens for Step 0 generation/rewriting to avoid truncation
+        # Doubao 2.0 Pro supports up to 128k output tokens
+        "max_tokens": 120000 
     }
     
     # Disable thinking mode for Step 0 only if explicitly requested or for legacy compatibility
     # User requested thinking mode for step0_modify, so we allow it there.
-    if payload.mode in ["step0_generate"]:
+    if payload.mode in ["step0_generate", "split_script"]:
         api_payload["thinking"] = {"type": "disabled"}
 
     async def event_generator():
@@ -223,12 +341,17 @@ async def generate_script(
                         # Yield SSE format
                         yield f"data: {json.dumps({'choices': [{'delta': {'content': content, 'reasoning_content': reasoning}}]})}\n\n"
                 elif isinstance(chunk, str):
-                     # If it's already a string, assume it's content
-                     yield f"data: {json.dumps({'choices': [{'delta': {'content': chunk}}]})}\n\n"
+                    if chunk.startswith("Error:"):
+                         yield f"data: {json.dumps({'error': chunk})}\n\n"
+                    else:
+                         # If it's already a string, assume it's content
+                         yield f"data: {json.dumps({'choices': [{'delta': {'content': chunk}}]})}\n\n"
             yield "data: [DONE]\n\n"
         except Exception as e:
-            logger.error(f"Stream error: {e}")
-            yield f"data: {json.dumps({'error': str(e)})}\n\n"
+                import traceback
+                traceback.print_exc()
+                logger.error(f"Stream error: {e}")
+                yield f"data: {json.dumps({'error': str(e)})}\n\n"
 
     return StreamingResponse(event_generator(), media_type="text/event-stream")
 
@@ -287,7 +410,7 @@ async def parse_script_file(
                 {"role": "user", "content": prompt}
             ],
             "temperature": 0.0,
-            "max_tokens": 4000,
+            "max_tokens": 64000,
             "thinking": {"type": "disabled"}
         }
 

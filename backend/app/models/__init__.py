@@ -8,6 +8,7 @@ from app.models.segment import Segment
 from app.models.segment_version import SegmentVersion
 from app.models.settings import UserSettings
 from app.models.user import User
+from app.models.character_voice import CharacterVoice
 
 __all__ = [
     "Base",
@@ -20,4 +21,5 @@ __all__ = [
     "AssetVersion",
     "Segment",
     "SegmentVersion",
+    "CharacterVoice",
 ]

@@ -17,7 +17,7 @@ class UserSettings(Base):
     endpoint: Mapped[str] = mapped_column(String(255), default="https://openrouter.ai/api/v1")
     api_key_encrypted: Mapped[Optional[str]] = mapped_column(String(2048), nullable=True)
     default_model_text: Mapped[str] = mapped_column(
-        String(128), default="google/gemini-3-flash-preview"
+        String(128), default="doubao-seed-2-0-pro-260215"
     )
     default_model_image: Mapped[str] = mapped_column(
         String(128), default="google/gemini-3-pro-image-preview"

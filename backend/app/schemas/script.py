@@ -15,8 +15,11 @@ class ScriptParseResponse(BaseModel):
 
 
 class ScriptRequest(BaseModel):
-    content: str
+    content: Optional[str] = None
     thinking: Optional[str] = None
+    storyboard: Optional[str] = None
+    outline: Optional[str] = None
+    episodes: Optional[List[dict]] = None
 
 
 class ScriptResponse(BaseModel):
@@ -24,6 +27,9 @@ class ScriptResponse(BaseModel):
     project_id: str
     content: str
     thinking: Optional[str] = None
+    storyboard: Optional[str] = None
+    outline: Optional[str] = None
+    episodes: Optional[List[dict]] = None
     version: Optional[int] = None
     is_active: Optional[bool] = None
     created_at: Optional[str] = None
@@ -41,7 +47,7 @@ class ScriptValidationRequest(BaseModel):
 
 
 class ScriptGenerateRequest(BaseModel):
-    mode: Literal["format", "complete", "revise", "extract_resources", "generate_storyboard", "step1_modify", "step2_modify", "suggestion_paid", "suggestion_traffic", "continuation", "continuation_paid", "continuation_traffic", "step0_generate", "step0_continue", "step0_modify"]
+    mode: Literal["format", "complete", "revise", "extract_resources", "generate_storyboard", "step1_modify", "step2_modify", "suggestion_paid", "suggestion_traffic", "continuation", "continuation_paid", "continuation_traffic", "step0_generate", "step0_continue", "step0_modify", "extract_outline", "split_script"]
     content: str
     model: Optional[str] = None
     instruction: Optional[str] = None
@@ -55,6 +61,10 @@ class ScriptHistoryItem(BaseModel):
     id: str
     project_id: str
     content: str
+    thinking: Optional[str] = None
+    storyboard: Optional[str] = None
+    outline: Optional[str] = None
+    episodes: Optional[List[dict]] = None
     version: int
     is_active: bool
     created_at: str

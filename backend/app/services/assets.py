@@ -2,9 +2,18 @@ from __future__ import annotations
 import json
 import ast
 import re
+import os
+import logging
+import uuid
+import httpx
+import aiofiles
+
+logger = logging.getLogger(__name__)
+
 from typing import Optional, Union, Any
-from sqlalchemy import select
+from sqlalchemy import select, delete
 from sqlalchemy.ext.asyncio import AsyncSession
+from urllib.parse import urlparse
 
 from app.models.asset import Asset
 from app.models.asset_version import AssetVersion
@@ -34,40 +43,165 @@ def _extract_json_payload(text: str) -> Optional[dict[str, Any]]:
 
 
 def _normalize_role_name(value: str) -> str:
-    normalized = re.sub(r"[\\s\\u3000]+", " ", value).strip()
-    return normalized
+    normalized = re.sub(r"[\s\u3000]+", " ", value).strip()
+    return normalized.strip("*")
 
 
 def _normalize_look_label(value: str) -> str:
-    normalized = re.sub(r"[\\s\\u3000]+", "", value).strip()
-    return normalized
+    normalized = re.sub(r"[\s\u3000]+", "", value).strip()
+    return normalized.strip("*")
+
+
+def _split_colon(text: str) -> tuple[str, str]:
+    if "：" in text:
+        return text.split("：", 1)
+    if ":" in text:
+        return text.split(":", 1)
+    return text, ""
+
+
+def _has_colon(text: str) -> bool:
+    return "：" in text or ":" in text
+
+
+async def download_image_as_local_file(image_url: str, filename_base: Optional[str] = None) -> str:
+    """
+    Download image from URL and save to local static directory.
+    Returns the local relative URL (e.g. /static/assets/xxx.png).
+    If download fails, returns the original URL.
+    If filename_base is provided, it uses that as the filename (plus extension).
+    """
+    if not image_url or not image_url.startswith("http"):
+        return image_url
+
+    try:
+        # Determine static directory
+        # backend/app/services/assets.py -> backend/app/services -> backend/app -> backend
+        base_dir = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
+        static_dir = os.path.join(base_dir, "static", "assets")
+        os.makedirs(static_dir, exist_ok=True)
+
+        async with httpx.AsyncClient(verify=False, trust_env=False, follow_redirects=True) as client:
+            resp = await client.get(image_url, timeout=60.0)
+            if resp.status_code != 200:
+                print(f"Download failed for {image_url}: {resp.status_code}")
+                return image_url
+            
+            content_type = resp.headers.get("content-type", "")
+            ext = ".png"
+            if "jpeg" in content_type or "jpg" in content_type:
+                ext = ".jpg"
+            elif "webp" in content_type:
+                ext = ".webp"
+            
+            if filename_base:
+                filename = f"{filename_base}{ext}"
+            else:
+                filename = f"{uuid.uuid4()}{ext}"
+            
+            filepath = os.path.join(static_dir, filename)
+            
+            async with aiofiles.open(filepath, "wb") as f:
+                await f.write(resp.content)
+            
+            return f"/static/assets/{filename}"
+    except Exception as e:
+        print(f"Error downloading image {image_url}: {e!r}")
+        return image_url
+
+
+# Fields to exclude from character descriptions and looks
+EXCLUDED_FIELDS = ["性格", "小传", "人物小传", "角色基础信息", "信息来源", "引用", "备注"]
 
 
 def _extract_role_descriptions(body: str) -> dict[str, str]:
     roles: dict[str, str] = {}
     current_role: Optional[str] = None
     buffer: list[str] = []
+    
     for raw_line in body.splitlines():
         line = raw_line.strip()
         if not line:
             continue
-        if line.startswith("角色") and "：" in line and "角色形象" not in line:
-            if current_role and buffer:
+            
+        clean_line = line.lstrip("#*").strip()
+        
+        # Detect start of other sections to close current role
+        if clean_line.startswith("通用道具") or clean_line.startswith("场景"):
+            if current_role:
                 roles[current_role] = "；".join(buffer).strip("；")
-            name = line.split("：", 1)[1].split("（", 1)[0].strip()
+            current_role = None
+            buffer = []
+            continue
+
+        # Detect role definition
+        if (clean_line.startswith("角色名") or clean_line.startswith("角色")) and _has_colon(clean_line):
+            # Check if it's really a role definition line (start with "角色名" or "角色" followed by colon)
+            # Handle cases like "角色名：xxx" or "角色: xxx"
+            parts = _split_colon(clean_line)
+            if len(parts) != 2:
+                continue
+                
+            label, val = parts
+            label = label.strip()
+            val = val.strip()
+            
+            # STRICT CHECK: Only treat as new role if label is exactly "角色" or "角色名"
+            if label not in ["角色", "角色名"]:
+                # If it's "角色形象", skip it (it's handled by _extract_role_looks)
+                if label == "角色形象":
+                    continue
+
+                # This is a description property (e.g. "角色基础信息"), fall through to description handling
+                if current_role:
+                    # Filter out unwanted fields
+                    if label in EXCLUDED_FIELDS:
+                        continue
+
+                    # Use original line to preserve formatting if needed, or reconstructed
+                    # Here we reconstruct to ensure consistent colon
+                    if _has_colon(clean_line):
+                        buffer.append(f"{label}：{val}")
+                    else:
+                        buffer.append(clean_line)
+                continue
+            
+            # If value is empty, it might be a header like "角色列表："
+            if not val:
+                continue
+            
+            if current_role:
+                roles[current_role] = "；".join(buffer).strip("；")
+            
+            # Normalize name (preserve parens for dual-role distinction)
+            name = val.strip()
             normalized = _normalize_role_name(name)
             current_role = normalized if normalized else None
             buffer = []
             continue
-        if current_role and "：" in line:
-            if "形象" in line:
+            
+        # Description lines
+        if current_role:
+            # Skip nested "Role Looks" section lines
+            if clean_line.startswith("角色形象") or clean_line.startswith("-") or clean_line.startswith("•"):
                 continue
-            label, value = line.split("：", 1)
-            value = value.strip()
-            if not value:
-                continue
-            buffer.append(f"{label.strip()}：{value}")
-    if current_role and buffer:
+
+            if _has_colon(line):
+                label, value = _split_colon(line)
+                label = label.strip()
+                value = value.strip()
+                
+                # Filter out unwanted fields
+                if label in EXCLUDED_FIELDS:
+                    continue
+
+                if value:
+                    buffer.append(f"{label}：{value}")
+            else:
+                # Plain text description
+                buffer.append(line)
+                
+    if current_role:
         roles[current_role] = "；".join(buffer).strip("；")
     return roles
 
@@ -75,53 +209,118 @@ def _extract_role_descriptions(body: str) -> dict[str, str]:
 def _extract_role_looks(body: str) -> dict[str, list[tuple[str, str]]]:
     looks: dict[str, list[tuple[str, str]]] = {}
     current_role: Optional[str] = None
+    
     for raw_line in body.splitlines():
         line = raw_line.strip()
         if not line:
             continue
-        if line.startswith("角色") and "：" in line and "角色形象" not in line:
-            name = line.split("：", 1)[1].split("（", 1)[0].strip()
-            normalized = _normalize_role_name(name)
-            current_role = normalized if normalized else None
-            if current_role:
-                looks.setdefault(current_role, [])
+            
+        clean_line = line.lstrip("#*").strip()
+        
+        # Reset current_role if entering other sections
+        if clean_line.startswith("通用道具") or clean_line.startswith("场景"):
+            current_role = None
             continue
-        if not current_role:
-            continue
-        normalized = line.lstrip("-").strip()
-        if normalized.startswith("形象") and "：" in normalized:
-            label, value = normalized.split("：", 1)
-            label = _normalize_look_label(label)
-            value = value.strip()
-            if label and value:
-                looks[current_role].append((label, value))
+        
+        # Context switch by role definition
+        if (clean_line.startswith("角色名") or clean_line.startswith("角色")) and _has_colon(clean_line) and "角色形象" not in clean_line:
+            parts = _split_colon(clean_line)
+            if len(parts) == 2:
+                label = parts[0].strip()
+                # STRICT CHECK: Only treat as new role if label is exactly "角色" or "角色名"
+                if label in ["角色", "角色名"]:
+                    val = parts[1].strip()
+                    if val:
+                        name = val.strip()
+                        normalized = _normalize_role_name(name)
+                        current_role = normalized if normalized else None
+                    continue
+            pass
+            
+        # Look definitions
+        if clean_line.startswith("-") or clean_line.startswith("•"):
+            content = re.sub(r"^[-•\s]+", "", clean_line)
+            
+            # Try to split by colon
+            parts = []
+            if "：" in content:
+                parts = content.split("：")
+            elif ":" in content:
+                parts = content.split(":")
+            else:
+                parts = [content]
+                
+            parts = [p.strip() for p in parts if p.strip()]
+
+            # Special handling: if line starts with "角色形象" (e.g. "- 角色形象：现代装：Desc"), remove it
+            if parts and parts[0] == "角色形象":
+                parts.pop(0)
+            
+            # Check for exclusions in the first part (label or potential role name)
+            if parts and parts[0] in EXCLUDED_FIELDS:
+                continue
+            
+            if len(parts) >= 3:
+                # Role：Look：Desc
+                r_name = _normalize_role_name(parts[0])
+                l_name = _normalize_look_label(parts[1])
+                # Join the rest with Chinese colon for consistency
+                desc = "：".join(parts[2:])
+                looks.setdefault(r_name, []).append((l_name, desc))
+            elif len(parts) == 2:
+                # Look：Desc (use current_role)
+                if current_role:
+                    l_name = _normalize_look_label(parts[0])
+                    if l_name.startswith("形象"):
+                        l_name = l_name.replace("形象", "", 1).strip()
+                    desc = parts[1]
+                    looks.setdefault(current_role, []).append((l_name, desc))
+            elif len(parts) == 1 and current_role:
+                # Just Look name? or Description?
+                pass
+            
     return looks
 
 
 def _extract_props_with_desc(body: str) -> list[tuple[str, str]]:
     props: list[tuple[str, str]] = []
+    in_props_section = False
+    
     for raw_line in body.splitlines():
         line = raw_line.strip()
         if not line:
             continue
-        if line.startswith("通用道具") or line.startswith("角色专属道具"):
-            if "：" in line:
-                value = line.split("：", 1)[1].strip()
+            
+        clean_line = line.lstrip("#*").strip()
+        
+        # Detect start of other sections
+        if clean_line.startswith("角色") or clean_line.startswith("场景"):
+            in_props_section = False
+            continue
+            
+        if clean_line.startswith("通用道具") or clean_line.startswith("角色专属道具"):
+            in_props_section = True
+            if "：" in clean_line:
+                value = clean_line.split("：", 1)[1].strip()
                 if value:
-                    name, desc = _split_name_desc(value)
-                    props.append((name, desc))
+                    if "：" in value:
+                        n, d = value.split("：", 1)
+                        props.append((n.strip(), d.strip()))
+                    else:
+                        props.append(_split_name_desc(value))
             continue
-        if line[0].isdigit() or line.startswith("- "):
-            value = re.sub(r"^[-\\d]+[\\.、\\s]+", "", line).strip()
-            if value:
-                name, desc = _split_name_desc(value)
-                props.append((name, desc))
-            continue
-        if "专属" in line and "：" in line:
-            value = line.split("：", 1)[1].strip()
-            if value:
-                name, desc = _split_name_desc(value)
-                props.append((name, desc))
+            
+        if in_props_section:
+            # Clean list markers
+            clean_line = re.sub(r"^[-•\d]+[\\.、\s]*", "", line).strip()
+            if not clean_line:
+                continue
+                
+            if "：" in clean_line:
+                name, desc = clean_line.split("：", 1)
+                props.append((name.strip(), desc.strip()))
+            else:
+                props.append(_split_name_desc(clean_line))
     return props
 
 
@@ -129,26 +328,51 @@ def _extract_scenes_with_desc(body: str) -> dict[str, str]:
     scenes: dict[str, str] = {}
     current_scene: Optional[str] = None
     buffer: list[str] = []
+    
     for raw_line in body.splitlines():
         line = raw_line.strip()
         if not line:
             continue
-        if line.startswith("场景") and "：" in line:
-            if current_scene and buffer:
+            
+        clean_line = line.lstrip("#*").strip()
+
+        # Detect start of other sections
+        if clean_line.startswith("角色") or clean_line.startswith("通用道具"):
+            if current_scene:
                 scenes[current_scene] = "；".join(buffer).strip("；")
-            value = line.split("：", 1)[1].strip()
-            name, desc = _split_name_desc(value)
-            current_scene = name if name else None
+            current_scene = None
             buffer = []
-            if desc:
-                buffer.append(desc)
             continue
-        if current_scene and "：" in line:
-            label, value = line.split("：", 1)
-            value = value.strip()
-            if value:
-                buffer.append(f"{label.strip()}：{value}")
-    if current_scene and buffer:
+
+        if clean_line.startswith("场景") and "：" in clean_line:
+            val = clean_line.split("：", 1)[1].strip()
+            # Header like "场景列表："
+            if not val:
+                continue
+                
+            if current_scene:
+                scenes[current_scene] = "；".join(buffer).strip("；")
+            
+            if "：" in val:
+                s_name, s_desc = val.split("：", 1)
+                current_scene = s_name.strip()
+                buffer = [s_desc.strip()]
+            else:
+                name, desc = _split_name_desc(val)
+                current_scene = name
+                buffer = []
+                if desc:
+                    buffer.append(desc)
+            continue
+            
+        if current_scene:
+            if "：" in line:
+                label, value = line.split("：", 1)
+                buffer.append(f"{label.strip()}：{value.strip()}")
+            else:
+                buffer.append(line)
+                
+    if current_scene:
         scenes[current_scene] = "；".join(buffer).strip("；")
     return scenes
 
@@ -166,7 +390,11 @@ async def list_assets(session: AsyncSession, project_id: str) -> list[Asset]:
 
 
 async def list_asset_versions(session: AsyncSession, asset_id: str) -> list[AssetVersion]:
-    result = await session.execute(select(AssetVersion).where(AssetVersion.asset_id == asset_id))
+    result = await session.execute(
+        select(AssetVersion)
+        .where(AssetVersion.asset_id == asset_id)
+        .order_by(AssetVersion.created_at.asc())
+    )
     return list(result.scalars().all())
 
 
@@ -174,8 +402,10 @@ async def get_asset(session: AsyncSession, asset_id: str) -> Optional[Asset]:
     return await session.scalar(select(Asset).where(Asset.id == asset_id))
 
 
+from app.core.script_prompts import PROMPT_EXTRACT_RESOURCES
+
 async def extract_assets_from_script(
-    session: AsyncSession, project_id: str, user_id: Optional[str] = None
+    session: AsyncSession, project_id: str, user_id: Optional[str] = None, manual_only: bool = False
 ) -> list[Asset]:
     script = await session.scalar(
         select(Script).where(Script.project_id == project_id, Script.is_active == True)
@@ -183,82 +413,165 @@ async def extract_assets_from_script(
     if not script:
         return []
 
-    if not user_id:
-        project = await session.scalar(select(Project).where(Project.id == project_id))
-        if project:
-            user_id = project.user_id
-    
-    if not user_id:
-        # Should not happen ideally, but as fallback
-        return []
+    SEPARATOR = "\n\n=== 原文剧本 (请勿删除此行) ===\n\n"
+    data = {}
 
-    system_prompt = (
-        "你是专业的短剧剧本分析助手。请仔细阅读剧本，提取出所有的【角色】、【角色形象】、【道具】、【场景】信息。\n"
-        "请严格输出标准的 JSON 格式，不要包含任何 Markdown 代码块标记或其他文字。\n"
-        "JSON 结构如下：\n"
-        "{\n"
-        '  "characters": [{"name": "角色名", "description": "角色描述"}],\n'
-        '  "character_looks": [{"role": "角色名", "look": "形象名称", "description": "形象描述"}],\n'
-        '  "props": [{"name": "道具名", "description": "道具描述"}],\n'
-        '  "scenes": [{"name": "场景名", "description": "场景描述"}]\n'
-        "}\n"
-        "注意：\n"
-        "1. 角色名应去除括号备注。\n"
-        "2. 角色形象通常格式为“角色名：形象名”，请拆分。\n"
-        "3. 描述应尽可能详细，包含外貌、穿着、材质、光影等信息。\n"
-        "4. 如果剧本中没有某类信息，请返回空列表。"
-    )
-
-    try:
-        response = await create_chat_completion(
-            session,
-            user_id,
-            {
-                "model": "doubao-seed-2-0-pro-260215",  # Explicitly request Doubao 2.0
-                "messages": [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": script.content},
-                ],
-                "temperature": 0.1,
-            },
-        )
-        content = ""
-        if isinstance(response, dict):
-             choices = response.get("choices") or []
-             if choices:
-                 content = choices[0].get("message", {}).get("content", "")
+    # Try to extract from manually edited resources first
+    if script.content and SEPARATOR in script.content:
+        resources_content = script.content.split(SEPARATOR)[0]
         
-        data = _extract_json_payload(content) or {}
-    except Exception as e:
-        # Fallback or error logging
-        # For now, return empty if LLM fails, or maybe raise error?
-        # Returning empty means no assets extracted.
-        return []
+        # Characters
+        char_map = _extract_role_descriptions(resources_content)
+        data["characters"] = [{"name": k, "description": v} for k, v in char_map.items()]
+        
+        # Looks
+        looks_map = _extract_role_looks(resources_content)
+        looks_list = []
+        for role, items in looks_map.items():
+            for label, val in items:
+                looks_list.append({"role": role, "look": label, "description": val})
+        data["character_looks"] = looks_list
+        
+        # Props
+        props_list = _extract_props_with_desc(resources_content)
+        data["props"] = [{"name": n, "description": d} for n, d in props_list]
+        
+        # Scenes
+        scenes_map = _extract_scenes_with_desc(resources_content)
+        data["scenes"] = [{"name": k, "description": v} for k, v in scenes_map.items()]
+        
+    else:
+        if manual_only:
+            return []
+
+        if not user_id:
+            project = await session.scalar(select(Project).where(Project.id == project_id))
+            if project:
+                user_id = project.user_id
+        
+        if not user_id:
+            # Should not happen ideally, but as fallback
+            return []
+
+        # Use the centralized prompt from script_prompts.py
+        system_prompt = PROMPT_EXTRACT_RESOURCES
+        
+        # Append JSON format instruction as it might not be in the prompt or we want to enforce it for the code parser
+        # The PROMPT_EXTRACT_RESOURCES tells the LLM to output a structured list (Markdown), 
+        # but here we need JSON for the code to parse it easily?
+        # WAIT. PROMPT_EXTRACT_RESOURCES outputs Markdown list format (Role Name: ...).
+        # But this function expects `data` to be a dict/JSON from `_extract_json_payload`.
+        # The existing code (lines 454-473) asks for JSON.
+        # The `PROMPT_EXTRACT_RESOURCES` (lines 406-463 in script_prompts.py) asks for "Standard Markdown Format".
+        
+        # If I switch to PROMPT_EXTRACT_RESOURCES, the output will be Markdown, not JSON.
+        # And `_extract_json_payload` (line 25) will fail or return None.
+        
+        # However, `extract_assets_from_script` also has logic to parse "manually edited resources" (lines 418-440) 
+        # which parses the Markdown format!
+        
+        # So if the LLM returns Markdown (matching PROMPT_EXTRACT_RESOURCES), 
+        # we can feed that output into the SAME parsing logic as the manual extraction!
+        
+        # Let's verify the parsing logic `_extract_role_descriptions` etc.
+        # They take `body: str`.
+        
+        # So the plan should be:
+        # 1. Use PROMPT_EXTRACT_RESOURCES.
+        # 2. Get the LLM output (Markdown).
+        # 3. Instead of trying `_extract_json_payload`, use the Markdown parsers (`_extract_role_descriptions`, etc.) on the LLM output.
+        
+        try:
+            response = await create_chat_completion(
+                session,
+                user_id,
+                {
+                    "model": "doubao-seed-2-0-pro-260215",  # Explicitly request Doubao 2.0
+                    "messages": [
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": script.content},
+                    ],
+                    "temperature": 0.1,
+                },
+            )
+            content = ""
+            if isinstance(response, dict):
+                 choices = response.get("choices") or []
+                 if choices:
+                     content = choices[0].get("message", {}).get("content", "")
+            
+            # Log the raw content for debugging
+            logger.info(f"LLM Extraction Response (Markdown): {content[:200]}...")
+            
+            # Parse the Markdown output using the same logic as manual extraction
+            # Characters
+            char_map = _extract_role_descriptions(content)
+            data["characters"] = [{"name": k, "description": v} for k, v in char_map.items()]
+            
+            # Looks
+            looks_map = _extract_role_looks(content)
+            looks_list = []
+            for role, items in looks_map.items():
+                for label, val in items:
+                    looks_list.append({"role": role, "look": label, "description": val})
+            data["character_looks"] = looks_list
+            
+            # Props
+            props_list = _extract_props_with_desc(content)
+            data["props"] = [{"name": n, "description": d} for n, d in props_list]
+            
+            # Scenes
+            scenes_map = _extract_scenes_with_desc(content)
+            data["scenes"] = [{"name": k, "description": v} for k, v in scenes_map.items()]
+            
+        except Exception as e:
+            # Fallback or error logging
+            logger.error(f"LLM Extraction Failed: {e}")
+            return []
 
     extracted_characters = data.get("characters", [])
+    if not isinstance(extracted_characters, list):
+        extracted_characters = []
+        
     extracted_looks = data.get("character_looks", [])
+    if not isinstance(extracted_looks, list):
+        extracted_looks = []
+        
     extracted_props = data.get("props", [])
+    if not isinstance(extracted_props, list):
+        extracted_props = []
+        
     extracted_scenes = data.get("scenes", [])
+    if not isinstance(extracted_scenes, list):
+        extracted_scenes = []
 
     assets: list[Asset] = []
     existing = await list_assets(session, project_id)
     existing_map: dict[tuple[str, str], list[Asset]] = {}
     for asset in existing:
         existing_map.setdefault((asset.type, asset.name), []).append(asset)
-    planned_keys = set(existing_map.keys())
+    planned_keys = set()
 
     # Process Characters
+    logger.info(f"Extracted {len(extracted_characters)} characters, {len(extracted_looks)} looks, {len(extracted_props)} props, {len(extracted_scenes)} scenes")
+
     for item in extracted_characters:
+        if not isinstance(item, dict):
+            continue
         name = _normalize_role_name(item.get("name", ""))
+
         desc = item.get("description", "")
         if not name:
             continue
         key = ("CHARACTER", name)
+        
         if key in existing_map:
+            planned_keys.add(key)
             for asset in existing_map[key]:
-                if desc and desc != asset.description:
+                if desc != asset.description:
                     asset.description = desc
         elif key not in planned_keys:
+            planned_keys.add(key)
             assets.append(
                 Asset(
                     project_id=project_id,
@@ -267,10 +580,11 @@ async def extract_assets_from_script(
                     description=desc,
                 )
             )
-            planned_keys.add(key)
 
     # Process Character Looks
     for item in extracted_looks:
+        if not isinstance(item, dict):
+            continue
         role = _normalize_role_name(item.get("role", ""))
         look = item.get("look", "").strip()
         desc = item.get("description", "")
@@ -285,11 +599,14 @@ async def extract_assets_from_script(
         full_desc = desc
         
         key = ("CHARACTER_LOOK", look_name)
+        
         if key in existing_map:
+            planned_keys.add(key)
             for asset in existing_map[key]:
-                if full_desc and full_desc != asset.description:
+                if full_desc != asset.description:
                     asset.description = full_desc
         elif key not in planned_keys:
+            planned_keys.add(key)
             assets.append(
                 Asset(
                     project_id=project_id,
@@ -298,20 +615,24 @@ async def extract_assets_from_script(
                     description=full_desc,
                 )
             )
-            planned_keys.add(key)
 
     # Process Props
     for item in extracted_props:
+        if not isinstance(item, dict):
+            continue
         name = item.get("name", "").strip()
         desc = item.get("description", "")
         if not name:
             continue
         key = ("PROP", name)
+        
         if key in existing_map:
+            planned_keys.add(key)
             for asset in existing_map[key]:
-                if desc and desc != asset.description:
+                if desc != asset.description:
                     asset.description = desc
         elif key not in planned_keys:
+            planned_keys.add(key)
             assets.append(
                 Asset(
                     project_id=project_id,
@@ -320,20 +641,24 @@ async def extract_assets_from_script(
                     description=desc,
                 )
             )
-            planned_keys.add(key)
 
     # Process Scenes
     for item in extracted_scenes:
+        if not isinstance(item, dict):
+            continue
         name = item.get("name", "").strip()
         desc = item.get("description", "")
         if not name:
             continue
         key = ("SCENE", name)
+        
         if key in existing_map:
+            planned_keys.add(key)
             for asset in existing_map[key]:
-                if desc and desc != asset.description:
+                if desc != asset.description:
                     asset.description = desc
         elif key not in planned_keys:
+            planned_keys.add(key)
             assets.append(
                 Asset(
                     project_id=project_id,
@@ -342,7 +667,14 @@ async def extract_assets_from_script(
                     description=desc,
                 )
             )
-            planned_keys.add(key)
+
+    # Delete assets that are no longer in the extraction
+    for key, asset_list in existing_map.items():
+        if key not in planned_keys:
+            for asset in asset_list:
+                # Delete associated versions first to avoid FK constraint issues
+                await session.execute(delete(AssetVersion).where(AssetVersion.asset_id == asset.id))
+                await session.delete(asset)
 
     if assets:
         session.add_all(assets)
@@ -389,3 +721,32 @@ async def delete_asset_version(session: AsyncSession, asset_id: str, version_id:
             item.is_selected = False
         await session.commit()
     return True
+
+
+async def update_asset_config(
+    session: AsyncSession,
+    asset_id: str,
+    prompt: Optional[str] = None,
+    model: Optional[str] = None,
+    size: Optional[str] = None,
+    style: Optional[str] = None,
+) -> Optional[Asset]:
+    stmt = select(Asset).where(Asset.id == asset_id)
+    result = await session.execute(stmt)
+    asset = result.scalar_one_or_none()
+    
+    if not asset:
+        return None
+    
+    if prompt is not None:
+        asset.prompt = prompt
+    if model is not None:
+        asset.model = model
+    if size is not None:
+        asset.size = size
+    if style is not None:
+        asset.style = style
+        
+    await session.commit()
+    await session.refresh(asset)
+    return asset
