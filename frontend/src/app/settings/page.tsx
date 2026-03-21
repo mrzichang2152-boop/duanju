@@ -126,7 +126,7 @@ export default function SettingsPage() {
             onChange={(event) => setApiKey(event.target.value)}
             className="mt-2 w-full rounded-lg border border-slate-200 px-3 py-2 text-sm"
             type="password"
-            placeholder={hasKey ? "已保存（输入可更新）" : "请输入 Key"}
+            placeholder={hasKey ? "已保存（输入可更新）支持 AK|SK / JSON" : "请输入 Key（支持 AK|SK / JSON）"}
           />
         </div>
         <div>
