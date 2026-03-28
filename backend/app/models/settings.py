@@ -14,13 +14,13 @@ class UserSettings(Base):
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
     user_id: Mapped[str] = mapped_column(String(36), unique=True, index=True)
-    endpoint: Mapped[str] = mapped_column(String(255), default="https://openrouter.ai/api/v1")
+    endpoint: Mapped[str] = mapped_column(String(255), default="https://api.wuyinkeji.com")
     api_key_encrypted: Mapped[Optional[str]] = mapped_column(String(2048), nullable=True)
     default_model_text: Mapped[str] = mapped_column(
-        String(128), default="doubao-seed-2-0-pro-260215"
+        String(128), default="gemini-3.1-pro"
     )
     default_model_image: Mapped[str] = mapped_column(
-        String(128), default="google/gemini-3-pro-image-preview"
+        String(128), default="nano-banana-2"
     )
     default_model_video: Mapped[str] = mapped_column(String(128), default="sora2")
     allow_sync: Mapped[bool] = mapped_column(Boolean, default=False)

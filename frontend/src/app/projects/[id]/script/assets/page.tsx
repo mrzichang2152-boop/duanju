@@ -6,19 +6,20 @@ import Image from "next/image";
 import {
   Asset,
   CharacterVoice,
+  deleteAssetVersion,
   generateAsset,
   getAssets,
-  getModels,
   getProjectVoices,
+  getModels,
   getSettings,
   getScript,
-  updateAssetConfig,
-  deleteAssetVersion,
   selectAssetVersion,
+  uploadAssetImage,
+  updateAssetConfig,
 } from "@/lib/api";
+import { extractDrawModels } from "@/lib/models";
 import { getToken } from "@/lib/auth";
 import { VoiceSelector } from "@/app/components/VoiceSelector";
-import { extractModels, filterModels } from "@/lib/models";
 import { applyTemplate } from "@/lib/templates";
 
 const normalizeRoleKey = (name: string) => {
@@ -31,13 +32,143 @@ const normalizeRoleKey = (name: string) => {
   return value;
 };
 
+const getAssetIdentityKey = (asset: Asset) => {
+  const normalizedName = (asset.name || "").replace(/[\s\u3000]+/g, " ").trim();
+  if (asset.type === "CHARACTER") {
+    return `${asset.type}::${normalizedName.replace(/\*/g, "")}`;
+  }
+  if (asset.type === "CHARACTER_LOOK") {
+    return `${asset.type}::${normalizedName.replace(/\s+/g, "")}`;
+  }
+  return `${asset.type}::${normalizedName}`;
+};
+
+/** 刷新/切页后仍显示「生成中」，并在新版本落库后自动清除 */
+const ASSET_GEN_PENDING_STORAGE_KEY = "duanju-asset-gen-pending-v2";
+const MAX_ASSET_GEN_PENDING_AGE_MS = 18 * 60 * 1000;
+
+type PendingAssetGenJob = {
+  /** 合并卡片下所有底层素材 id，用于快照/对账（避免只盯 activeAssetId 漏检新版本） */
+  sourceAssetIds: string[];
+  uiKey: string;
+  versionIdsSnapshot: string[];
+  startedAt: number;
+};
+
+function normalizePendingJob(raw: unknown): PendingAssetGenJob | null {
+  if (!raw || typeof raw !== "object") return null;
+  const j = raw as Record<string, unknown>;
+  const uiKey = typeof j.uiKey === "string" ? j.uiKey : "";
+  if (!uiKey) return null;
+  let sourceAssetIds: string[] = [];
+  if (Array.isArray(j.sourceAssetIds)) {
+    sourceAssetIds = j.sourceAssetIds.filter((x): x is string => typeof x === "string");
+  }
+  if (sourceAssetIds.length === 0 && typeof j.sourceAssetId === "string" && j.sourceAssetId) {
+    sourceAssetIds = [j.sourceAssetId];
+  }
+  const versionIdsSnapshot = Array.isArray(j.versionIdsSnapshot)
+    ? j.versionIdsSnapshot.filter((x): x is string => typeof x === "string")
+    : [];
+  const startedAt = typeof j.startedAt === "number" ? j.startedAt : Date.now();
+  return { uiKey, sourceAssetIds, versionIdsSnapshot, startedAt };
+}
+
+function readPendingAssetGenJobs(projectId: string): PendingAssetGenJob[] {
+  if (typeof window === "undefined") return [];
+  try {
+    const raw = sessionStorage.getItem(ASSET_GEN_PENDING_STORAGE_KEY);
+    if (!raw) return [];
+    const all = JSON.parse(raw) as Record<string, unknown[]>;
+    const list = all[projectId];
+    if (!Array.isArray(list)) return [];
+    return list.map(normalizePendingJob).filter((x): x is PendingAssetGenJob => x !== null);
+  } catch {
+    return [];
+  }
+}
+
+function writePendingAssetGenJobs(projectId: string, jobs: PendingAssetGenJob[]) {
+  if (typeof window === "undefined") return;
+  try {
+    const raw = sessionStorage.getItem(ASSET_GEN_PENDING_STORAGE_KEY);
+    const all: Record<string, PendingAssetGenJob[]> = raw ? JSON.parse(raw) : {};
+    if (jobs.length === 0) {
+      delete all[projectId];
+    } else {
+      all[projectId] = jobs;
+    }
+    sessionStorage.setItem(ASSET_GEN_PENDING_STORAGE_KEY, JSON.stringify(all));
+  } catch {
+    /* ignore quota / private mode */
+  }
+}
+
+function pushPendingAssetGenJob(projectId: string, job: PendingAssetGenJob) {
+  const jobs = readPendingAssetGenJobs(projectId).filter((j) => j.uiKey !== job.uiKey);
+  jobs.push(job);
+  writePendingAssetGenJobs(projectId, jobs);
+}
+
+function removePendingAssetGenJob(projectId: string, uiKey: string) {
+  const jobs = readPendingAssetGenJobs(projectId).filter((j) => j.uiKey !== uiKey);
+  writePendingAssetGenJobs(projectId, jobs);
+}
+
+function reconcilePendingJobs(projectId: string, currentAssets: Asset[]): Set<string> {
+  const jobs = readPendingAssetGenJobs(projectId);
+  const now = Date.now();
+  const kept: PendingAssetGenJob[] = [];
+  const activeUiKeys = new Set<string>();
+  for (const job of jobs) {
+    if (now - job.startedAt > MAX_ASSET_GEN_PENDING_AGE_MS) {
+      continue;
+    }
+    const ids = job.sourceAssetIds.length ? job.sourceAssetIds : [];
+    if (ids.length === 0) {
+      continue;
+    }
+    const raws = ids
+      .map((id) => currentAssets.find((a) => a.id === id))
+      .filter((a): a is Asset => Boolean(a));
+    if (raws.length === 0) {
+      kept.push(job);
+      activeUiKeys.add(job.uiKey);
+      continue;
+    }
+    const hasNew = raws.some((raw) =>
+      raw.versions.some((v) => !job.versionIdsSnapshot.includes(v.id))
+    );
+    if (hasNew) {
+      continue;
+    }
+    kept.push(job);
+    activeUiKeys.add(job.uiKey);
+  }
+  writePendingAssetGenJobs(projectId, kept);
+  return activeUiKeys;
+}
+
+type AggregatedVersion = Asset["versions"][number] & {
+  assetId: string;
+  assetName: string;
+};
+
+type AggregatedAsset = Omit<Asset, "versions"> & {
+  activeAssetId: string;
+  sourceAssetIds: string[];
+  versions: AggregatedVersion[];
+};
+
+const OPENROUTER_IMAGE_MODEL = "nano-banana-2";
+
 export default function AssetsPage() {
+  const MAX_PARALLEL_GENERATIONS = 3;
   const params = useParams<{ id: string }>();
   const router = useRouter();
   const projectId = params.id;
   const scriptCacheKey = projectId ? `script-cache-${projectId}` : "";
   const [status, setStatus] = useState<string | null>(null);
-  const [loading, setLoading] = useState(false);
   const [assets, setAssets] = useState<Asset[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [assetPrompts, setAssetPrompts] = useState<Record<string, string>>({});
@@ -102,26 +233,33 @@ export default function AssetsPage() {
   };
 
   const SUPPORTED_SIZES = [
-    { label: "竖屏 (1792x2304)", value: "1792x2304" },
-    { label: "横屏 (2304x1792)", value: "2304x1792" },
-    { label: "方图 (2048x2048)", value: "2048x2048" },
+    { label: "竖屏 (9:16)", value: "9:16" },
+    { label: "竖构图 (3:4)", value: "3:4" },
+    { label: "方图 (1:1)", value: "1:1" },
+    { label: "横构图 (4:3)", value: "4:3" },
+    { label: "横屏 (16:9)", value: "16:9" },
   ];
 
-  const getAssetDefaultSize = useCallback((type: string) => {
-    // User requested default to landscape for all types (Character, Look, Scene, Prop)
-    return "2304x1792";
+  const getAssetDefaultSize = useCallback(() => {
+    return "16:9";
   }, []);
   const [configLoading, setConfigLoading] = useState(false);
   const [previewImageUrl, setPreviewImageUrl] = useState<string | null>(null);
-  const [generatingAssetId, setGeneratingAssetId] = useState<string | null>(null);
+  const [generatingUiKeys, setGeneratingUiKeys] = useState<Set<string>>(new Set());
   const [scriptContent, setScriptContent] = useState("");
   const [scriptLoading, setScriptLoading] = useState(false);
   const [modifyingImage, setModifyingImage] = useState<{
-    assetId: string;
+    uiKey: string;
+    sourceAssetId: string;
     versionId: string;
     url: string;
   } | null>(null);
   const [modificationPrompt, setModificationPrompt] = useState("");
+  const [uploadingAssetIds, setUploadingAssetIds] = useState<Set<string>>(new Set());
+  const [uploadTarget, setUploadTarget] = useState<{ aggregatedAssetId: string; sourceAssetId: string } | null>(null);
+  const [selectingVersionKey, setSelectingVersionKey] = useState<string | null>(null);
+  const [deletingVersionKey, setDeletingVersionKey] = useState<string | null>(null);
+  const uploadInputRef = useRef<HTMLInputElement | null>(null);
   const defaultTemplate =
     "为{{type_cn}} {{name}} 生成高质量、写实风格的参考图，包含细节描述、风格、光照与色调。{{description}}";
 
@@ -160,7 +298,7 @@ export default function AssetsPage() {
     return description?.trim() || "";
   }, []);
 
-  const loadAssets = useCallback(async () => {
+  const loadAssets = useCallback(async (opts?: { preserveError?: boolean }) => {
     if (!projectId) {
       return;
     }
@@ -169,10 +307,13 @@ export default function AssetsPage() {
       window.location.href = "/login";
       return;
     }
-    setError(null);
+    if (!opts?.preserveError) {
+      setError(null);
+    }
     try {
       const result = await getAssets(token, projectId);
       setAssets(result);
+      setGeneratingUiKeys(reconcilePendingJobs(projectId, result));
       setAssetPrompts((prev) => {
         const next = { ...prev };
         result.forEach((asset) => {
@@ -212,7 +353,7 @@ export default function AssetsPage() {
           if (asset.size) {
             next[asset.id] = asset.size;
           } else if (!next[asset.id]) {
-            next[asset.id] = getAssetDefaultSize(asset.type);
+            next[asset.id] = getAssetDefaultSize();
           }
         });
         return next;
@@ -243,6 +384,15 @@ export default function AssetsPage() {
     void loadAssets();
   }, [loadAssets]);
 
+  useEffect(() => {
+    if (!projectId) return;
+    const timer = window.setInterval(() => {
+      if (readPendingAssetGenJobs(projectId).length === 0) return;
+      void loadAssets({ preserveError: true });
+    }, 3000);
+    return () => window.clearInterval(timer);
+  }, [projectId, loadAssets]);
+
   const loadConfig = useCallback(async () => {
     const token = getToken();
     if (!token) {
@@ -252,14 +402,22 @@ export default function AssetsPage() {
     setConfigLoading(true);
     setError(null);
     try {
-      const [modelsRaw, settings] = await Promise.all([getModels(token), getSettings(token)]);
-      const models = extractModels(modelsRaw);
-      const filtered = filterModels(models, "image");
-      if (!filtered.includes("doubao-seedream-4-5-251128")) {
-        filtered.unshift("doubao-seedream-4-5-251128");
+      await getSettings(token);
+      const modelsRaw = await getModels(token);
+      const drawIds = extractDrawModels(modelsRaw);
+      const merged: string[] = [];
+      const seen = new Set<string>();
+      for (const id of drawIds) {
+        const k = id.toLowerCase();
+        if (seen.has(k)) continue;
+        seen.add(k);
+        merged.push(id);
       }
-      setImageModels(filtered);
-      setDefaultImageModel("doubao-seedream-4-5-251128");
+      if (!seen.has(OPENROUTER_IMAGE_MODEL.toLowerCase())) {
+        merged.push(OPENROUTER_IMAGE_MODEL);
+      }
+      setImageModels(merged.length ? merged : [OPENROUTER_IMAGE_MODEL]);
+      setDefaultImageModel(OPENROUTER_IMAGE_MODEL);
     } catch (err) {
       setError(err instanceof Error ? err.message : "加载失败");
     } finally {
@@ -344,7 +502,7 @@ export default function AssetsPage() {
       });
   }, [projectId]);
 
-  const runGenerate = async (asset: Asset) => {
+  const runGenerate = async (asset: AggregatedAsset) => {
     if (!projectId) {
       return;
     }
@@ -353,19 +511,84 @@ export default function AssetsPage() {
       window.location.href = "/login";
       return;
     }
-    setLoading(true);
+    const uiKey = getAssetIdentityKey(asset);
+    if (generatingUiKeys.has(uiKey)) {
+      return;
+    }
+    if (readPendingAssetGenJobs(projectId).length >= MAX_PARALLEL_GENERATIONS) {
+      setStatus(`最多同时生成 ${MAX_PARALLEL_GENERATIONS} 张，请等待已有任务完成`);
+      return;
+    }
+    const activeAssetId =
+      modifyingImage && modifyingImage.uiKey === uiKey
+        ? modifyingImage.sourceAssetId
+        : asset.activeAssetId;
+    const sourceAssetIds = [...asset.sourceAssetIds];
+    const versionIdsSnapshot = sourceAssetIds.flatMap((id) => {
+      const raw = assets.find((a) => a.id === id);
+      return raw ? raw.versions.map((v) => v.id) : [];
+    });
+
     setError(null);
-    setStatus("生成中...");
-    setGeneratingAssetId(asset.id);
+    setStatus(
+      `生成中（${readPendingAssetGenJobs(projectId).length + 1}/${MAX_PARALLEL_GENERATIONS}）...`
+    );
+    pushPendingAssetGenJob(projectId, {
+      sourceAssetIds,
+      uiKey,
+      versionIdsSnapshot,
+      startedAt: Date.now(),
+    });
+    setGeneratingUiKeys(reconcilePendingJobs(projectId, assets));
+
+    let success = false;
+    let aborted = false;
+    let generatedOk = false;
     try {
-      if (modifyingImage && modifyingImage.assetId === asset.id) {
-        await generateAsset(token, projectId, asset.id, {
+      if (modifyingImage && modifyingImage.uiKey === uiKey) {
+        const rawRefUrl = (modifyingImage.url || "").trim();
+        const isLocalLikeRef =
+          rawRefUrl.startsWith("data:image") ||
+          rawRefUrl.startsWith("/static/") ||
+          ((rawRefUrl.startsWith("http://") || rawRefUrl.startsWith("https://")) &&
+            rawRefUrl.includes("/static/") &&
+            (rawRefUrl.includes("localhost") ||
+              rawRefUrl.includes("127.0.0.1") ||
+              rawRefUrl.includes(":8003")));
+        let refImageUrl = rawRefUrl;
+        if (isLocalLikeRef) {
+          const sourceAsset = assets.find((item) => item.id === modifyingImage.sourceAssetId) ?? asset;
+          const remoteVersion = [...sourceAsset.versions]
+            .reverse()
+            .find((version) => {
+              const versionUrl = (version.image_url || "").trim();
+              if (!(versionUrl.startsWith("http://") || versionUrl.startsWith("https://"))) {
+                return false;
+              }
+              if (
+                versionUrl.includes("/static/") &&
+                (versionUrl.includes("localhost") ||
+                  versionUrl.includes("127.0.0.1") ||
+                  versionUrl.includes(":8003"))
+              ) {
+                return false;
+              }
+              return true;
+            });
+          if (remoteVersion?.image_url) {
+            refImageUrl = remoteVersion.image_url;
+            setStatus("检测到本地参考图，已自动切换到该素材的最新远程版本后继续生成...");
+          }
+          // 否则仍提交当前参考地址，由后端结合 PUBLIC_BASE_URL 解析 /static 与 data 图
+        }
+        await generateAsset(token, projectId, activeAssetId, {
           prompt: modificationPrompt || undefined,
-          model: assetModels[asset.id] || undefined,
-          ref_image_url: modifyingImage.url,
-          style: assetStyles[asset.id] || globalStyle,
+          model: assetModels[activeAssetId] || undefined,
+          ref_image_url: refImageUrl,
+          style: assetStyles[activeAssetId] || globalStyle,
           options: {
-            size: assetSizes[asset.id] || getAssetDefaultSize(asset.type),
+            aspect_ratio: assetSizes[activeAssetId] || getAssetDefaultSize(),
+            size: "4K",
           },
         });
       } else {
@@ -378,91 +601,195 @@ export default function AssetsPage() {
           const selectedCandidate = matchedAssets
             .map((item) => ({
               asset: item,
-              version: item.versions.find((v) => v.is_selected),
+              version: item.versions.find((version) => version.is_selected && Boolean((version.image_url || "").trim())),
             }))
-            .find((item) => item.version);
+            .find((item) => Boolean(item.version));
           if (selectedCandidate?.version) {
             refImageUrl = selectedCandidate.version.image_url;
           } else {
-            setError("请先在对应角色素材中选中参考图，再生成该角色形象");
+            setError("请先在角色素材中选中一张图片，再生成该角色形象");
             setStatus(null);
             return;
           }
         }
 
-        await generateAsset(token, projectId, asset.id, {
-          prompt: assetPrompts[asset.id] || undefined,
-          model: assetModels[asset.id] || undefined,
+        await generateAsset(token, projectId, activeAssetId, {
+          prompt: assetPrompts[activeAssetId] || undefined,
+          model: assetModels[activeAssetId] || undefined,
           ref_image_url: refImageUrl,
-          style: assetStyles[asset.id] || globalStyle,
+          style: assetStyles[activeAssetId] || globalStyle,
           options: {
-            size: assetSizes[asset.id] || getAssetDefaultSize(asset.type),
+            aspect_ratio: assetSizes[activeAssetId] || getAssetDefaultSize(),
+            size: "4K",
           },
         });
       }
+      // HTTP 已成功落库：立刻清 pending，避免「接口成功但刷新列表/对账失败」导致永久「生成中」
+      removePendingAssetGenJob(projectId, uiKey);
+      generatedOk = true;
       await loadAssets();
       setStatus("生成完成");
+      success = true;
     } catch (err) {
-      setError(err instanceof Error ? err.message : "生成失败");
+      const msg = err instanceof Error ? err.message : "生成失败";
+      if (
+        err instanceof Error &&
+        (/请求超时|AbortError|aborted/i.test(msg) || err.name === "AbortError")
+      ) {
+        aborted = true;
+        setStatus(null);
+        setError(
+          "请求等待超时，服务端可能仍在生成；列表将自动刷新，完成后新版本会出现在下方。您也可以手动刷新页面。"
+        );
+      } else if (generatedOk) {
+        success = true;
+        setError("生成已返回，同步列表时出错；下方将自动重试刷新，也可手动刷新页面。");
+      } else {
+        setError(msg);
+        setStatus(null);
+      }
+    } finally {
+      // 超时/失败也必须清 pending，否则 reconcile 会一直把该卡片标成「生成中」
+      removePendingAssetGenJob(projectId, uiKey);
+      void loadAssets({ preserveError: true });
+    }
+  };
+
+  const openUploadPicker = (asset: AggregatedAsset) => {
+    if (uploadingAssetIds.has(asset.id)) {
+      return;
+    }
+    setUploadTarget({ aggregatedAssetId: asset.id, sourceAssetId: asset.activeAssetId });
+    uploadInputRef.current?.click();
+  };
+
+  const handleUploadChange = async (event: React.ChangeEvent<HTMLInputElement>) => {
+    const selectedFile = event.target.files?.[0];
+    event.target.value = "";
+    if (!selectedFile || !uploadTarget || !projectId) {
+      return;
+    }
+    if (!selectedFile.type.startsWith("image/")) {
+      setError("仅支持上传图片文件");
+      return;
+    }
+    const token = getToken();
+    if (!token) {
+      window.location.href = "/login";
+      return;
+    }
+    setError(null);
+    setStatus("上传中...");
+    setUploadingAssetIds((prev) => {
+      const next = new Set(prev);
+      next.add(uploadTarget.aggregatedAssetId);
+      return next;
+    });
+    try {
+      await uploadAssetImage(token, projectId, uploadTarget.sourceAssetId, selectedFile);
+      await loadAssets();
+      setStatus("上传完成");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "上传失败");
       setStatus(null);
     } finally {
-      setLoading(false);
-      setGeneratingAssetId(null);
+      setUploadingAssetIds((prev) => {
+        const next = new Set(prev);
+        next.delete(uploadTarget.aggregatedAssetId);
+        return next;
+      });
+      setUploadTarget(null);
     }
   };
 
-  const runSelect = async (assetId: string, versionId: string) => {
-    if (!projectId) {
-      return;
-    }
+  const handleSelectVersion = async (asset: AggregatedAsset, version: AggregatedVersion) => {
+    if (!projectId || version.is_selected) return;
     const token = getToken();
     if (!token) {
       window.location.href = "/login";
       return;
     }
-    setLoading(true);
+    const actionKey = `${version.assetId}:${version.id}`;
+    setSelectingVersionKey(actionKey);
     setError(null);
     try {
-      await selectAssetVersion(token, projectId, assetId, versionId);
+      await selectAssetVersion(token, projectId, version.assetId, version.id);
       await loadAssets();
+      setStatus(`已选中 ${asset.name} 的版本${asset.versions.findIndex((item) => item.id === version.id) + 1}`);
     } catch (err) {
-      setError(err instanceof Error ? err.message : "选择失败");
+      setError(err instanceof Error ? err.message : "选中版本失败");
     } finally {
-      setLoading(false);
+      setSelectingVersionKey(null);
     }
   };
 
-  const runDeleteVersion = async (assetId: string, versionId: string) => {
-    if (!projectId) {
-      return;
-    }
+  const handleDeleteVersion = async (version: AggregatedVersion) => {
+    if (!projectId) return;
     const token = getToken();
     if (!token) {
       window.location.href = "/login";
       return;
     }
-    if (!window.confirm("确认删除该图片吗？")) {
-      return;
-    }
-    setLoading(true);
+    const actionKey = `${version.assetId}:${version.id}`;
+    setDeletingVersionKey(actionKey);
     setError(null);
     try {
-      await deleteAssetVersion(token, projectId, assetId, versionId);
+      await deleteAssetVersion(token, projectId, version.assetId, version.id);
       await loadAssets();
+      setStatus("删除版本成功");
     } catch (err) {
-      setError(err instanceof Error ? err.message : "删除失败");
+      setError(err instanceof Error ? err.message : "删除版本失败");
     } finally {
-      setLoading(false);
+      setDeletingVersionKey(null);
     }
   };
 
-  const characterAssets = assets.filter((asset) => asset.type === "CHARACTER");
-  const lookAssets = assets.filter((asset) => asset.type === "CHARACTER_LOOK");
-  const otherAssets = assets.filter(
+  const aggregatedAssets = Object.values(
+    assets.reduce<Record<string, AggregatedAsset>>((acc, asset) => {
+      const key = getAssetIdentityKey(asset);
+      if (!acc[key]) {
+        acc[key] = {
+          ...asset,
+          activeAssetId: asset.id,
+          sourceAssetIds: [asset.id],
+          versions: asset.versions.map((version) => ({
+            ...version,
+            assetId: asset.id,
+            assetName: asset.name,
+          })),
+        };
+        return acc;
+      }
+      const current = acc[key];
+      const hasSelected = asset.versions.some((version) => version.is_selected);
+      const currentHasSelected = current.versions.some((version) => version.is_selected);
+      if (hasSelected || !currentHasSelected) {
+        current.activeAssetId = asset.id;
+        current.description = asset.description;
+        current.prompt = asset.prompt;
+        current.model = asset.model;
+        current.size = asset.size;
+        current.style = asset.style;
+      }
+      current.sourceAssetIds.push(asset.id);
+      current.versions.push(
+        ...asset.versions.map((version) => ({
+          ...version,
+          assetId: asset.id,
+          assetName: asset.name,
+        }))
+      );
+      return acc;
+    }, {})
+  );
+
+  const characterAssets = aggregatedAssets.filter((asset) => asset.type === "CHARACTER");
+  const lookAssets = aggregatedAssets.filter((asset) => asset.type === "CHARACTER_LOOK");
+  const otherAssets = aggregatedAssets.filter(
     (asset) => asset.type !== "CHARACTER" && asset.type !== "CHARACTER_LOOK"
   );
 
-  const looksByRole = lookAssets.reduce<Record<string, Asset[]>>((acc, asset) => {
+  const looksByRole = lookAssets.reduce<Record<string, AggregatedAsset[]>>((acc, asset) => {
     const baseName = normalizeRoleKey(asset.name);
     if (!acc[baseName]) {
       acc[baseName] = [];
@@ -471,40 +798,66 @@ export default function AssetsPage() {
     return acc;
   }, {});
 
-  const selectedTemplateByRole = characterAssets.reduce<Record<string, boolean>>(
-    (acc, asset) => {
-      acc[normalizeRoleKey(asset.name)] = asset.versions.some(
-        (version) => version.is_selected
-      );
-      return acc;
-    },
-    {}
-  );
-
-  const renderAssetContent = (asset: Asset, afterPrompt?: ReactNode) => (
+  const renderAssetContent = (asset: AggregatedAsset, afterPrompt?: ReactNode) => {
+    const editableAssetId = asset.activeAssetId;
+    const uiKeyRow = getAssetIdentityKey(asset);
+    return (
     <>
+      {(() => {
+        const isGeneratingCurrent = generatingUiKeys.has(uiKeyRow);
+        const isUploadingCurrent = uploadingAssetIds.has(asset.id);
+        const isConcurrencyFull =
+          generatingUiKeys.size >= MAX_PARALLEL_GENERATIONS && !isGeneratingCurrent;
+        return (
       <div className="flex flex-col gap-2 md:flex-row md:items-center md:justify-between">
         <div className="text-sm font-semibold">
           {asset.name} · {getAssetTypeLabel(asset.type)}
         </div>
         <div className="flex w-full items-center gap-2 md:w-auto">
-          <input
-            value={assetModels[asset.id] ?? ""}
-            onChange={(event) => {
-              const newVal = event.target.value;
-              setAssetModels((prev) => ({ ...prev, [asset.id]: newVal }));
-              triggerAutoSave(asset.id, { model: newVal });
-            }}
-            className="w-full rounded-lg border border-slate-200 px-3 py-2 text-xs md:w-60"
-            placeholder={`模型（可选）默认：${defaultImageModel || "未设置"}`}
-            list="image-models"
-          />
+          {(() => {
+            const resolvedDefault =
+              defaultImageModel || OPENROUTER_IMAGE_MODEL;
+            const raw = (assetModels[editableAssetId] ?? "").trim();
+            const currentModel = raw || resolvedDefault;
+            const selectOptions = [...imageModels];
+            if (
+              currentModel &&
+              !selectOptions.some((m) => m === currentModel)
+            ) {
+              selectOptions.unshift(currentModel);
+            }
+            if (selectOptions.length === 0) {
+              selectOptions.push(resolvedDefault);
+            }
+            return (
+              <select
+                value={currentModel}
+                onChange={(event) => {
+                  const newVal = event.target.value;
+                  setAssetModels((prev) => ({
+                    ...prev,
+                    [editableAssetId]: newVal,
+                  }));
+                  triggerAutoSave(editableAssetId, { model: newVal });
+                }}
+                disabled={configLoading && imageModels.length === 0}
+                className="w-full rounded-lg border border-slate-200 px-3 py-2 text-xs md:w-60"
+                title="绘画模型（由后端映射为 GRSAI 接口 model）"
+              >
+                {selectOptions.map((m) => (
+                  <option key={m} value={m}>
+                    {m}
+                  </option>
+                ))}
+              </select>
+            );
+          })()}
           <select
-            value={assetSizes[asset.id] || getAssetDefaultSize(asset.type)}
+            value={assetSizes[editableAssetId] || getAssetDefaultSize()}
             onChange={(e) => {
               const newVal = e.target.value;
-              setAssetSizes((prev) => ({ ...prev, [asset.id]: newVal }));
-              triggerAutoSave(asset.id, { size: newVal });
+              setAssetSizes((prev) => ({ ...prev, [editableAssetId]: newVal }));
+              triggerAutoSave(editableAssetId, { size: newVal });
             }}
             className="w-full rounded-lg border border-slate-200 px-3 py-2 text-xs md:w-32"
           >
@@ -515,11 +868,11 @@ export default function AssetsPage() {
             ))}
           </select>
           <select
-            value={assetStyles[asset.id] || globalStyle}
+            value={assetStyles[editableAssetId] || globalStyle}
             onChange={(e) => {
               const newVal = e.target.value;
-              setAssetStyles((prev) => ({ ...prev, [asset.id]: newVal }));
-              triggerAutoSave(asset.id, { style: newVal });
+              setAssetStyles((prev) => ({ ...prev, [editableAssetId]: newVal }));
+              triggerAutoSave(editableAssetId, { style: newVal });
             }}
             className="w-full rounded-lg border border-slate-200 px-3 py-2 text-xs md:w-32"
           >
@@ -529,19 +882,30 @@ export default function AssetsPage() {
               </option>
             ))}
           </select>
-          {modifyingImage?.assetId !== asset.id && (
-            <button
-              onClick={() => runGenerate(asset)}
-              disabled={loading || generatingAssetId === asset.id}
-              className="whitespace-nowrap rounded-lg border border-slate-200 px-3 py-2 text-xs"
-            >
-              {generatingAssetId === asset.id ? "生成中..." : "生成版本"}
-            </button>
+          {modifyingImage?.uiKey !== uiKeyRow && (
+            <>
+              <button
+                onClick={() => openUploadPicker(asset)}
+                disabled={isUploadingCurrent}
+                className="whitespace-nowrap rounded-lg border border-slate-200 px-3 py-2 text-xs"
+              >
+                {isUploadingCurrent ? "上传中..." : "上传图片"}
+              </button>
+              <button
+                onClick={() => runGenerate(asset)}
+                disabled={isGeneratingCurrent || isConcurrencyFull}
+                className="whitespace-nowrap rounded-lg border border-slate-200 px-3 py-2 text-xs"
+              >
+                {isGeneratingCurrent ? "生成中..." : "生成素材"}
+              </button>
+            </>
           )}
         </div>
       </div>
+        );
+      })()}
 
-      {modifyingImage?.assetId === asset.id ? (
+      {modifyingImage?.uiKey === uiKeyRow ? (
         <div className="mt-3 rounded-lg border border-indigo-200 bg-indigo-50 p-3">
           <div className="mb-2 flex items-center justify-between text-xs font-medium text-indigo-900">
             <span>AI 辅助修改模式</span>
@@ -561,6 +925,7 @@ export default function AssetsPage() {
                 src={modifyingImage.url}
                 alt="参考图"
                 fill
+                unoptimized
                 className="object-cover"
               />
             </div>
@@ -574,10 +939,14 @@ export default function AssetsPage() {
               />
               <button
                 onClick={() => runGenerate(asset)}
-                disabled={loading || generatingAssetId === asset.id}
+                disabled={
+                  generatingUiKeys.has(uiKeyRow) ||
+                  (generatingUiKeys.size >= MAX_PARALLEL_GENERATIONS &&
+                    !generatingUiKeys.has(uiKeyRow))
+                }
                 className="self-end rounded-lg bg-indigo-600 px-3 py-1.5 text-xs text-white hover:bg-indigo-700 disabled:opacity-50"
               >
-                {generatingAssetId === asset.id ? "修改中..." : "生成修改版"}
+                {generatingUiKeys.has(uiKeyRow) ? "修改中..." : "生成素材"}
               </button>
             </div>
           </div>
@@ -585,11 +954,11 @@ export default function AssetsPage() {
       ) : (
         <div className="mt-3 flex flex-col gap-2 md:flex-row md:items-start">
           <textarea
-            value={assetPrompts[asset.id] ?? ""}
+            value={assetPrompts[editableAssetId] ?? ""}
             onChange={(event) => {
               const newVal = event.target.value;
-              setAssetPrompts((prev) => ({ ...prev, [asset.id]: newVal }));
-              triggerAutoSave(asset.id, { prompt: newVal });
+              setAssetPrompts((prev) => ({ ...prev, [editableAssetId]: newVal }));
+              triggerAutoSave(editableAssetId, { prompt: newVal });
             }}
             className="w-full flex-1 rounded-lg border border-slate-200 px-3 py-2 text-xs"
             placeholder="提示词（可选）"
@@ -601,38 +970,41 @@ export default function AssetsPage() {
       {afterPrompt ? <div className="mt-3">{afterPrompt}</div> : null}
 
       {asset.versions.length === 0 ? (
-        <div className="mt-2 text-xs text-slate-500">暂无版本</div>
+        <div className="mt-2 text-xs text-slate-500">暂无素材，请点击上方“生成素材”</div>
       ) : (
         <div className="mt-3">
           <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-3">
-            {asset.versions.map((version) => (
-              <div
-                key={version.id}
-                className={`rounded-lg border ${
-                  version.is_selected ? "border-slate-900" : "border-slate-200"
-                }`}
-              >
+            {asset.versions.map((version, index) => (
+              <div key={version.id} className="rounded-lg border border-slate-200">
                 <div
                   className="relative cursor-pointer bg-slate-50 p-2"
                   onClick={() => {
-                    runSelect(asset.id, version.id);
                     setPreviewImageUrl(version.image_url);
                   }}
                 >
-                  <button
-                    onClick={(event) => {
-                      event.stopPropagation();
-                      void runDeleteVersion(asset.id, version.id);
-                    }}
-                    className="absolute right-2 top-2 z-10 rounded-md bg-white/90 px-2 py-1 text-xs text-red-500 shadow-sm"
-                  >
-                    删除
-                  </button>
+                  <div className="absolute right-2 top-2 z-10 flex items-center gap-1">
+                    <button
+                      type="button"
+                      onClick={(event) => {
+                        event.stopPropagation();
+                        void handleDeleteVersion(version);
+                      }}
+                      disabled={deletingVersionKey === `${version.assetId}:${version.id}`}
+                      className="rounded bg-white/90 px-2 py-1 text-xs text-rose-700 shadow-sm disabled:opacity-50"
+                    >
+                      {deletingVersionKey === `${version.assetId}:${version.id}` ? "删除中" : "删除"}
+                    </button>
+                  </div>
+                  <div className="absolute left-2 top-2 z-10 rounded bg-black/60 px-2 py-1 text-[11px] text-white">
+                    {`版本${index + 1}`}
+                    {version.is_selected ? " · 已选中" : ""}
+                  </div>
                   <button
                     onClick={(event) => {
                       event.stopPropagation();
                       setModifyingImage({
-                        assetId: asset.id,
+                        uiKey: getAssetIdentityKey(asset),
+                        sourceAssetId: version.assetId,
                         versionId: version.id,
                         url: version.image_url,
                       });
@@ -643,25 +1015,27 @@ export default function AssetsPage() {
                     AI修改
                   </button>
                   <button
+                    type="button"
                     onClick={(event) => {
                       event.stopPropagation();
-                      runSelect(asset.id, version.id);
+                      void handleSelectVersion(asset, version);
                     }}
-                    className="absolute bottom-2 right-2 z-10 rounded-md bg-white/90 px-2 py-1 text-xs text-slate-700 shadow-sm"
+                    disabled={version.is_selected || selectingVersionKey === `${version.assetId}:${version.id}`}
+                    className="absolute bottom-2 right-2 z-10 rounded-md bg-white/90 px-2 py-1 text-xs text-sky-700 shadow-sm disabled:opacity-50"
                   >
-                    选取
+                    {version.is_selected
+                      ? "已选中"
+                      : selectingVersionKey === `${version.assetId}:${version.id}`
+                        ? "选中中"
+                        : "选中"}
                   </button>
-                  {version.is_selected ? (
-                    <div className="absolute bottom-2 right-12 z-10 rounded-full bg-slate-900/90 px-2 py-1 text-[10px] text-white">
-                      已选
-                    </div>
-                  ) : null}
                   <Image
                     src={version.image_url}
-                    alt={`${asset.name}-版本${version.id.slice(0, 4)}`}
+                    alt={`${asset.name}-版本${index + 1}`}
                     width={900}
                     height={1200}
                     sizes="(min-width: 1024px) 33vw, (min-width: 640px) 50vw, 100vw"
+                    unoptimized
                     className="h-auto w-full object-contain"
                   />
                 </div>
@@ -671,9 +1045,10 @@ export default function AssetsPage() {
         </div>
       )}
     </>
-  );
+    );
+  };
 
-  const renderAssetCard = (asset: Asset) => (
+  const renderAssetCard = (asset: AggregatedAsset) => (
     <div key={asset.id} className="rounded-lg border border-slate-200 p-3">
       {renderAssetContent(asset)}
     </div>
@@ -764,7 +1139,7 @@ export default function AssetsPage() {
         {status ? <div className="mt-2 text-blue-600">{status}</div> : null}
         {configLoading ? <div className="mt-1 text-xs text-slate-400">模型加载中...</div> : null}
         {assets.length === 0 ? (
-          <div className="mt-2 text-slate-600">尚未提取素材。</div>
+          <div className="mt-2 text-slate-600">{error ? "素材加载失败，请稍后重试。" : "尚未提取素材。"}</div>
         ) : (
           <div className="mt-4 space-y-4">
             {characterAssets.map((asset) => (
@@ -823,17 +1198,20 @@ export default function AssetsPage() {
               width={1800}
               height={2400}
               sizes="100vw"
+              unoptimized
               className="max-w-full object-contain"
               priority
             />
           </div>
         </div>
       ) : null}
-      <datalist id="image-models">
-        {imageModels.map((model) => (
-          <option key={model} value={model} />
-        ))}
-      </datalist>
+      <input
+        ref={uploadInputRef}
+        type="file"
+        accept="image/*"
+        onChange={handleUploadChange}
+        className="hidden"
+      />
     </div>
   );
 }
