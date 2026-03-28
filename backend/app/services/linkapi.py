@@ -35,9 +35,8 @@ _OPENROUTER_IMAGE_MODEL = "nano-banana-2"
 
 # GRSAI /v1/draw/nano-banana 文档列出的绘画 model 值（用于 /linkapi/models 与前端 datalist）
 _GRSAI_DRAW_MODEL_ENTRIES: tuple[tuple[str, str], ...] = (
-    ("nano-banana-2", "Nano Banana 2"),
+    ("nano-banana-2", "Nano Banana 2（4K 请选 imageSize，勿用 -4k-cl 专线）"),
     ("nano-banana-2-cl", "Nano Banana 2 CL（仅 1K/2K）"),
-    ("nano-banana-2-4k-cl", "Nano Banana 2 4K CL（仅 4K）"),
     ("nano-banana-fast", "Nano Banana Fast"),
     ("nano-banana", "Nano Banana"),
     ("nano-banana-pro", "Nano Banana Pro"),
@@ -636,8 +635,8 @@ def _normalize_grsai_draw_model(raw: Optional[str]) -> str:
     # Step3 前端默认 nanoBanana2
     if s == "nanoBanana2" or lower in {"nanobanana2", "nano-banana2"}:
         return "nano-banana-2"
-    # 统一走 nano-banana-2 + imageSize（含 4K），不向 GRSAI 提交 nano-banana-2-4k-cl（与产品约定一致）
-    if lower in {"nano-banana-2-4k", "nano-banana2-4k", "nano-banana-2-4k-cl"}:
+    # 统一走 nano-banana-2 + imageSize（含 4K）：任意 nano-banana-2-4k* 变体（含 -4k-cl）均不得透传
+    if lower.startswith("nano-banana-2-4k") or lower in {"nano-banana2-4k", "nanobanana2-4k"}:
         return "nano-banana-2"
     # 文档：Gemini 画图类名称应对应 nano-banana-fast 等绘画模型，勿把 chat 模型名传给 draw 接口
     if "gemini" in lower and "image" in lower:
@@ -649,6 +648,15 @@ def _normalize_grsai_draw_model(raw: Optional[str]) -> str:
     if lower.startswith("nano-banana-"):
         return lower
     return _OPENROUTER_IMAGE_MODEL
+
+
+def _outgoing_grsai_draw_model_must_be_nano_banana_2(model: str, payload: dict[str, Any]) -> str:
+    """HTTP 发出前最后一道闸：禁止对 GRSAI 提交 nano-banana-2-4k-cl（产品约定）。"""
+    m = (model or "").strip().lower().replace("_", "-")
+    if m == "nano-banana-2-4k-cl" or m.startswith("nano-banana-2-4k"):
+        payload.setdefault("size", "4K")
+        return "nano-banana-2"
+    return (model or "").strip() or _OPENROUTER_IMAGE_MODEL
 
 
 def _coerce_grsai_draw_image_size(model: str, payload: dict[str, Any]) -> str:
@@ -874,11 +882,8 @@ async def create_image(
     prompt = str(payload.get("prompt") or "").strip() or "生成一张高质量图片"
     ratio = _resolve_image_aspect_ratio(payload) or "auto"
     raw_model_str = str(payload.get("model") or "").strip()
-    raw_lower = raw_model_str.lower().replace("_", "-")
     draw_model = _normalize_grsai_draw_model(raw_model_str or None)
-    # 旧素材/设置里存 nano-banana-2-4k-cl 或别名时，映射为 nano-banana-2 且补全 4K 意图
-    if raw_lower in {"nano-banana-2-4k", "nano-banana2-4k", "nano-banana-2-4k-cl"}:
-        payload.setdefault("size", "4K")
+    draw_model = _outgoing_grsai_draw_model_must_be_nano_banana_2(draw_model, payload)
     image_size = _coerce_grsai_draw_image_size(draw_model, payload)
     request_payload: dict[str, Any] = {
         "model": draw_model,
@@ -893,8 +898,9 @@ async def create_image(
         u0 = str(resolved_references[0] or "").strip()
         ref_preview = (u0[:160] + "…") if len(u0) > 160 else u0
     logger.info(
-        "GRSAI draw 请求 user_id=%s model=%s imageSize=%s aspectRatio=%s ref_count=%d ref_preview=%s",
+        "GRSAI draw 请求 user_id=%s raw_model=%s outgoing_model=%s imageSize=%s aspectRatio=%s ref_count=%d ref_preview=%s",
         user_id,
+        raw_model_str or "(empty)",
         draw_model,
         image_size,
         ratio,
