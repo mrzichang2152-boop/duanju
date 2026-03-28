@@ -25,18 +25,33 @@ const nextConfig: NextConfig = {
         protocol: "https",
         hostname: "p16-flow-image-sg.volces.com",
       },
+      {
+        protocol: "https",
+        hostname: "openpt.wuyinkeji.com",
+      },
+      {
+        protocol: "https",
+        hostname: "**.myqcloud.com",
+      },
+      {
+        protocol: "http",
+        hostname: "**.myqcloud.com",
+      },
     ],
     dangerouslyAllowSVG: true,
   },
   async rewrites() {
+    const backendUrl =
+      process.env.BACKEND_URL ||
+      (process.env.NODE_ENV === "development" ? "http://localhost:8003" : "http://backend:8000");
     return [
       {
         source: "/static/:path*",
-        destination: "http://localhost:8002/static/:path*",
+        destination: `${backendUrl}/static/:path*`,
       },
       {
         source: "/api/:path*",
-        destination: "http://localhost:8002/api/:path*",
+        destination: `${backendUrl}/api/:path*`,
       },
     ];
   },

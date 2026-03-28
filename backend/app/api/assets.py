@@ -1,17 +1,19 @@
 import json
+import mimetypes
 import os
 import logging
 import base64
 import uuid
-from fastapi import APIRouter, Depends, HTTPException, status
-from fastapi.responses import Response, RedirectResponse
+import asyncio
+from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File
+from fastapi.responses import Response, RedirectResponse, FileResponse
 
 logger = logging.getLogger(__name__)
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_current_user_id
-from app.core.db import get_db
+from app.core.db import SessionLocal, get_db
 from app.schemas.assets import AssetGenerateRequest, AssetResponse, AssetSelectRequest, AssetUpdateRequest
 from app.schemas.common import StatusResponse
 from app.services.projects import get_project
@@ -28,10 +30,11 @@ from app.services.assets import (
     download_image_as_local_file,
     update_asset_config,
 )
+from app.services import media_storage
 from app.services.linkapi import create_image, create_image_edit, create_image_with_reference
-from app.services.settings import get_or_create_settings
 
 router = APIRouter()
+OPENROUTER_IMAGE_MODEL = "nano-banana-2"
 
 
 def _get_style_prompts():
@@ -60,6 +63,24 @@ def _extract_role_name_from_look(look_name: str) -> str:
             if left:
                 return left
     return name
+
+
+async def _continue_asset_generation_after_disconnect(
+    project_id: str,
+    asset_id: str,
+    payload_snapshot: dict,
+    user_id: str,
+) -> None:
+    try:
+        payload = AssetGenerateRequest(**payload_snapshot)
+    except Exception:
+        logger.exception("恢复素材生成失败：payload 反序列化异常 asset_id=%s", asset_id)
+        return
+    try:
+        async with SessionLocal() as background_db:
+            await generate_asset(project_id, asset_id, payload, user_id, background_db)
+    except Exception:
+        logger.exception("恢复素材生成失败：后台任务执行异常 asset_id=%s", asset_id)
 
 
 @router.post("/{project_id}/assets/extract", response_model=StatusResponse)
@@ -101,8 +122,40 @@ async def fetch_assets(
     assets = await list_assets(db, project_id)
     
     responses: list[AssetResponse] = []
+    has_version_url_updated = False
     for asset in assets:
         versions = await list_asset_versions(db, asset.id)
+        if len(versions) > 30:
+            selected_version = next((item for item in versions if item.is_selected), None)
+            tail_versions = versions[-30:]
+            if selected_version and all(item.id != selected_version.id for item in tail_versions):
+                versions = [selected_version, *tail_versions[-29:]]
+            else:
+                versions = tail_versions
+        version_payloads: list[dict[str, object]] = []
+        for version in versions:
+            image_url = str(version.image_url or "").strip()
+            if image_url.startswith("data:image"):
+                try:
+                    image_url = await download_image_as_local_file(
+                        image_url, filename_base=f"{asset.id}_{version.id}"
+                    )
+                    if image_url != version.image_url:
+                        version.image_url = image_url
+                        has_version_url_updated = True
+                except Exception as convert_exc:
+                    logger.warning(
+                        f"Failed to convert base64 version image for asset={asset.id}, version={version.id}: {convert_exc}"
+                    )
+                    image_url = ""
+            version_payloads.append(
+                {
+                    "id": version.id,
+                    "image_url": image_url,
+                    "prompt": version.prompt,
+                    "is_selected": version.is_selected,
+                }
+            )
         responses.append(
             AssetResponse(
                 id=asset.id,
@@ -113,18 +166,12 @@ async def fetch_assets(
                 model=asset.model,
                 size=asset.size,
                 style=asset.style,
-                versions=[
-                    {
-                        "id": version.id,
-                        "image_url": version.image_url,
-                        "prompt": version.prompt,
-                        "is_selected": version.is_selected,
-                    }
-                    for version in versions
-                ],
+                versions=version_payloads,
                 created_at=asset.created_at,
             )
         )
+    if has_version_url_updated:
+        await db.commit()
     return responses
 
 
@@ -150,22 +197,28 @@ async def get_asset_image(
     stmt = select(AssetVersion).where(
         AssetVersion.asset_id == asset_id, 
         AssetVersion.is_selected == True
-    ).limit(1)
+    ).order_by(AssetVersion.created_at.desc()).limit(1)
     result = await db.execute(stmt)
     version = result.scalar_one_or_none()
     
-    # 3. If no selected, find latest
-    if not version:
+    selected_image_url = (str(version.image_url).strip() if version and version.image_url else "")
+
+    # 3. If selected has no image, fallback to latest version with image
+    if not version or not selected_image_url:
         stmt = select(AssetVersion).where(
-            AssetVersion.asset_id == asset_id
+            AssetVersion.asset_id == asset_id,
+            AssetVersion.image_url.isnot(None),
+            AssetVersion.image_url != "",
         ).order_by(AssetVersion.created_at.desc()).limit(1)
         result = await db.execute(stmt)
         version = result.scalar_one_or_none()
         
-    if not version or not version.image_url:
+    if not version:
         return Response(content=b"", status_code=404)
-        
-    image_url = version.image_url
+
+    image_url = str(version.image_url or "").strip()
+    if not image_url:
+        return Response(content=b"", status_code=404)
     
     # 4. Handle Base64
     if image_url.startswith("data:image"):
@@ -180,7 +233,18 @@ async def get_asset_image(
             logger.error(f"Failed to decode base64 image for asset {asset_id}: {e}")
             return Response(content=b"", status_code=500)
             
-    # 5. Handle URL (redirect)
+    # 5. Handle local static path
+    if image_url.startswith("/static/"):
+        current_dir = os.path.dirname(os.path.abspath(__file__))
+        static_root = os.path.join(os.path.dirname(os.path.dirname(current_dir)), "static")
+        relative_path = image_url[len("/static/"):]
+        file_path = os.path.join(static_root, relative_path)
+        if not os.path.exists(file_path):
+            return Response(content=b"", status_code=404)
+        media_type = mimetypes.guess_type(file_path)[0] or "application/octet-stream"
+        return FileResponse(file_path, media_type=media_type)
+
+    # 6. Handle URL (redirect)
     return RedirectResponse(url=image_url)
 
 
@@ -238,13 +302,13 @@ async def generate_asset(
     user_id: str = Depends(get_current_user_id),
     db: AsyncSession = Depends(get_db),
 ) -> StatusResponse:
+    payload_snapshot = payload.model_dump() if hasattr(payload, "model_dump") else payload.dict()
     project = await get_project(db, user_id, project_id)
     if not project:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="项目不存在")
     asset = await get_asset(db, asset_id)
     if not asset or asset.project_id != project_id:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="素材不存在")
-    settings = await get_or_create_settings(db, user_id)
     if payload.prompt:
         prompt = payload.prompt
     else:
@@ -252,42 +316,11 @@ async def generate_asset(
         if asset.description:
             prompt = f"{prompt}，{asset.description}"
     
-    # Default model logic
-    model = payload.model or settings.default_model_image
-    
-    # Force Doubao Seedream for image generation if:
-    # 1. No model provided
-    # 2. Known text-only models (gpt, dall-e, gemini, doubao-seed-2-0-pro)
-    # 3. Model doesn't contain "seedream" but contains "doubao" (likely text model)
-    if not model or \
-       "gpt" in model or \
-       "dall-e" in model or \
-       "gemini" in model or \
-       ("doubao" in model and "seedream" not in model):
-         model = "doubao-seedream-4-5-251128"
-         
     request_payload = payload.options.copy() if payload.options else {}
-    request_payload["model"] = model
-    request_payload.setdefault("n", 1)
-    
-    # Default size logic
-    model_key = (model or "").lower()
-    nano_square_only = any(
-        key in model_key
-        for key in [
-            "nanobanana",
-            "gemini-2.5-flash-image-preview",
-        ]
-    )
-    if nano_square_only:
-        default_size = "1024x1024"
-    elif asset.type in {"CHARACTER", "CHARACTER_LOOK", "SCENE", "PROP"}:
-        # User requested Landscape (2304x1792) for all these types
-        default_size = "2304x1792"
-    else:
-        default_size = "2048x2048"
-            
-    request_payload.setdefault("size", default_size)
+    # 透传前端 model，由 linkapi.create_image 映射为 GRSAI draw 文档中的合法 model
+    request_payload["model"] = (payload.model or "").strip() or OPENROUTER_IMAGE_MODEL
+    request_payload.setdefault("size", "4K")
+    request_payload.setdefault("aspect_ratio", "16:9")
     
     # Resolve reference image and construct prompt
     ref_image_url = payload.ref_image_url
@@ -295,6 +328,38 @@ async def generate_asset(
         logger.info(f"Asset Generation with Ref Image: {ref_image_url}")
     else:
         logger.info("Asset Generation: No Ref Image")
+
+    async def _resolve_remote_reference_url(candidate_url: str) -> str:
+        raw = str(candidate_url or "").strip()
+        if not raw:
+            return ""
+        is_local_like = (
+            raw.startswith("data:image")
+            or raw.startswith("/static/")
+            or (
+                raw.startswith(("http://", "https://"))
+                and "/static/" in raw
+                and ("localhost" in raw or "127.0.0.1" in raw or ":8003" in raw)
+            )
+        )
+        if not is_local_like:
+            return raw
+        versions = await list_asset_versions(db, asset.id)
+        selected_remote = ""
+        latest_remote = ""
+        for version in versions:
+            version_url = str(version.image_url or "").strip()
+            if not version_url.startswith(("http://", "https://")):
+                continue
+            if "/static/" in version_url and (
+                "localhost" in version_url or "127.0.0.1" in version_url or ":8003" in version_url
+            ):
+                continue
+            latest_remote = version_url
+            if version.is_selected:
+                selected_remote = version_url
+        # 无历史纯外链版本时仍返回原地址，由 linkapi.create_image 内 _resolve_image_url（PUBLIC_BASE_URL 等）解析
+        return selected_remote or latest_remote or raw
 
     # --- Style resolution ---
     style_prompts = _get_style_prompts()
@@ -369,10 +434,21 @@ async def generate_asset(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=f"未找到角色参考图：{role_name}，请先在对应角色素材中选中参考图",
             )
-        
-        logger.info(f"Found reference image for {role_name}: {ref_image_url}")
 
-        # Construct detailed prompt
+    if ref_image_url:
+        resolved_ref = await _resolve_remote_reference_url(ref_image_url)
+        if not resolved_ref:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="参考图地址无效，请重新选择参考图或上传图片。",
+            )
+        if resolved_ref != ref_image_url:
+            logger.warning(f"Reference image switched to remote URL for edit: {resolved_ref}")
+        ref_image_url = resolved_ref
+        if asset.type == "CHARACTER_LOOK":
+            logger.info(f"Found reference image for {role_name}: {ref_image_url}")
+
+    if asset.type == "CHARACTER_LOOK":
         if not payload.prompt:
             look_desc = asset.description or ""
             parts = [
@@ -384,7 +460,7 @@ async def generate_asset(
             prompt = " ".join(part for part in parts if part)
         else:
             prompt = f"{style_system_prompt}, {payload.prompt}"
-            
+
     # Special handling for CHARACTER prompt suffix
     elif asset.type == "CHARACTER":
         if not payload.prompt:
@@ -422,28 +498,18 @@ async def generate_asset(
 
     request_payload["prompt"] = prompt
 
-    logger.info(f"Generating image with model={model}, size={request_payload.get('size')}, prompt_len={len(prompt)}")
+    logger.info(
+        "Generating image with model=%s, aspect_ratio=%s, prompt_len=%s",
+        request_payload.get("model"),
+        request_payload.get("aspect_ratio"),
+        len(prompt),
+    )
     logger.info(f"Request Payload Keys: {list(request_payload.keys())}")
     
     try:
         if ref_image_url:
-            # If we have a reference image, use Img2Img or ControlNet flow
-            # Ensure we pass the image_url to the payload
             image_payload = request_payload.copy()
             image_payload["image_url"] = ref_image_url
-
-            # Do NOT remove size here.
-            # If size is invalid for image-to-image, the model should complain,
-            # or we should ensure valid sizes. But removing it forces default size.
-            # We trust the user/frontend provided a valid size.
-            
-            # However, if size IS removed, the model might default to something else (e.g. square).
-            # The issue described is "chose portrait (vertical) but got square".
-            # This suggests size was being removed or ignored.
-            
-            # The previous code had: image_payload.pop("size", None)
-            # This line REMOVED the size parameter for image-to-image calls.
-            # This is likely the cause of the size issue.
             
             try:
                 result = await create_image_edit(
@@ -452,17 +518,22 @@ async def generate_asset(
                     ref_image_url,
                     image_payload,
                 )
+            except asyncio.CancelledError:
+                logger.warning("素材生成请求中断，转后台继续：asset_id=%s", asset_id)
+                asyncio.create_task(
+                    _continue_asset_generation_after_disconnect(
+                        project_id,
+                        asset_id,
+                        payload_snapshot,
+                        user_id,
+                    )
+                )
+                raise
             except Exception as edit_exc:
                 logger.error(f"create_image_edit failed: {edit_exc}", exc_info=True)
-                # If editing fails, do NOT fallback to text-to-image for Character Look.
-                # The user expects the reference to be used.
-                # We raise the error directly so the user knows something is wrong with the image or API.
-                raise ValueError(f"AI修改生成失败：{edit_exc}")
+                raise ValueError(f"AI修改生成失败：{edit_exc}") from edit_exc
         else:
-            # Check if it was CHARACTER_LOOK but we failed to find a reference
             if asset.type == "CHARACTER_LOOK":
-                 # Use the detailed prompt but warn/log? 
-                 # Or just proceed as Text-to-Image with the detailed description
                  pass
 
             try:
@@ -471,8 +542,21 @@ async def generate_asset(
                     user_id,
                     request_payload,
                 )
+            except asyncio.CancelledError:
+                logger.warning("素材生成请求中断，转后台继续：asset_id=%s", asset_id)
+                asyncio.create_task(
+                    _continue_asset_generation_after_disconnect(
+                        project_id,
+                        asset_id,
+                        payload_snapshot,
+                        user_id,
+                    )
+                )
+                raise
             except Exception as create_exc:
                 raise create_exc
+    except asyncio.CancelledError:
+        raise
     except Exception as exc:
         detail = str(exc).strip()
         logger.error(f"Asset generation failed: {exc}", exc_info=True)
@@ -482,7 +566,8 @@ async def generate_asset(
             detail=detail if detail else "生成失败",
         ) from exc
     
-    # Process successful result
+    image_url = ""
+
     if isinstance(result, dict):
         if "error" in result:
             error = result["error"]
@@ -499,34 +584,10 @@ async def generate_asset(
                 or "risk" in code_lower
                 or "输入图片包含敏感内容" in msg
             )
-            if ref_image_url and is_sensitive_error:
-                fallback_payload = request_payload.copy()
-                fallback_prompt = prompt
-                if asset.type == "CHARACTER_LOOK":
-                    fallback_prompt = f"{prompt} 保持人物身份一致，保持发型与面部特征一致。"
-                fallback_payload["prompt"] = fallback_prompt[:800]
-                fallback_payload.pop("image", None)
-                fallback_payload.pop("image_url", None)
-                fallback_payload.pop("image_urls", None)
-                try:
-                    logger.warning("Image edit blocked by moderation, fallback to text-to-image generation")
-                    fallback_result = await create_image(
-                        db,
-                        user_id,
-                        fallback_payload,
-                    )
-                    result = fallback_result
-                except Exception as fallback_exc:
-                    logger.error(f"Fallback text-to-image failed: {fallback_exc}", exc_info=True)
-                    raise HTTPException(
-                        status_code=status.HTTP_400_BAD_REQUEST,
-                        detail="参考图触发安全拦截，且兜底生成失败，请稍后重试。",
-                    ) from fallback_exc
-            else:
-                detail_msg = f"生成失败: {msg}" if msg else "生成失败"
-                if is_sensitive_error:
-                    detail_msg = "输入图片包含敏感内容，请更换图片重试。"
-                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=detail_msg)
+            detail_msg = f"生成失败: {msg}" if msg else "生成失败"
+            if is_sensitive_error:
+                detail_msg = "输入图片包含敏感内容，请更换图片重试。"
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=detail_msg)
              
         data = result.get("data") or []
         if data:
@@ -544,9 +605,82 @@ async def generate_asset(
     # Use asset_id + random suffix as filename base to ensure uniqueness and preserve history
     # This satisfies "name by ID" (ID is part of filename) while allowing versioning
     filename_base = f"{asset_id}_{uuid.uuid4().hex[:8]}"
-    local_url = await download_image_as_local_file(image_url, filename_base=filename_base)
-    await create_asset_version(db, asset_id, local_url, prompt)
+    image_url_text = str(image_url or "").strip()
+    version_image_url = image_url_text
+    if image_url_text.startswith(("http://", "https://")):
+        try:
+            await download_image_as_local_file(image_url_text, filename_base=filename_base)
+        except Exception as exc:
+            logger.warning(f"Image download skipped, keep remote URL for version: {exc}")
+    else:
+        try:
+            version_image_url = await download_image_as_local_file(image_url_text, filename_base=filename_base)
+        except Exception as exc:
+            logger.error(f"Image download failed after generation: {exc}", exc_info=True)
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail=f"图片下载失败，请重试: {exc}",
+            ) from exc
+    if media_storage.cos_enabled():
+        if version_image_url.startswith("/static/"):
+            rel = version_image_url.replace("/static/", "", 1).lstrip("/")
+            abs_img = os.path.join(media_storage.backend_static_dir(), rel)
+            version_image_url = await media_storage.publish_local_file_under_static(project_id, abs_img)
+        elif version_image_url.startswith(("http://", "https://")):
+            version_image_url = await media_storage.mirror_http_url_to_cos(
+                project_id, "assets", version_image_url
+            )
+    await create_asset_version(db, asset_id, version_image_url, prompt)
     
+    return StatusResponse(status="ready")
+
+
+@router.post("/{project_id}/assets/{asset_id}/upload", response_model=StatusResponse)
+async def upload_asset_image(
+    project_id: str,
+    asset_id: str,
+    file: UploadFile = File(...),
+    user_id: str = Depends(get_current_user_id),
+    db: AsyncSession = Depends(get_db),
+) -> StatusResponse:
+    project = await get_project(db, user_id, project_id)
+    if not project:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="项目不存在")
+    asset = await get_asset(db, asset_id)
+    if not asset or asset.project_id != project_id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="素材不存在")
+    if not file.content_type or not file.content_type.startswith("image/"):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="仅支持图片文件")
+    raw = await file.read()
+    if not raw:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="上传文件为空")
+    if len(raw) > 15 * 1024 * 1024:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="图片大小不能超过15MB")
+    ext_map = {
+        "image/jpeg": ".jpg",
+        "image/jpg": ".jpg",
+        "image/png": ".png",
+        "image/webp": ".webp",
+        "image/gif": ".gif",
+        "image/bmp": ".bmp",
+    }
+    ext = ext_map.get((file.content_type or "").lower(), "")
+    if not ext and file.filename and "." in file.filename:
+        ext = os.path.splitext(file.filename)[1].lower()
+    if ext not in {".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp"}:
+        ext = ".png"
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    static_dir = os.path.join(os.path.dirname(os.path.dirname(current_dir)), "static", "assets")
+    os.makedirs(static_dir, exist_ok=True)
+    filename = f"{asset_id}_{uuid.uuid4().hex[:8]}{ext}"
+    filepath = os.path.join(static_dir, filename)
+    with open(filepath, "wb") as out:
+        out.write(raw)
+    upload_url = f"/static/assets/{filename}"
+    if media_storage.cos_enabled():
+        upload_url = await media_storage.publish_local_file_under_static(project_id, filepath)
+    await create_asset_version(db, asset_id, upload_url, f"upload:{file.filename or ''}")
+    await file.close()
     return StatusResponse(status="ready")
 
 
@@ -561,7 +695,7 @@ async def select_asset(
     project = await get_project(db, user_id, project_id)
     if not project:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="项目不存在")
-    await select_asset_version(db, asset_id, payload.version_id)
+    await select_asset_version(db, asset_id, payload.version_id, project_id=project_id)
     return StatusResponse(status="ready")
 
 

@@ -976,3 +976,5 @@
 - 2026-03-29 - 后端 - GRSAI 绘画模型与产品约定对齐：`nano-banana-2-4k-cl` / `nano-banana-2-4k` 别名一律映射为 `nano-banana-2`，并在映射时 `payload.setdefault("size","4K")`，实际请求为 `model=nano-banana-2` + `imageSize=4K`，不再向 GRSAI 提交 `nano-banana-2-4k-cl`；`_coerce_grsai_draw_image_size` 中「仅 4K」分支去掉已不使用的 `nano-banana-2-4k-cl`；`segments` 首帧图默认改为 `nano-banana-2` + `size=4K`；`Settings.default_model_image` 默认改为 `nano-banana-2`；`docker compose up -d --build backend` + `/health` 200。
 - 2026-03-29 - 后端 - 强化禁止 `nano-banana-2-4k-cl`：`lower.startswith("nano-banana-2-4k")` 覆盖一切变体（避免未命中 `in {...}` 时落入 `startswith("nano-banana-")` 原样透传）；新增 `_outgoing_grsai_draw_model_must_be_nano_banana_2` 在组 HTTP 体前最后一道改写；日志增加 `raw_model` / `outgoing_model`；`/linkapi/models` 绘画列表移除 `nano-banana-2-4k-cl` 条目以免再次手选。
 
+
+- 2026-03-29 - 规范 - 新增 CodeBuddy 项目规则入口 `.codebuddy/rules/project_rules.md`（always 生效），保留 `.trae/rules/project_rules.md` 不变；同步更新 `RULES.md` 入口与三处规则语义一致约定。

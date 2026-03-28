@@ -6,24 +6,15 @@ import { getProjects, Project } from "@/lib/api";
 import { getToken } from "@/lib/auth";
 
 export default function Home() {
-  const [token, setToken] = useState<string | null>(null);
+  const token = getToken();
   const [projects, setProjects] = useState<Project[]>([]);
-  const [loading, setLoading] = useState(true);
+  const [loading, setLoading] = useState<boolean>(Boolean(token));
   const [error, setError] = useState<string | null>(null);
-
-  useEffect(() => {
-    const t = getToken();
-    setToken(t);
-    if (!t) {
-      setLoading(false);
-    }
-  }, []);
 
   useEffect(() => {
     if (!token) {
       return;
     }
-    setLoading(true);
     getProjects(token)
       .then(setProjects)
       .catch((err) => setError(err instanceof Error ? err.message : "加载失败"))

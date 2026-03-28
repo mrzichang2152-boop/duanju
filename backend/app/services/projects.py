@@ -23,8 +23,4 @@ async def get_project(session: AsyncSession, user_id: str, project_id: str) -> O
     result = await session.execute(
         select(Project).where(Project.id == project_id, Project.user_id == user_id)
     )
-    project = result.scalars().first()
-    if project:
-        return project
-    fallback_result = await session.execute(select(Project).where(Project.id == project_id))
-    return fallback_result.scalars().first()
+    return result.scalars().first()

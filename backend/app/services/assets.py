@@ -3,6 +3,7 @@ import json
 import ast
 import re
 import os
+import base64
 import logging
 import uuid
 import httpx
@@ -11,7 +12,7 @@ import aiofiles
 logger = logging.getLogger(__name__)
 
 from typing import Optional, Union, Any
-from sqlalchemy import select, delete
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from urllib.parse import urlparse
 
@@ -64,15 +65,67 @@ def _has_colon(text: str) -> bool:
     return "：" in text or ":" in text
 
 
+def _normalize_image_model(model: Optional[str]) -> Optional[str]:
+    if model is None:
+        return None
+    text = str(model).strip()
+    if not text:
+        return text
+    lower = text.lower().replace("_", "-")
+    if lower in {"nanobanana2", "nano-banana2", "nanobanana-2"}:
+        return "nano-banana-2"
+    if lower.startswith("nano-banana-2-4k") or lower in {"nano-banana2-4k", "nanobanana2-4k"}:
+        return "nano-banana-2"
+    return text
+
+
 async def download_image_as_local_file(image_url: str, filename_base: Optional[str] = None) -> str:
     """
     Download image from URL and save to local static directory.
     Returns the local relative URL (e.g. /static/assets/xxx.png).
-    If download fails, returns the original URL.
+    If download fails, raises RuntimeError.
     If filename_base is provided, it uses that as the filename (plus extension).
     """
-    if not image_url or not image_url.startswith("http"):
+    if not image_url:
+        raise RuntimeError("图片地址为空")
+
+    # Handle base64 data URI
+    if image_url.startswith("data:image"):
+        try:
+            header, encoded = image_url.split(",", 1)
+        except ValueError as exc:
+            raise RuntimeError("图片数据格式无效") from exc
+        mime = "image/png"
+        if ";" in header and ":" in header:
+            mime = header.split(":", 1)[1].split(";", 1)[0].strip().lower() or mime
+        ext = ".png"
+        if "jpeg" in mime or "jpg" in mime:
+            ext = ".jpg"
+        elif "webp" in mime:
+            ext = ".webp"
+        elif "gif" in mime:
+            ext = ".gif"
+        elif "bmp" in mime:
+            ext = ".bmp"
+        try:
+            image_bytes = base64.b64decode(encoded, validate=False)
+        except Exception as exc:
+            raise RuntimeError("图片数据解码失败") from exc
+        if not image_bytes:
+            raise RuntimeError("图片数据为空")
+        base_dir = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
+        static_dir = os.path.join(base_dir, "static", "assets")
+        os.makedirs(static_dir, exist_ok=True)
+        filename = f"{filename_base}{ext}" if filename_base else f"{uuid.uuid4()}{ext}"
+        filepath = os.path.join(static_dir, filename)
+        async with aiofiles.open(filepath, "wb") as f:
+            await f.write(image_bytes)
+        return f"/static/assets/{filename}"
+
+    if image_url.startswith("/static/"):
         return image_url
+    if not image_url.startswith("http"):
+        raise RuntimeError("图片地址格式不支持")
 
     try:
         # Determine static directory
@@ -84,10 +137,13 @@ async def download_image_as_local_file(image_url: str, filename_base: Optional[s
         async with httpx.AsyncClient(verify=False, trust_env=False, follow_redirects=True) as client:
             resp = await client.get(image_url, timeout=60.0)
             if resp.status_code != 200:
-                print(f"Download failed for {image_url}: {resp.status_code}")
-                return image_url
+                raise RuntimeError(f"下载图片失败，状态码: {resp.status_code}")
             
-            content_type = resp.headers.get("content-type", "")
+            content_type = (resp.headers.get("content-type") or "").lower()
+            if "image/" not in content_type:
+                raise RuntimeError(f"下载结果不是图片: {content_type or 'unknown'}")
+            if not resp.content:
+                raise RuntimeError("下载结果为空")
             ext = ".png"
             if "jpeg" in content_type or "jpg" in content_type:
                 ext = ".jpg"
@@ -106,8 +162,7 @@ async def download_image_as_local_file(image_url: str, filename_base: Optional[s
             
             return f"/static/assets/{filename}"
     except Exception as e:
-        print(f"Error downloading image {image_url}: {e!r}")
-        return image_url
+        raise RuntimeError(f"下载图片失败: {e!r}") from e
 
 
 # Fields to exclude from character descriptions and looks
@@ -385,8 +440,70 @@ def _split_name_desc(value: str) -> tuple[str, str]:
 
 
 async def list_assets(session: AsyncSession, project_id: str) -> list[Asset]:
-    result = await session.execute(select(Asset).where(Asset.project_id == project_id))
+    result = await session.execute(
+        select(Asset).where(Asset.project_id == project_id).order_by(Asset.created_at.asc())
+    )
     return list(result.scalars().all())
+
+
+def _asset_identity_key(asset_type: str, name: str) -> tuple[str, str]:
+    normalized_name = re.sub(r"[\s\u3000]+", " ", (name or "")).strip()
+    if asset_type == "CHARACTER":
+        normalized_name = _normalize_role_name(normalized_name)
+    elif asset_type == "CHARACTER_LOOK":
+        normalized_name = normalized_name.replace(" ", "")
+    return asset_type, normalized_name
+
+
+async def _merge_duplicate_assets(
+    session: AsyncSession, project_id: str, existing_assets: list[Asset]
+) -> list[Asset]:
+    grouped: dict[tuple[str, str], list[Asset]] = {}
+    for asset in existing_assets:
+        grouped.setdefault(_asset_identity_key(asset.type, asset.name), []).append(asset)
+
+    canonical_ids: set[str] = set()
+    changed = False
+    for asset_group in grouped.values():
+        if len(asset_group) <= 1:
+            continue
+        ordered_group = sorted(asset_group, key=lambda item: (item.created_at, item.id))
+        canonical = ordered_group[0]
+        canonical_ids.add(canonical.id)
+        for duplicate in ordered_group[1:]:
+            await session.execute(
+                update(AssetVersion)
+                .where(AssetVersion.asset_id == duplicate.id)
+                .values(asset_id=canonical.id)
+            )
+            if not canonical.description and duplicate.description:
+                canonical.description = duplicate.description
+            if not canonical.prompt and duplicate.prompt:
+                canonical.prompt = duplicate.prompt
+            if not canonical.model and duplicate.model:
+                canonical.model = duplicate.model
+            if not canonical.size and duplicate.size:
+                canonical.size = duplicate.size
+            if not canonical.style and duplicate.style:
+                canonical.style = duplicate.style
+            await session.delete(duplicate)
+            changed = True
+
+    if not changed:
+        return existing_assets
+
+    await session.commit()
+
+    for canonical_id in canonical_ids:
+        versions = await list_asset_versions(session, canonical_id)
+        selected_versions = [item for item in versions if item.is_selected]
+        if len(selected_versions) <= 1:
+            continue
+        keep_selected = selected_versions[-1]
+        for item in selected_versions:
+            item.is_selected = item.id == keep_selected.id
+    await session.commit()
+    return await list_assets(session, project_id)
 
 
 async def list_asset_versions(session: AsyncSession, asset_id: str) -> list[AssetVersion]:
@@ -486,7 +603,7 @@ async def extract_assets_from_script(
                 session,
                 user_id,
                 {
-                    "model": "doubao-seed-2-0-pro-260215",  # Explicitly request Doubao 2.0
+                    "model": "gemini-3.1-pro",
                     "messages": [
                         {"role": "system", "content": system_prompt},
                         {"role": "user", "content": script.content},
@@ -549,7 +666,7 @@ async def extract_assets_from_script(
     existing = await list_assets(session, project_id)
     existing_map: dict[tuple[str, str], list[Asset]] = {}
     for asset in existing:
-        existing_map.setdefault((asset.type, asset.name), []).append(asset)
+        existing_map.setdefault(_asset_identity_key(asset.type, asset.name), []).append(asset)
     planned_keys = set()
 
     # Process Characters
@@ -563,15 +680,27 @@ async def extract_assets_from_script(
         desc = item.get("description", "")
         if not name:
             continue
-        key = ("CHARACTER", name)
+        key = _asset_identity_key("CHARACTER", name)
         
+        if key in planned_keys:
+            continue
+        planned_keys.add(key)
         if key in existing_map:
-            planned_keys.add(key)
-            for asset in existing_map[key]:
-                if desc != asset.description:
-                    asset.description = desc
-        elif key not in planned_keys:
-            planned_keys.add(key)
+            latest_asset = sorted(existing_map[key], key=lambda item: (item.created_at, item.id))[-1]
+            latest_desc = (latest_asset.description or "").strip()
+            incoming_desc = (desc or "").strip()
+            if incoming_desc and incoming_desc != latest_desc:
+                assets.append(
+                    Asset(
+                        project_id=project_id,
+                        type="CHARACTER",
+                        name=name,
+                        description=desc,
+                    )
+                )
+            elif incoming_desc and not latest_desc:
+                latest_asset.description = desc
+        else:
             assets.append(
                 Asset(
                     project_id=project_id,
@@ -598,15 +727,27 @@ async def extract_assets_from_script(
         # Combine descriptions if needed, but LLM usually gives full description
         full_desc = desc
         
-        key = ("CHARACTER_LOOK", look_name)
+        key = _asset_identity_key("CHARACTER_LOOK", look_name)
         
+        if key in planned_keys:
+            continue
+        planned_keys.add(key)
         if key in existing_map:
-            planned_keys.add(key)
-            for asset in existing_map[key]:
-                if full_desc != asset.description:
-                    asset.description = full_desc
-        elif key not in planned_keys:
-            planned_keys.add(key)
+            latest_asset = sorted(existing_map[key], key=lambda item: (item.created_at, item.id))[-1]
+            latest_desc = (latest_asset.description or "").strip()
+            incoming_desc = (full_desc or "").strip()
+            if incoming_desc and incoming_desc != latest_desc:
+                assets.append(
+                    Asset(
+                        project_id=project_id,
+                        type="CHARACTER_LOOK",
+                        name=look_name,
+                        description=full_desc,
+                    )
+                )
+            elif incoming_desc and not latest_desc:
+                latest_asset.description = full_desc
+        else:
             assets.append(
                 Asset(
                     project_id=project_id,
@@ -624,15 +765,27 @@ async def extract_assets_from_script(
         desc = item.get("description", "")
         if not name:
             continue
-        key = ("PROP", name)
+        key = _asset_identity_key("PROP", name)
         
+        if key in planned_keys:
+            continue
+        planned_keys.add(key)
         if key in existing_map:
-            planned_keys.add(key)
-            for asset in existing_map[key]:
-                if desc != asset.description:
-                    asset.description = desc
-        elif key not in planned_keys:
-            planned_keys.add(key)
+            latest_asset = sorted(existing_map[key], key=lambda item: (item.created_at, item.id))[-1]
+            latest_desc = (latest_asset.description or "").strip()
+            incoming_desc = (desc or "").strip()
+            if incoming_desc and incoming_desc != latest_desc:
+                assets.append(
+                    Asset(
+                        project_id=project_id,
+                        type="PROP",
+                        name=name,
+                        description=desc,
+                    )
+                )
+            elif incoming_desc and not latest_desc:
+                latest_asset.description = desc
+        else:
             assets.append(
                 Asset(
                     project_id=project_id,
@@ -650,15 +803,27 @@ async def extract_assets_from_script(
         desc = item.get("description", "")
         if not name:
             continue
-        key = ("SCENE", name)
+        key = _asset_identity_key("SCENE", name)
         
+        if key in planned_keys:
+            continue
+        planned_keys.add(key)
         if key in existing_map:
-            planned_keys.add(key)
-            for asset in existing_map[key]:
-                if desc != asset.description:
-                    asset.description = desc
-        elif key not in planned_keys:
-            planned_keys.add(key)
+            latest_asset = sorted(existing_map[key], key=lambda item: (item.created_at, item.id))[-1]
+            latest_desc = (latest_asset.description or "").strip()
+            incoming_desc = (desc or "").strip()
+            if incoming_desc and incoming_desc != latest_desc:
+                assets.append(
+                    Asset(
+                        project_id=project_id,
+                        type="SCENE",
+                        name=name,
+                        description=desc,
+                    )
+                )
+            elif incoming_desc and not latest_desc:
+                latest_asset.description = desc
+        else:
             assets.append(
                 Asset(
                     project_id=project_id,
@@ -667,14 +832,6 @@ async def extract_assets_from_script(
                     description=desc,
                 )
             )
-
-    # Delete assets that are no longer in the extraction
-    for key, asset_list in existing_map.items():
-        if key not in planned_keys:
-            for asset in asset_list:
-                # Delete associated versions first to avoid FK constraint issues
-                await session.execute(delete(AssetVersion).where(AssetVersion.asset_id == asset.id))
-                await session.delete(asset)
 
     if assets:
         session.add_all(assets)
@@ -691,11 +848,28 @@ async def create_asset_version(
     session.add(version)
     await session.commit()
     await session.refresh(version)
+    await select_asset_version(session, asset_id, version.id)
+    await session.refresh(version)
     return version
 
 
-async def select_asset_version(session: AsyncSession, asset_id: str, version_id: str) -> None:
-    result = await session.execute(select(AssetVersion).where(AssetVersion.asset_id == asset_id))
+async def select_asset_version(
+    session: AsyncSession, asset_id: str, version_id: str, project_id: Optional[str] = None
+) -> None:
+    asset = await get_asset(session, asset_id)
+    if not asset:
+        return
+    target_project_id = project_id or asset.project_id
+    same_key = _asset_identity_key(asset.type, asset.name)
+    project_assets = await list_assets(session, target_project_id)
+    same_key_asset_ids = [
+        item.id for item in project_assets if _asset_identity_key(item.type, item.name) == same_key
+    ]
+    if not same_key_asset_ids:
+        same_key_asset_ids = [asset_id]
+    result = await session.execute(
+        select(AssetVersion).where(AssetVersion.asset_id.in_(same_key_asset_ids))
+    )
     versions = list(result.scalars().all())
     for version in versions:
         version.is_selected = version.id == version_id
@@ -741,7 +915,7 @@ async def update_asset_config(
     if prompt is not None:
         asset.prompt = prompt
     if model is not None:
-        asset.model = model
+        asset.model = _normalize_image_model(model) or "nano-banana-2"
     if size is not None:
         asset.size = size
     if style is not None:

@@ -5,7 +5,9 @@ type ApiErrorDetailItem = {
 };
 
 export type ApiError = {
-  detail?: string | ApiErrorDetailItem[];
+  detail?: string | ApiErrorDetailItem[] | Record<string, unknown>;
+  message?: string;
+  error?: string | Record<string, unknown>;
 };
 
 const formatApiErrorDetail = (detail: ApiError["detail"]) => {
@@ -23,13 +25,109 @@ const formatApiErrorDetail = (detail: ApiError["detail"]) => {
       return messages.join("；");
     }
   }
+  if (typeof detail === "object") {
+    const detailObject = detail as Record<string, unknown>;
+    const directMessage = detailObject.message;
+    if (typeof directMessage === "string" && directMessage.trim()) {
+      return directMessage.trim();
+    }
+    const nestedError = detailObject.error;
+    if (typeof nestedError === "string" && nestedError.trim()) {
+      return nestedError.trim();
+    }
+    if (nestedError && typeof nestedError === "object") {
+      const nestedMessage = (nestedError as Record<string, unknown>).message;
+      if (typeof nestedMessage === "string" && nestedMessage.trim()) {
+        return nestedMessage.trim();
+      }
+    }
+    try {
+      return JSON.stringify(detailObject, ensureASCIIReplacer);
+    } catch {
+      return String(detailObject);
+    }
+  }
   return null;
 };
 
-const baseUrl = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://localhost:8002/api";
+const ensureASCIIReplacer = (_key: string, value: unknown) => {
+  if (typeof value === "bigint") {
+    return value.toString();
+  }
+  return value;
+};
+
+const parseApiErrorMessage = (bodyText: string, statusCode: number, fallback: string) => {
+  const trimmed = bodyText.trim();
+  if (!trimmed) {
+    return `${fallback}（${statusCode}）`;
+  }
+  try {
+    const parsed = JSON.parse(trimmed) as ApiError;
+    const detailText = formatApiErrorDetail(parsed.detail);
+    if (detailText) {
+      return detailText;
+    }
+    if (typeof parsed.message === "string" && parsed.message.trim()) {
+      return parsed.message.trim();
+    }
+    if (typeof parsed.error === "string" && parsed.error.trim()) {
+      return parsed.error.trim();
+    }
+    if (parsed.error && typeof parsed.error === "object") {
+      const nestedMessage = (parsed.error as Record<string, unknown>).message;
+      if (typeof nestedMessage === "string" && nestedMessage.trim()) {
+        return nestedMessage.trim();
+      }
+      return JSON.stringify(parsed.error, ensureASCIIReplacer);
+    }
+    return `${fallback}（${statusCode}）: ${trimmed}`;
+  } catch {
+    return `${fallback}（${statusCode}）: ${trimmed}`;
+  }
+};
+
+const resolveApiBaseUrl = () => {
+  const raw = (process.env.NEXT_PUBLIC_API_BASE_URL ?? "/api").trim();
+  if (!raw) {
+    return "/api";
+  }
+  if (typeof window === "undefined") {
+    return raw;
+  }
+  if (raw === "/api") {
+    const hostname = window.location.hostname;
+    const isLocalHost = hostname === "localhost" || hostname === "127.0.0.1";
+    const isFrontendPort = window.location.port === "3001" || window.location.port === "3000";
+    if (isLocalHost && isFrontendPort) {
+      return `http://${hostname}:8003/api`;
+    }
+  }
+  if (raw.startsWith("/")) {
+    return raw;
+  }
+  try {
+    const parsed = new URL(raw);
+    const isLocalHost = parsed.hostname === "localhost" || parsed.hostname === "127.0.0.1";
+    const isCrossOrigin = parsed.origin !== window.location.origin;
+    if (isLocalHost && isCrossOrigin) {
+      return "/api";
+    }
+    return raw;
+  } catch {
+    return raw;
+  }
+};
+
+const baseUrl = resolveApiBaseUrl();
 const normalizeToken = (token?: string | null) => (token ?? "").trim();
 const REQUEST_TIMEOUT_MS = 15000;
-const ASSET_GENERATE_TIMEOUT_MS = 180000;
+// 略大于后端 GRSAI_POLL_MAX_WALL_SECONDS（默认 600s），避免前端先断而后台仍在跑
+const ASSET_GENERATE_TIMEOUT_MS = 660000;
+// 图生图与文生图耗时相近（GRSAI 约 1~3 分钟），统一用 3 分钟超时
+const ASSET_GENERATE_I2I_TIMEOUT_MS = 180000;
+const VIDEO_GENERATE_TIMEOUT_MS = 420000;
+const FRAME_GENERATE_TIMEOUT_MS = 900000;
 
 const request = async <T>(
   path: string,
@@ -69,16 +167,7 @@ const request = async <T>(
   }
   if (response.status === 401) {
     const bodyText = await response.text();
-    let detail: ApiError["detail"];
-    if (bodyText) {
-      try {
-        const parsed = JSON.parse(bodyText) as ApiError;
-        detail = parsed.detail;
-      } catch {
-        detail = bodyText;
-      }
-    }
-    const authMessage = formatApiErrorDetail(detail) ?? "登录状态校验失败，请重试";
+    const authMessage = parseApiErrorMessage(bodyText, response.status, "登录状态校验失败，请重试");
     const lower = authMessage.toLowerCase();
     const shouldForceLogout =
       normalizedToken.length > 0 &&
@@ -95,16 +184,7 @@ const request = async <T>(
   }
   if (!response.ok) {
     const bodyText = await response.text();
-    let detail: ApiError["detail"];
-    if (bodyText) {
-      try {
-        const parsed = JSON.parse(bodyText) as ApiError;
-        detail = parsed.detail;
-      } catch {
-        detail = bodyText;
-      }
-    }
-    throw new Error(formatApiErrorDetail(detail) ?? "请求失败");
+    throw new Error(parseApiErrorMessage(bodyText, response.status, "请求失败"));
   }
   if (response.status === 204) {
     return null as T;
@@ -203,8 +283,13 @@ export interface Episode {
   thinking: string;
   userInput: string;
   storyboard?: string;
+  storyboardTaskId?: string;
+  storyboardTaskStatus?: "running" | "completed" | "failed";
+  storyboardTaskError?: string;
+  dialogueCellAudioMap?: Record<string, Array<{ text: string; audioUrl: string }>>;
   isThinkingCollapsed?: boolean;
 }
+export type ScriptEpisodePayload = Episode | Record<string, unknown>;
 
 export type ScriptResponse = {
   id?: string;
@@ -222,7 +307,7 @@ export type ScriptResponse = {
 export const getScript = (token: string, id: string) =>
   request<ScriptResponse>(`/projects/${id}/script`, {}, token);
 
-export const saveScript = (token: string, id: string, content?: string, thinking?: string, storyboard?: string, outline?: string, episodes?: Episode[]) =>
+export const saveScript = (token: string, id: string, content?: string, thinking?: string, storyboard?: string, outline?: string, episodes?: ScriptEpisodePayload[]) =>
   request<ScriptResponse>(
     `/projects/${id}/script`,
     {
@@ -265,6 +350,24 @@ export type ScriptGenerateResponse = {
   thinking?: string;
 };
 
+export type StoryboardTaskStartPayload = {
+  episode_index: number;
+  episode_title: string;
+  episode_content: string;
+  model?: string;
+  instruction?: string;
+};
+
+export type StoryboardTaskStatusResponse = {
+  task_id: string;
+  project_id: string;
+  episode_index: number;
+  episode_title: string;
+  status: "running" | "completed" | "failed";
+  content?: string | null;
+  error?: string | null;
+};
+
 type ScriptStreamDelta = {
   content?: string;
   reasoning_content?: string;
@@ -277,31 +380,56 @@ type ScriptStreamChunk = {
   error?: string;
 };
 
-export const generateScript = (token: string, id: string, payload: ScriptGeneratePayload): Promise<ScriptGenerateResponse> => {
-  return new Promise((resolve, reject) => {
-    let content = "";
-    let thinking = "";
-    generateScriptStream(token, id, payload, (chunk: ScriptStreamChunk) => {
-      if (chunk.choices?.[0]?.delta?.content) {
-        content += chunk.choices[0].delta.content;
-      }
-      if (chunk.choices?.[0]?.delta?.reasoning_content) {
-        thinking += chunk.choices[0].delta.reasoning_content;
-      }
-    })
-      .then(() => resolve({ content, thinking }))
-      .catch(reject);
+export const generateScript = async (
+  token: string,
+  id: string,
+  payload: ScriptGeneratePayload
+): Promise<ScriptGenerateResponse> => {
+  let content = "";
+  let thinking = "";
+  await generateScriptStream(token, id, payload, (chunk: ScriptStreamChunk) => {
+    if (chunk.choices?.[0]?.delta?.content) {
+      content += chunk.choices[0].delta.content;
+    }
+    if (chunk.choices?.[0]?.delta?.reasoning_content) {
+      thinking += chunk.choices[0].delta.reasoning_content;
+    }
   });
+  const normalizedContent = content.trim();
+  if (!normalizedContent) {
+    throw new Error("模型未返回可用内容，请检查模型权限或稍后重试");
+  }
+  return { content: normalizedContent, thinking };
 };
+
+export const startStoryboardTask = (
+  token: string,
+  id: string,
+  payload: StoryboardTaskStartPayload
+) =>
+  request<StoryboardTaskStatusResponse>(
+    `/projects/${id}/script/storyboard-tasks/start`,
+    {
+      method: "POST",
+      body: JSON.stringify(payload),
+    },
+    token
+  );
+
+export const getStoryboardTaskStatus = (token: string, id: string, taskId: string) =>
+  request<StoryboardTaskStatusResponse>(
+    `/projects/${id}/script/storyboard-tasks/${taskId}`,
+    {},
+    token
+  );
 
 export const generateScriptStream = async (
   token: string,
   id: string,
   payload: ScriptGeneratePayload,
-  onChunk: (chunk: any) => void,
+  onChunk: (chunk: ScriptStreamChunk) => void,
   signal?: AbortSignal
 ) => {
-  const baseUrl = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://localhost:8002/api";
   const response = await fetch(`${baseUrl}/projects/${id}/script/generate`, {
     method: "POST",
     headers: {
@@ -440,17 +568,47 @@ export const generateAsset = (
   token: string,
   projectId: string,
   assetId: string,
-  payload: { prompt?: string; model?: string; ref_image_url?: string; style?: string; options?: Record<string, any> }
-) =>
-  request<{ status: string }>(
+  payload: { prompt?: string; model?: string; ref_image_url?: string; style?: string; options?: Record<string, unknown> }
+) => {
+  const hasRef = Boolean((payload.ref_image_url || "").trim());
+  return request<{ status: string }>(
     `/projects/${projectId}/assets/${assetId}/generate`,
     {
       method: "POST",
       body: JSON.stringify(payload),
     },
     token,
-    ASSET_GENERATE_TIMEOUT_MS
+    hasRef ? ASSET_GENERATE_I2I_TIMEOUT_MS : ASSET_GENERATE_TIMEOUT_MS
   );
+};
+
+export const uploadAssetImage = async (
+  token: string,
+  projectId: string,
+  assetId: string,
+  file: File
+) => {
+  const normalizedToken = normalizeToken(token);
+  const formData = new FormData();
+  formData.append("file", file);
+  const response = await fetch(`${baseUrl}/projects/${projectId}/assets/${assetId}/upload`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${normalizedToken}`,
+    },
+    body: formData,
+  });
+  if (response.status === 401) {
+    const bodyText = await response.text();
+    const authMessage = parseApiErrorMessage(bodyText, response.status, "登录状态校验失败，请重试");
+    throw new Error(authMessage);
+  }
+  if (!response.ok) {
+    const bodyText = await response.text();
+    throw new Error(parseApiErrorMessage(bodyText, response.status, "上传失败"));
+  }
+  return response.json() as Promise<{ status: string }>;
+};
 
 export const selectAssetVersion = (token: string, projectId: string, assetId: string, versionId: string) =>
   request<{ status: string }>(
@@ -462,9 +620,9 @@ export const selectAssetVersion = (token: string, projectId: string, assetId: st
     token
   );
 
-// Voice & Fish Audio API
+// Voice & ElevenLabs API
 
-export type FishAudioModel = {
+export type ElevenLabsVoiceModel = {
   _id: string;
   title: string;
   description?: string;
@@ -473,36 +631,89 @@ export type FishAudioModel = {
   preview_audio?: string;
   tags?: string[];
   languages?: string[];
+  labels?: Record<string, string>;
+  category?: string;
   samples?: Array<{ audio?: string; text?: string; title?: string }>;
 };
 
-export const getFishAudioModels = (
+export type ElevenLabsVoiceFacets = {
+  languages: string[];
+  accents: string[];
+  genders: string[];
+  ages: string[];
+  qualities: string[];
+};
+
+export type ElevenLabsModel = {
+  model_id: string;
+  name: string;
+  description?: string;
+  can_do_text_to_speech: boolean;
+  can_do_voice_conversion: boolean;
+  languages?: Array<Record<string, unknown>>;
+};
+
+export const getElevenLabsVoices = (
   token: string,
-  params?: { page?: number; size?: number; language?: string; query?: string }
+  params?: {
+    page?: number;
+    size?: number;
+    language?: string;
+    query?: string;
+    accent?: string;
+    gender?: string;
+    age?: string;
+    quality?: string;
+    includeLibrary?: boolean;
+  }
 ) =>
-  request<{ items: FishAudioModel[]; total: number }>(
-    `/fish-audio/models?page=${params?.page ?? 1}&size=${params?.size ?? 100}${
+  request<{ items: ElevenLabsVoiceModel[]; total: number; facets?: ElevenLabsVoiceFacets; has_more?: boolean }>(
+    `/eleven-labs/voices?page=${params?.page ?? 1}&size=${params?.size ?? 100}${
       params?.language ? `&language=${encodeURIComponent(params.language)}` : ""
-    }${params?.query ? `&query=${encodeURIComponent(params.query)}` : ""}`,
+    }${params?.query ? `&query=${encodeURIComponent(params.query)}` : ""}${
+      params?.accent ? `&accent=${encodeURIComponent(params.accent)}` : ""
+    }${params?.gender ? `&gender=${encodeURIComponent(params.gender)}` : ""}${
+      params?.age ? `&age=${encodeURIComponent(params.age)}` : ""
+    }${params?.quality ? `&quality=${encodeURIComponent(params.quality)}` : ""}${
+      typeof params?.includeLibrary === "boolean" ? `&include_library=${params.includeLibrary ? "true" : "false"}` : ""
+    }`,
     {},
     token,
     45000
   );
 
-export const generateFishAudioPreview = async (
+export const getElevenLabsModels = (
   token: string,
-  payload: { text: string; reference_id: string; format?: "mp3" | "wav" }
+  params?: { canDoVoiceConversion?: boolean }
+) =>
+  request<{ items: ElevenLabsModel[]; total: number }>(
+    `/eleven-labs/models${
+      typeof params?.canDoVoiceConversion === "boolean"
+        ? `?can_do_voice_conversion=${params.canDoVoiceConversion ? "true" : "false"}`
+        : ""
+    }`,
+    {},
+    token,
+    45000
+  );
+
+export const generateElevenLabsPreview = async (
+  token: string,
+  payload: { text: string; voice_id: string; output_format?: string; settings?: Record<string, unknown> }
 ) => {
   const normalizedToken = normalizeToken(token);
   const formData = new FormData();
   formData.append("text", payload.text);
-  formData.append("reference_id", payload.reference_id);
-  formData.append("format", payload.format ?? "mp3");
+  formData.append("voice_id", payload.voice_id);
+  formData.append("output_format", payload.output_format ?? "mp3_44100_128");
+  if (payload.settings) {
+    formData.append("settings_json", JSON.stringify(payload.settings));
+  }
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), 45000);
   let response: Response;
   try {
-    response = await fetch(`${baseUrl}/fish-audio/tts`, {
+    response = await fetch(`${baseUrl}/eleven-labs/tts`, {
       method: "POST",
       headers: {
         Authorization: `Bearer ${normalizedToken}`,
@@ -512,7 +723,7 @@ export const generateFishAudioPreview = async (
     });
   } catch (err) {
     if (err instanceof DOMException && err.name === "AbortError") {
-      throw new Error("音色试听生成超时，请稍后重试");
+      throw new Error("ElevenLabs 试听生成超时，请稍后重试");
     }
     throw err;
   } finally {
@@ -530,19 +741,19 @@ export const generateFishAudioPreview = async (
         detail = bodyText;
       }
     }
-    throw new Error(formatApiErrorDetail(detail) ?? "音色试听生成失败");
+    throw new Error(formatApiErrorDetail(detail) ?? "ElevenLabs 试听生成失败");
   }
 
   return response.blob();
 };
 
-export const cloneVoice = async (token: string, file: File, title: string) => {
+export const cloneElevenLabsVoice = async (token: string, file: File, title: string) => {
   const normalizedToken = normalizeToken(token);
   const formData = new FormData();
   formData.append("title", title);
   formData.append("file", file);
 
-  const response = await fetch(`${baseUrl}/fish-audio/clone`, {
+  const response = await fetch(`${baseUrl}/eleven-labs/clone`, {
     method: "POST",
     headers: {
       Authorization: `Bearer ${normalizedToken}`,
@@ -561,11 +772,24 @@ export const cloneVoice = async (token: string, file: File, title: string) => {
         detail = bodyText;
       }
     }
-    throw new Error(formatApiErrorDetail(detail) ?? "Voice cloning failed");
+    throw new Error(formatApiErrorDetail(detail) ?? "ElevenLabs 音色克隆失败");
   }
 
   return response.json() as Promise<{ _id?: string; model_id?: string; title?: string; cover_image?: string }>;
 };
+
+export const getFishAudioModels = getElevenLabsVoices;
+export type FishAudioModel = ElevenLabsVoiceModel;
+export const generateFishAudioPreview = (
+  token: string,
+  payload: { text: string; reference_id: string; format?: "mp3" | "wav" }
+) =>
+  generateElevenLabsPreview(token, {
+    text: payload.text,
+    voice_id: payload.reference_id,
+    output_format: payload.format === "wav" ? "pcm_44100" : "mp3_44100_128",
+  });
+export const cloneVoice = cloneElevenLabsVoice;
 
 export type CharacterVoice = {
   id: string;
@@ -574,7 +798,7 @@ export type CharacterVoice = {
   voice_id: string;
   voice_type: string;
   preview_url?: string;
-  config?: any;
+  config?: Record<string, unknown>;
 };
 
 export const getProjectVoices = (token: string, projectId: string) =>
@@ -584,7 +808,7 @@ export const updateCharacterVoice = (
   token: string,
   projectId: string,
   characterName: string,
-  payload: { voice_id: string; voice_type: string; preview_url?: string; config?: any }
+  payload: { voice_id: string; voice_type: string; preview_url?: string; config?: Record<string, unknown> }
 ) =>
   request<CharacterVoice>(
     `/projects/${projectId}/voices/${characterName}`,
@@ -598,7 +822,14 @@ export const updateCharacterVoice = (
 export const generateTTS = (
   token: string,
   projectId: string,
-  payload: { text: string; character_name: string; speed?: number; volume?: number; pitch?: number }
+  payload: {
+    text: string;
+    character_name: string;
+    speed?: number;
+    volume?: number;
+    pitch?: number;
+    tts_config?: Record<string, unknown>;
+  }
 ) =>
   request<{ audio_url: string }>(
     `/projects/${projectId}/tts`,
@@ -629,7 +860,8 @@ export const generateSegments = (token: string, id: string) =>
     {
       method: "POST",
     },
-    token
+    token,
+    VIDEO_GENERATE_TIMEOUT_MS
   );
 
 export type SegmentVersion = {
@@ -637,6 +869,7 @@ export type SegmentVersion = {
   video_url: string;
   prompt?: string | null;
   status: string;
+  task_id?: string | null;
   is_selected: boolean;
 };
 
@@ -645,6 +878,8 @@ export type Segment = {
   order_index: number;
   text_content: string;
   status: string;
+  task_status?: string | null;
+  task_id?: string | null;
   versions: SegmentVersion[];
 };
 
@@ -654,7 +889,7 @@ export const getSegments = (token: string, id: string) =>
 export const generateSegment = (
   token: string,
   projectId: string,
-  payload: { segment_id?: string; prompt?: string; model?: string; options?: any }
+  payload: { segment_id?: string; prompt?: string; model?: string; options?: Record<string, unknown>; user_selected_row_index?: number }
 ) =>
   request<{ status: string }>(
     `/projects/${projectId}/segments/generate`,
@@ -662,7 +897,23 @@ export const generateSegment = (
       method: "POST",
       body: JSON.stringify(payload),
     },
-    token
+    token,
+    VIDEO_GENERATE_TIMEOUT_MS
+  );
+
+export const generateSegmentFrameImage = (
+  token: string,
+  projectId: string,
+  payload: { prompt: string; references?: string[]; frame_type?: "first" | "last"; aspect_ratio?: string }
+) =>
+  request<{ image_url: string }>(
+    `/projects/${projectId}/segments/frame-images/generate`,
+    {
+      method: "POST",
+      body: JSON.stringify(payload),
+    },
+    token,
+    FRAME_GENERATE_TIMEOUT_MS
   );
 
 export const selectSegmentVersion = (
@@ -680,6 +931,20 @@ export const selectSegmentVersion = (
     token
   );
 
+export const deleteSegmentVersion = (
+  token: string,
+  projectId: string,
+  segmentId: string,
+  versionId: string
+) =>
+  request<{ status: string }>(
+    `/projects/${projectId}/segments/${segmentId}/versions/${versionId}`,
+    {
+      method: "DELETE",
+    },
+    token
+  );
+
 export const mergeFinal = (token: string, id: string) =>
   request<{ status: string }>(
     `/projects/${id}/merge`,
@@ -688,6 +953,529 @@ export const mergeFinal = (token: string, id: string) =>
     },
     token
   );
+
+export const downloadMergedEpisode = async (
+  token: string,
+  projectId: string,
+  payload: { episodeTitle?: string; clipUrls: string[] }
+) => {
+  const normalizedToken = normalizeToken(token);
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), VIDEO_GENERATE_TIMEOUT_MS);
+  let response: Response;
+  try {
+    response = await fetch(`${baseUrl}/projects/${projectId}/episodes/merge-download`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${normalizedToken}`,
+      },
+      body: JSON.stringify({
+        episode_title: payload.episodeTitle || "",
+        clip_urls: payload.clipUrls,
+      }),
+      signal: controller.signal,
+    });
+  } catch (err) {
+    if (err instanceof DOMException && err.name === "AbortError") {
+      throw new Error("分集合并超时，请稍后重试");
+    }
+    throw err;
+  } finally {
+    clearTimeout(timeoutId);
+  }
+  if (!response.ok) {
+    const bodyText = await response.text();
+    throw new Error(parseApiErrorMessage(bodyText, response.status, "分集合并下载失败"));
+  }
+  const blob = await response.blob();
+  const disposition = response.headers.get("content-disposition") || "";
+  const filenameMatch = disposition.match(/filename\*?=(?:UTF-8''|")?([^\";]+)/i);
+  const rawFilename = filenameMatch?.[1] || `${(payload.episodeTitle || "episode").trim() || "episode"}.mp4`;
+  const filename = decodeURIComponent(rawFilename.replace(/"/g, "").trim());
+  return { blob, filename };
+};
+
+export type EpisodeMergeStoreResult = {
+  merge_key: string;
+  merged_video_url: string;
+  already_exists: boolean;
+  episode_title: string;
+};
+
+export const mergeEpisodeOnServer = (
+  token: string,
+  projectId: string,
+  payload: { episodeTitle?: string; clipUrls: string[] },
+  timeoutMs: number = VIDEO_GENERATE_TIMEOUT_MS
+) =>
+  request<EpisodeMergeStoreResult>(
+    `/projects/${projectId}/episodes/merge-store`,
+    {
+      method: "POST",
+      body: JSON.stringify({
+        episode_title: payload.episodeTitle || "",
+        clip_urls: payload.clipUrls,
+      }),
+    },
+    token,
+    timeoutMs
+  );
+
+export type EpisodeAudioPipelineSegment = {
+  id: string;
+  index: number;
+  start_sec: number;
+  end_sec: number;
+  speaker_label: string;
+  source_audio_url: string;
+  isolated_audio_url: string;
+  dubbed_audio_url: string;
+  transcription?: string;
+  transcription_language?: string;
+};
+
+export type EpisodeSfxSegmentResult = {
+  segment_index: number;
+  version?: number;
+  start_sec: number;
+  end_sec: number;
+  duration_sec: number;
+  clip_video_url?: string;
+  audio_url?: string;
+  video_url?: string;
+  background_sound_prompt?: string;
+  updated_at?: string;
+};
+
+export type EpisodeAppliedSfxSegmentResult = {
+  segment_index: number;
+  start_sec: number;
+  end_sec: number;
+  duration_sec: number;
+  clip_video_url?: string;
+  video_url?: string;
+  updated_at?: string;
+};
+
+export type EpisodeBgmSegmentResult = {
+  segment_index: number;
+  version?: number;
+  start_sec: number;
+  end_sec: number;
+  duration_sec: number;
+  audio_url?: string;
+  original_filename?: string;
+  content_type?: string;
+  updated_at?: string;
+};
+
+export type FreeSoundTag = {
+  name: string;
+  count?: number;
+};
+
+export type FreeSoundSound = {
+  id: number;
+  name: string;
+  duration: number;
+  preview_url: string;
+  tags: string[];
+  username?: string;
+};
+
+export type EpisodeAudioPipelineResult = {
+  job_id: string;
+  project_id: string;
+  episode_title: string;
+  created_at: string;
+  merge_key?: string;
+  merged_video_url: string;
+  source_audio_url: string;
+  vocal_audio_url: string;
+  original_isolated_audio_url?: string;
+  merged_dubbed_audio_url?: string;
+  merged_dubbed_video_url?: string;
+  sfx_clip_video_url?: string;
+  sfx_audio_url?: string;
+  sfx_video_url?: string;
+  sfx_segment_results?: EpisodeSfxSegmentResult[];
+  sfx_applied_segment_results?: EpisodeAppliedSfxSegmentResult[];
+  sfx_applied_split_points?: number[];
+  sfx_background_sound_prompt?: string;
+  sfx_soundtrack_prompt?: string;
+  sfx_asmr_mode?: boolean;
+  sfx_task_id?: string;
+  sfx_segment_index?: number;
+  sfx_start_sec?: number;
+  sfx_end_sec?: number;
+  sfx_task_updated_at?: string;
+  sfx_status?: string;
+  bgm_audio_url?: string;
+  bgm_segment_results?: EpisodeBgmSegmentResult[];
+  bgm_segment_index?: number;
+  bgm_start_sec?: number;
+  bgm_end_sec?: number;
+  bgm_status?: string;
+  bgm_task_updated_at?: string;
+  duration_sec: number;
+  waveform: number[];
+  split_points: number[];
+  segments: EpisodeAudioPipelineSegment[];
+  episode_transcription?: string;
+  episode_transcription_language?: string;
+};
+
+export const extractEpisodeAudioPipeline = (
+  token: string,
+  projectId: string,
+  payload: { episodeTitle?: string; clipUrls: string[]; mergeKey?: string }
+) =>
+  request<EpisodeAudioPipelineResult>(
+    `/projects/${projectId}/episodes/audio-pipeline/extract`,
+    {
+      method: "POST",
+      body: JSON.stringify({
+        episode_title: payload.episodeTitle || "",
+        clip_urls: payload.clipUrls,
+        merge_key: payload.mergeKey || "",
+      }),
+    },
+    token,
+    VIDEO_GENERATE_TIMEOUT_MS
+  );
+
+export const updateEpisodeAudioSplits = (
+  token: string,
+  projectId: string,
+  payload: { jobId: string; splitPoints: number[] }
+) =>
+  request<EpisodeAudioPipelineResult>(
+    `/projects/${projectId}/episodes/audio-pipeline/update-splits`,
+    {
+      method: "POST",
+      body: JSON.stringify({
+        job_id: payload.jobId,
+        split_points: payload.splitPoints,
+      }),
+    },
+    token
+  );
+
+export const generateEpisodeAudioSegments = (
+  token: string,
+  projectId: string,
+  payload: { jobId: string }
+) =>
+  request<EpisodeAudioPipelineResult>(
+    `/projects/${projectId}/episodes/audio-pipeline/generate-segments`,
+    {
+      method: "POST",
+      body: JSON.stringify({
+        job_id: payload.jobId,
+      }),
+    },
+    token,
+    VIDEO_GENERATE_TIMEOUT_MS
+  );
+
+export const generateEpisodeSegmentS2S = (
+  token: string,
+  projectId: string,
+  payload: {
+    jobId: string;
+    segmentId: string;
+    voiceId: string;
+    modelId?: string;
+    settings?: Record<string, unknown>;
+  }
+) =>
+  request<EpisodeAudioPipelineResult>(
+    `/projects/${projectId}/episodes/audio-pipeline/s2s`,
+    {
+      method: "POST",
+      body: JSON.stringify({
+        job_id: payload.jobId,
+        segment_id: payload.segmentId,
+        voice_id: payload.voiceId,
+        model_id: payload.modelId,
+        settings: payload.settings ?? {},
+      }),
+    },
+    token,
+    VIDEO_GENERATE_TIMEOUT_MS
+  );
+
+export const deleteEpisodeAudioSegment = (
+  token: string,
+  projectId: string,
+  payload: {
+    jobId: string;
+    segmentId: string;
+  }
+) =>
+  request<EpisodeAudioPipelineResult>(
+    `/projects/${projectId}/episodes/audio-pipeline/delete-segment`,
+    {
+      method: "POST",
+      body: JSON.stringify({
+        job_id: payload.jobId,
+        segment_id: payload.segmentId,
+      }),
+    },
+    token,
+    VIDEO_GENERATE_TIMEOUT_MS
+  );
+
+export const extractEpisodeOriginalVocal = (
+  token: string,
+  projectId: string,
+  payload: {
+    jobId: string;
+  }
+) =>
+  request<EpisodeAudioPipelineResult>(
+    `/projects/${projectId}/episodes/audio-pipeline/extract-original-vocal`,
+    {
+      method: "POST",
+      body: JSON.stringify({
+        job_id: payload.jobId,
+      }),
+    },
+    token,
+    VIDEO_GENERATE_TIMEOUT_MS
+  );
+
+export const mergeEpisodeDubbedAudio = (
+  token: string,
+  projectId: string,
+  payload: {
+    jobId: string;
+  }
+) =>
+  request<EpisodeAudioPipelineResult>(
+    `/projects/${projectId}/episodes/audio-pipeline/merge-dubbed`,
+    {
+      method: "POST",
+      body: JSON.stringify({
+        job_id: payload.jobId,
+      }),
+    },
+    token,
+    VIDEO_GENERATE_TIMEOUT_MS
+  );
+
+export const muxEpisodeDubbedVideo = (
+  token: string,
+  projectId: string,
+  payload: {
+    jobId: string;
+  }
+) =>
+  request<EpisodeAudioPipelineResult>(
+    `/projects/${projectId}/episodes/audio-pipeline/mux-dubbed-video`,
+    {
+      method: "POST",
+      body: JSON.stringify({
+        job_id: payload.jobId,
+      }),
+    },
+    token,
+    VIDEO_GENERATE_TIMEOUT_MS
+  );
+
+export const clipEpisodeSfxVideo = (
+  token: string,
+  projectId: string,
+  payload: {
+    jobId: string;
+    sourceVideoUrl?: string;
+    startSec: number;
+    endSec: number;
+  }
+) =>
+  request<EpisodeAudioPipelineResult>(
+    `/projects/${projectId}/episodes/audio-pipeline/clip-sfx-video`,
+    {
+      method: "POST",
+      body: JSON.stringify({
+        job_id: payload.jobId,
+        source_video_url: payload.sourceVideoUrl || "",
+        start_sec: payload.startSec,
+        end_sec: payload.endSec,
+      }),
+    },
+    token,
+    VIDEO_GENERATE_TIMEOUT_MS
+  );
+
+export const applyEpisodeSfxSegments = (
+  token: string,
+  projectId: string,
+  payload: {
+    jobId: string;
+    sourceVideoUrl?: string;
+    split_points: number[];
+  }
+) =>
+  request<EpisodeAudioPipelineResult>(
+    `/projects/${projectId}/episodes/audio-pipeline/apply-sfx-segments`,
+    {
+      method: "POST",
+      body: JSON.stringify({
+        job_id: payload.jobId,
+        source_video_url: payload.sourceVideoUrl || "",
+        split_points: payload.split_points,
+      }),
+    },
+    token,
+    VIDEO_GENERATE_TIMEOUT_MS
+  );
+
+export const generateEpisodeSfxAudio = (
+  token: string,
+  projectId: string,
+  payload: {
+    jobId: string;
+    sourceVideoUrl?: string;
+    segmentIndex?: number;
+    startSec: number;
+    endSec: number;
+    backgroundSoundPrompt: string;
+  }
+) =>
+  request<EpisodeAudioPipelineResult>(
+    `/projects/${projectId}/episodes/audio-pipeline/generate-sfx`,
+    {
+      method: "POST",
+      body: JSON.stringify({
+        job_id: payload.jobId,
+        source_video_url: payload.sourceVideoUrl || "",
+        segment_index: payload.segmentIndex ?? 0,
+        start_sec: payload.startSec,
+        end_sec: payload.endSec,
+        background_sound_prompt: payload.backgroundSoundPrompt,
+      }),
+    },
+    token,
+    VIDEO_GENERATE_TIMEOUT_MS
+  );
+
+export const deleteEpisodeSfxVersion = (
+  token: string,
+  projectId: string,
+  payload: {
+    jobId: string;
+    segmentIndex: number;
+    version: number;
+  }
+) =>
+  request<EpisodeAudioPipelineResult>(
+    `/projects/${projectId}/episodes/audio-pipeline/delete-sfx-version`,
+    {
+      method: "POST",
+      body: JSON.stringify({
+        job_id: payload.jobId,
+        segment_index: payload.segmentIndex,
+        version: payload.version,
+      }),
+    },
+    token,
+    VIDEO_GENERATE_TIMEOUT_MS
+  );
+
+export const uploadEpisodeBgmAudio = async (
+  token: string,
+  projectId: string,
+  payload: {
+    jobId: string;
+    sourceVideoUrl?: string;
+    segmentIndex?: number;
+    startSec: number;
+    endSec: number;
+    file: File;
+  }
+) => {
+  const normalizedToken = normalizeToken(token);
+  const formData = new FormData();
+  formData.append("job_id", payload.jobId);
+  formData.append("source_video_url", payload.sourceVideoUrl || "");
+  formData.append("segment_index", String(Math.max(0, Number(payload.segmentIndex ?? 0))));
+  formData.append("start_sec", String(payload.startSec));
+  formData.append("end_sec", String(payload.endSec));
+  formData.append("file", payload.file);
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), VIDEO_GENERATE_TIMEOUT_MS);
+  let response: Response;
+  try {
+    response = await fetch(`${baseUrl}/projects/${projectId}/episodes/audio-pipeline/upload-bgm`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${normalizedToken}`,
+      },
+      body: formData,
+      signal: controller.signal,
+    });
+  } catch (err) {
+    if (err instanceof DOMException && err.name === "AbortError") {
+      throw new Error("上传 BGM 超时，请稍后重试");
+    }
+    throw err;
+  } finally {
+    clearTimeout(timeoutId);
+  }
+  if (response.status === 401) {
+    const bodyText = await response.text();
+    const authMessage = parseApiErrorMessage(bodyText, response.status, "登录状态校验失败，请重试");
+    throw new Error(authMessage);
+  }
+  if (!response.ok) {
+    const bodyText = await response.text();
+    throw new Error(parseApiErrorMessage(bodyText, response.status, "上传 BGM 失败"));
+  }
+  return response.json() as Promise<EpisodeAudioPipelineResult>;
+};
+
+export const getFreeSoundTags = (
+  token: string,
+  projectId: string,
+  payload?: { query?: string; pageSize?: number }
+) =>
+  request<{ items: FreeSoundTag[] }>(
+    `/projects/${projectId}/episodes/audio-pipeline/freesound-tags?query=${encodeURIComponent(payload?.query || "")}&page_size=${Math.max(
+      1,
+      Math.min(100, Number(payload?.pageSize || 24))
+    )}`,
+    {},
+    token,
+    45000
+  ).catch(() => ({ items: [] }));
+
+export const searchFreeSoundSounds = (
+  token: string,
+  projectId: string,
+  payload: { query?: string; tag?: string; page?: number; pageSize?: number }
+) =>
+  request<{ items: FreeSoundSound[]; count: number; page: number; page_size: number; warning?: string }>(
+    `/projects/${projectId}/episodes/audio-pipeline/freesound-search`,
+    {
+      method: "POST",
+      body: JSON.stringify({
+        query: payload.query || "",
+        tag: payload.tag || "",
+        page: Math.max(1, Number(payload.page || 1)),
+        page_size: Math.max(1, Math.min(40, Number(payload.pageSize || 20))),
+      }),
+    },
+    token,
+    45000
+  ).catch(() => ({
+    items: [],
+    count: 0,
+    page: Math.max(1, Number(payload.page || 1)),
+    page_size: Math.max(1, Math.min(40, Number(payload.pageSize || 20))),
+    warning: "Freesound 搜索暂时不可用",
+  }));
 
 export type SettingsResponse = {
   endpoint: string;
@@ -770,4 +1558,53 @@ export const updateTemplate = (
       body: JSON.stringify(payload),
     },
     token
+  );
+
+export type TranscribeSegmentResult = {
+  job_id: string;
+  segment_id: string;
+  text: string;
+  language: string;
+  segments: EpisodeAudioPipelineSegment[];
+};
+
+export const transcribeEpisodeSegment = (
+  token: string,
+  projectId: string,
+  payload: { jobId: string; segmentId: string }
+) =>
+  request<EpisodeAudioPipelineResult>(
+    `/projects/${projectId}/episodes/audio-pipeline/transcribe-segment`,
+    {
+      method: "POST",
+      body: JSON.stringify({
+        job_id: payload.jobId,
+        segment_id: payload.segmentId,
+      }),
+    },
+    token,
+    VIDEO_GENERATE_TIMEOUT_MS
+  );
+
+export type TranscribeEpisodeResult = {
+  job_id: string;
+  text: string;
+  language: string;
+};
+
+export const transcribeEpisodeAudio = (
+  token: string,
+  projectId: string,
+  payload: { jobId: string }
+) =>
+  request<EpisodeAudioPipelineResult>(
+    `/projects/${projectId}/episodes/audio-pipeline/transcribe-episode`,
+    {
+      method: "POST",
+      body: JSON.stringify({
+        job_id: payload.jobId,
+      }),
+    },
+    token,
+    VIDEO_GENERATE_TIMEOUT_MS
   );

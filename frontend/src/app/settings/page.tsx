@@ -6,10 +6,10 @@ import { getToken } from "@/lib/auth";
 import { extractModels } from "@/lib/models";
 
 export default function SettingsPage() {
-  const [endpoint, setEndpoint] = useState("https://openrouter.ai/api/v1");
+  const [endpoint, setEndpoint] = useState("https://api.wuyinkeji.com");
   const [apiKey, setApiKey] = useState("");
-  const [modelText, setModelText] = useState("gemini3flash");
-  const [modelImage, setModelImage] = useState("google/gemini-3-pro-image-preview");
+  const [modelText, setModelText] = useState("gemini-3-pro");
+  const [modelImage, setModelImage] = useState("nanoBanana2");
   const [modelVideo, setModelVideo] = useState("sora2");
   const [allowSync, setAllowSync] = useState(false);
   const [hasKey, setHasKey] = useState(false);
@@ -135,7 +135,7 @@ export default function SettingsPage() {
             value={modelText}
             onChange={(event) => setModelText(event.target.value)}
             className="mt-2 w-full rounded-lg border border-slate-200 px-3 py-2 text-sm"
-            placeholder="例如：gemini3flash"
+            placeholder="例如：gemini-3-pro"
             list="linkapi-models"
           />
         </div>
@@ -145,7 +145,7 @@ export default function SettingsPage() {
             value={modelImage}
             onChange={(event) => setModelImage(event.target.value)}
             className="mt-2 w-full rounded-lg border border-slate-200 px-3 py-2 text-sm"
-            placeholder="例如：google/gemini-3-pro-image-preview"
+            placeholder="例如：nanoBanana2"
             list="linkapi-models"
           />
         </div>

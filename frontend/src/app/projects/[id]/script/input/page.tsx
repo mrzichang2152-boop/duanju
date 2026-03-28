@@ -2,7 +2,7 @@
 
 import { useEffect, useState, useRef, type ChangeEvent } from "react";
 import { useParams, useRouter } from "next/navigation";
-import { getScript, saveScript, generateScriptStream, type ScriptGeneratePayload } from "@/lib/api";
+import { getScript, saveScript, generateScriptStream, type ScriptEpisodePayload, type ScriptGeneratePayload } from "@/lib/api";
 import { getToken } from "@/lib/auth";
 
 const scriptOptions = [
@@ -266,12 +266,12 @@ export default function ScriptInputPage() {
     finishedAt: "",
     error: "",
     cacheRestored: false,
-    apiBase: process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://localhost:8002/api",
+    apiBase: process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://localhost:3000/api",
     tokenPresent: false,
   });
   
   // Inputs
-  const [selectedModel, setSelectedModel] = useState("doubao-seed-2-0-pro-260215");
+  const [selectedModel, setSelectedModel] = useState("gemini-3-pro");
 
   useEffect(() => {
     if (!projectId) return;
@@ -334,8 +334,18 @@ export default function ScriptInputPage() {
     isThinkingCollapsed: boolean;
     isGenerating: boolean;
   }
+  type RawEpisode = {
+    title?: string;
+    content?: string;
+    thinking?: string;
+    userInput?: string;
+    isThinkingCollapsed?: boolean;
+    versions?: EpisodeVersion[];
+    currentVersionId?: string;
+  };
   
   const generateId = () => Math.random().toString(36).substring(2, 15) + Math.random().toString(36).substring(2, 15);
+  const getErrorMessage = (error: unknown) => (error instanceof Error ? error.message : "未知错误");
   
   const [episodes, setEpisodes] = useState<Episode[]>([]);
   const [expandedEpisodes, setExpandedEpisodes] = useState<Set<number>>(new Set()); // Default all collapsed
@@ -447,7 +457,7 @@ export default function ScriptInputPage() {
         }
 
         if (scriptData.episodes && scriptData.episodes.length > 0) {
-            const mappedEpisodes = scriptData.episodes.map((ep: any) => {
+            const mappedEpisodes = (scriptData.episodes as RawEpisode[]).map((ep, index) => {
                 const versions: EpisodeVersion[] = ep.versions && ep.versions.length > 0 
                   ? ep.versions 
                   : [{
@@ -461,7 +471,7 @@ export default function ScriptInputPage() {
                 const currentVersionId = ep.currentVersionId || versions[0].id;
                 
                 return {
-                  title: ep.title,
+                  title: ep.title || `第${index + 1}集`,
                   versions,
                   currentVersionId,
                   userInput: ep.userInput || "",
@@ -582,9 +592,7 @@ export default function ScriptInputPage() {
         if (resourcesPartRef.current) {
           finalContent = resourcesPartRef.current + SEPARATOR + scriptContent;
         }
-        // Filter out UI-only fields from episodes before saving
-        // Cast to any to bypass strict type checking for saving
-        const episodesToSave = episodes.map(({ isGenerating, ...rest }) => rest) as any[];
+        const episodesToSave: ScriptEpisodePayload[] = episodes.map(({ isGenerating, ...rest }) => rest);
         
         await saveScript(token, projectId, finalContent, scriptThinking, undefined, outlineContent, episodesToSave);
         
@@ -617,14 +625,14 @@ export default function ScriptInputPage() {
       }
       
       // Filter out UI-only fields from episodes before saving
-      const episodesToSave = episodes.map(({ isGenerating, ...rest }) => {
+      const episodesToSave: ScriptEpisodePayload[] = episodes.map(({ isGenerating, ...rest }) => {
         // Ensure content is populated from current version for downstream consumption (e.g. Step 4)
         const currentVersion = rest.versions.find(v => v.id === rest.currentVersionId) || rest.versions[0];
         return {
           ...rest,
           content: currentVersion ? currentVersion.content : ""
         };
-      }) as any[];
+      });
       
       await saveScript(token, projectId, finalContent, scriptThinking, undefined, outlineContent, episodesToSave);
       lastSavedContentRef.current = scriptContent;
@@ -632,7 +640,7 @@ export default function ScriptInputPage() {
       lastSavedOutlineRef.current = outlineContent || "";
       lastSavedEpisodesRef.current = episodes;
       setMessage("已保存");
-    } catch (error) {
+    } catch {
       setMessage("保存失败");
     }
   };
@@ -658,7 +666,6 @@ export default function ScriptInputPage() {
     try {
       let text = "";
       if (isDocx) {
-        // @ts-ignore
         const mammoth = await import("mammoth");
         const arrayBuffer = await file.arrayBuffer();
         const result = await mammoth.extractRawText({ arrayBuffer });
@@ -670,7 +677,7 @@ export default function ScriptInputPage() {
       setScriptContent(text);
       await saveScript(token, projectId, text);
       setMessage("已导入");
-    } catch (error) {
+    } catch {
       setMessage("导入失败");
     } finally {
       setUploading(false);
@@ -764,24 +771,25 @@ export default function ScriptInputPage() {
         model: selectedModel,
         instruction: "",
       }, (chunk) => {
-        if (chunk.choices?.[0]?.delta?.reasoning_content) {
-          setOutlineThinking(prev => prev + chunk.choices[0].delta.reasoning_content);
+        const delta = chunk.choices?.[0]?.delta;
+        if (delta?.reasoning_content) {
+          setOutlineThinking(prev => prev + delta.reasoning_content);
         }
-        if (chunk.choices?.[0]?.delta?.content) {
+        if (delta?.content) {
           if (!hasCollapsedThinking) {
              setIsOutlineThinkingCollapsed(true);
              hasCollapsedThinking = true;
           }
-          setOutlineContent(prev => prev + chunk.choices[0].delta.content);
+          setOutlineContent(prev => prev + delta.content);
         }
       }, abortController.signal);
       
       setMessage("大纲提炼完成");
-    } catch (error: any) {
-      if (error.name === 'AbortError') {
+    } catch (error: unknown) {
+      if (error instanceof Error && error.name === "AbortError") {
         setMessage("提炼已取消");
       } else {
-        setMessage(`提炼失败: ${error.message}`);
+        setMessage(`提炼失败: ${getErrorMessage(error)}`);
       }
     } finally {
       setIsExtractingOutline(false);
@@ -825,7 +833,7 @@ export default function ScriptInputPage() {
 
      // Validation for AI Modify button
      if (source === "mode" && !selectedSuggestionMode) {
-        setMessage("请先在“AI 辅助修改”中选择“付费优化修改建议”或“流量爆款修改建议”");
+       setMessage("请先在“基础设定”中选择“用户付费型”或“流量爆款型”");
         // Clear message after 3 seconds
         setTimeout(() => setMessage(null), 3000);
         return;
@@ -871,7 +879,6 @@ export default function ScriptInputPage() {
      const abortController = new AbortController();
      abortControllersRef.current[index] = abortController;
 
-     let hasCollapsedThinking = false;
      let thinkingBuffer = "";
 
      // If source is custom, prepare new version
@@ -945,9 +952,9 @@ export default function ScriptInputPage() {
               return newEpisodes;
            });
         }, abortController.signal);
-     } catch (e: any) {
-        if (e.name !== 'AbortError') {
-           setMessage(`生成失败: ${e.message}`);
+     } catch (e: unknown) {
+        if (!(e instanceof Error && e.name === "AbortError")) {
+           setMessage(`生成失败: ${getErrorMessage(e)}`);
         }
      } finally {
         setEpisodes(prev => {
@@ -1113,11 +1120,11 @@ export default function ScriptInputPage() {
          setMessage("分集完成 (未识别到明确分集标记)");
       }
 
-    } catch (error: any) {
-      if (error.name === 'AbortError') {
+    } catch (error: unknown) {
+      if (error instanceof Error && error.name === "AbortError") {
         setMessage("拆分已取消");
       } else {
-        setMessage(`拆分失败: ${error.message}`);
+        setMessage(`拆分失败: ${getErrorMessage(error)}`);
       }
     } finally {
       setIsSplittingScript(false);
@@ -1259,7 +1266,29 @@ export default function ScriptInputPage() {
           <div className="rounded-xl border border-slate-200 bg-white p-4 shadow-sm">
              {/* ... Input Section ... */}
             <div className="mb-3 flex items-center justify-between text-sm font-medium text-slate-900">
-              <span>AI 辅助修改</span>
+              <span>基础设定</span>
+              <div className="flex items-center gap-3">
+                <button
+                  onClick={() => setSelectedSuggestionMode(prev => prev === "suggestion_paid" ? null : "suggestion_paid")}
+                  className={`rounded-lg border px-3 py-2 text-xs transition-colors disabled:opacity-50 ${
+                    selectedSuggestionMode === "suggestion_paid"
+                      ? "border-indigo-600 bg-indigo-600 text-white"
+                      : "border-indigo-200 bg-indigo-50 text-indigo-700 hover:bg-indigo-100"
+                  }`}
+                >
+                  用户付费型
+                </button>
+                <button
+                  onClick={() => setSelectedSuggestionMode(prev => prev === "suggestion_traffic" ? null : "suggestion_traffic")}
+                  className={`rounded-lg border px-3 py-2 text-xs transition-colors disabled:opacity-50 ${
+                    selectedSuggestionMode === "suggestion_traffic"
+                      ? "border-amber-600 bg-amber-600 text-white"
+                      : "border-amber-200 bg-amber-50 text-amber-700 hover:bg-amber-100"
+                  }`}
+                >
+                  流量爆款型
+                </button>
+              </div>
             </div>
             <div className="flex flex-col gap-3">
               <div className="rounded-lg border border-slate-200 bg-slate-50 p-3">
@@ -1369,30 +1398,6 @@ export default function ScriptInputPage() {
                 </div>
               )}
 
-              <div className="flex items-center justify-between gap-3">
-                <div className="flex gap-3">
-                  <button
-                    onClick={() => setSelectedSuggestionMode(prev => prev === "suggestion_paid" ? null : "suggestion_paid")}
-                    className={`rounded-lg border px-3 py-2 text-xs transition-colors disabled:opacity-50 ${
-                      selectedSuggestionMode === "suggestion_paid"
-                        ? "border-indigo-600 bg-indigo-600 text-white"
-                        : "border-indigo-200 bg-indigo-50 text-indigo-700 hover:bg-indigo-100"
-                    }`}
-                  >
-                    💡 付费优化修改建议
-                  </button>
-                  <button
-                    onClick={() => setSelectedSuggestionMode(prev => prev === "suggestion_traffic" ? null : "suggestion_traffic")}
-                    className={`rounded-lg border px-3 py-2 text-xs transition-colors disabled:opacity-50 ${
-                      selectedSuggestionMode === "suggestion_traffic"
-                        ? "border-amber-600 bg-amber-600 text-white"
-                        : "border-amber-200 bg-amber-50 text-amber-700 hover:bg-amber-100"
-                    }`}
-                  >
-                    🔥 流量爆款修改建议
-                  </button>
-                </div>
-              </div>
             </div>
           </div>
 

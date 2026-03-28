@@ -1,5 +1,6 @@
 import type { Metadata } from "next";
 import { Geist, Geist_Mono } from "next/font/google";
+import Link from "next/link";
 import "./globals.css";
 import TopNav from "./components/TopNav";
 
@@ -31,12 +32,12 @@ export default function RootLayout({
             <div className="mx-auto flex w-full max-w-6xl items-center justify-between px-6 py-4">
               <div className="flex items-center gap-4">
                 <div className="text-lg font-semibold">短剧生成 Web 应用</div>
-                <a
+                <Link
                   href="/"
                   className="rounded-lg bg-slate-100 px-3 py-1 text-sm font-medium text-slate-600 hover:bg-slate-200"
                 >
                   首页
-                </a>
+                </Link>
               </div>
               <TopNav />
             </div>

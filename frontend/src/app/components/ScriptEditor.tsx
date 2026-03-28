@@ -1,20 +1,35 @@
-import React, { useState, useEffect, useRef, useCallback } from 'react';
+import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
+import Image from "next/image";
 import { getToken } from "@/lib/auth";
-import { generateTTS, getProjectVoices, type CharacterVoice } from "@/lib/api";
+import { generateSegmentFrameImage, generateTTS, getProjectVoices, type Asset, type CharacterVoice } from "@/lib/api";
 
 interface ScriptEditorProps {
   content: string;
   onChange: (newContent: string) => void;
   projectId?: string;
+  dialogueCellAudioMap?: Record<string, AppliedVoiceSegment[]>;
+  onDialogueCellAudioMapChange?: (map: Record<string, AppliedVoiceSegment[]>) => void;
   rowStartIndex?: number;
   generatingGlobalRowIndex?: number | null;
   generatedRowIndexSet?: Set<number>;
+  pendingRowIndexSet?: Set<number>;
+  rowTaskStatusMap?: Record<number, string>;
+  rowTaskIdMap?: Record<number, string>;
+  rowVideoUrlMap?: Record<number, string>;
+  rowVersionListMap?: Record<number, Array<{ id: string; video_url: string; status: string; is_selected: boolean }>>;
+  rowSelectedVersionIdMap?: Record<number, string>;
   onGenerateKlingRow?: (params: {
     globalRowIndex: number;
+    previousGlobalRowIndex?: number;
     headers: string[];
     row: string[];
-    spec: string;
+    usePreviousSegmentEndFrame?: boolean;
+    customFirstFrameUrl?: string;
+    customLastFrameUrl?: string;
   }) => void;
+  onSelectKlingVersion?: (globalRowIndex: number, versionId: string) => void;
+  onDeleteKlingVersion?: (globalRowIndex: number, versionId: string) => void;
+  deletingVersionKey?: string | null;
 }
 
 type Block = 
@@ -24,8 +39,17 @@ type Block =
 type VoiceTagItem = { label: string; tag: string; desc: string };
 type VoiceTagGroup = { key: "basic" | "advanced" | "tone" | "audio" | "special"; title: string; tags: VoiceTagItem[] };
 type VoiceSegment = { id: string; text: string };
+type AppliedVoiceSegment = { text: string; audioUrl: string };
 type VoiceEmotionIntensity = "slightly" | "very" | "extremely";
 type VoiceAccentLevel = "slight" | "normal" | "strong";
+type PronunciationRule = { id: string; source: string; target: string };
+type FrameReference = { assetId: string; name: string; imageUrl: string };
+type FrameMaterialTab = "character" | "prop" | "scene";
+type PersistedFrameState = {
+  firstImageMap?: Record<string, string[]>;
+  lastImageMap?: Record<string, string[]>;
+  appliedMap?: Record<string, { first?: string; last?: string }>;
+};
 
 const VOICE_TAG_GROUPS: VoiceTagGroup[] = [
   {
@@ -130,34 +154,112 @@ const VOICE_TAG_GROUPS: VoiceTagGroup[] = [
   },
 ];
 
-const KLING_COLUMN = "Kling视频生成";
-const KLING_DEFAULT_SPEC = "pro|1|false";
-const KLING_SPEC_OPTIONS = [
-  { value: "std|1|true", label: "标准（std）x 1s 时长 x 有参考视频" },
-  { value: "std|1|false", label: "标准（std）x 1s 时长 x 无参考视频" },
-  { value: "pro|1|true", label: "高品质（pro）x 1s 时长 x 有参考视频" },
-  { value: "pro|1|false", label: "高品质（pro）x 1s 时长 x 无参考视频" },
+const KLING_COLUMN = "视频生成";
+const LEGACY_KLING_COLUMN = "Kling视频生成";
+const getFrameStateStorageKey = (projectId: string) => `script_editor_frame_state_v1:${projectId}`;
+const isCompletedVideoVersion = (version: { video_url: string; status: string }) => {
+  const status = String(version.status || "").toUpperCase();
+  if (!version.video_url) return false;
+  if (!status) return false;
+  if (status.includes("FAILED") || status.includes("ERROR") || status.includes("CANCEL")) return false;
+  if (status.includes("COMPLETED") || status.includes("SUCCESS")) return true;
+  return false;
+};
+const ELEVEN_MODELS = [
+  { value: "eleven_v3", label: "Eleven v3" },
+  { value: "eleven_multilingual_v2", label: "Multilingual v2" },
+  { value: "eleven_turbo_v2_5", label: "Turbo v2.5" },
+  { value: "eleven_flash_v2_5", label: "Flash v2.5" },
+  { value: "eleven_monolingual_v1", label: "Monolingual v1" },
 ];
+const ELEVEN_OUTPUT_FORMATS = [
+  { value: "mp3_44100_128", label: "MP3 44.1kHz 128kbps" },
+  { value: "mp3_44100_192", label: "MP3 44.1kHz 192kbps" },
+  { value: "pcm_44100", label: "PCM 44.1kHz" },
+  { value: "pcm_22050", label: "PCM 22.05kHz" },
+  { value: "ulaw_8000", label: "uLaw 8kHz" },
+];
+const ELEVEN_LANGUAGE_OPTIONS = [
+  { value: "", label: "自动" },
+  { value: "zh", label: "中文" },
+  { value: "en", label: "英文" },
+  { value: "ja", label: "日文" },
+  { value: "ko", label: "韩文" },
+  { value: "de", label: "德文" },
+  { value: "fr", label: "法文" },
+  { value: "es", label: "西班牙文" },
+];
+
+function isKlingColumnHeader(header: string) {
+  const text = (header || "").replace(/\s+/g, "");
+  return text === KLING_COLUMN || text === LEGACY_KLING_COLUMN;
+}
+
+function getSceneColumnIndex(headers: string[]) {
+  return headers.findIndex((header) => header.replace(/\s+/g, "").includes("场景"));
+}
+
+function normalizeSceneCellValue(value: string) {
+  return String(value || "")
+    .replace(/\[AssetID:\s*[^\]]+\]/g, "")
+    .replace(/\s+/g, "")
+    .toLowerCase();
+}
+
+function isSameSceneAsPreviousRow(headers: string[], row: string[], previousRow: string[] | null) {
+  if (!previousRow) return false;
+  const sceneIndex = getSceneColumnIndex(headers);
+  if (sceneIndex < 0) return false;
+  const currentScene = normalizeSceneCellValue(row[sceneIndex] || "");
+  const previousScene = normalizeSceneCellValue(previousRow[sceneIndex] || "");
+  return Boolean(currentScene && previousScene && currentScene === previousScene);
+}
 
 export function ScriptEditor({
   content,
   onChange,
   projectId,
+  dialogueCellAudioMap: dialogueCellAudioMapProp,
+  onDialogueCellAudioMapChange,
   rowStartIndex = 0,
   generatingGlobalRowIndex = null,
   generatedRowIndexSet,
+  pendingRowIndexSet,
+  rowTaskStatusMap,
+  rowTaskIdMap,
+  rowVideoUrlMap,
+  rowVersionListMap,
+  rowSelectedVersionIdMap,
   onGenerateKlingRow,
+  onSelectKlingVersion,
+  onDeleteKlingVersion,
+  deletingVersionKey = null,
 }: ScriptEditorProps) {
+  void rowTaskStatusMap;
+  void rowTaskIdMap;
   const [blocks, setBlocks] = useState<Block[]>([]);
-  const [projectAssets, setProjectAssets] = useState<any[]>([]);
+  const [projectAssets, setProjectAssets] = useState<Asset[]>([]);
   const [projectVoices, setProjectVoices] = useState<CharacterVoice[]>([]);
-  const [voiceModal, setVoiceModal] = useState<{ blockIndex: number; rowIndex: number; colIndex: number } | null>(null);
+  const [voiceModal, setVoiceModal] = useState<{ blockIndex: number; rowIndex: number; colIndex: number; globalRowIndex: number } | null>(null);
   const [voiceSourceText, setVoiceSourceText] = useState("");
   const [voiceSegments, setVoiceSegments] = useState<VoiceSegment[]>([]);
   const [voiceCharacter, setVoiceCharacter] = useState("");
-  const [voiceVolume, setVoiceVolume] = useState(0);
   const [voiceSpeed, setVoiceSpeed] = useState(1);
-  const [voicePitch, setVoicePitch] = useState(0);
+  const [voiceStability, setVoiceStability] = useState(0.45);
+  const [voiceSimilarityBoost, setVoiceSimilarityBoost] = useState(0.8);
+  const [voiceStyle, setVoiceStyle] = useState(0.35);
+  const [voiceUseSpeakerBoost, setVoiceUseSpeakerBoost] = useState(true);
+  const [voiceModelId, setVoiceModelId] = useState("eleven_v3");
+  const [voiceOutputFormat, setVoiceOutputFormat] = useState("mp3_44100_128");
+  const [voiceLanguageCode, setVoiceLanguageCode] = useState("");
+  const [voiceSeed, setVoiceSeed] = useState("");
+  const [voicePreviousText, setVoicePreviousText] = useState("");
+  const [voiceNextText, setVoiceNextText] = useState("");
+  const [voicePronunciationRules, setVoicePronunciationRules] = useState<PronunciationRule[]>([
+    { id: "default-0", source: "", target: "" },
+  ]);
+  const [voicePronunciationDictId, setVoicePronunciationDictId] = useState("");
+  const [voicePronunciationDictVersion, setVoicePronunciationDictVersion] = useState("");
   const [activeVoiceSegmentId, setActiveVoiceSegmentId] = useState<string | null>(null);
   const [voiceGeneratingSegmentId, setVoiceGeneratingSegmentId] = useState<string | null>(null);
   const [voiceTagGroupKey, setVoiceTagGroupKey] = useState<VoiceTagGroup["key"]>("basic");
@@ -165,13 +267,65 @@ export function ScriptEditor({
   const [voiceAccentLevel, setVoiceAccentLevel] = useState<VoiceAccentLevel>("normal");
   const [voicePauseSeconds, setVoicePauseSeconds] = useState(1.2);
   const [voiceSegmentAudioMap, setVoiceSegmentAudioMap] = useState<Record<string, string>>({});
+  const [dialogueCellAudioMap, setDialogueCellAudioMap] = useState<Record<string, AppliedVoiceSegment[]>>(dialogueCellAudioMapProp || {});
+  const [previewVideoUrl, setPreviewVideoUrl] = useState<string | null>(null);
+  const [downloadingVideoKey, setDownloadingVideoKey] = useState<string | null>(null);
+  const [frameModalRowIndex, setFrameModalRowIndex] = useState<number | null>(null);
+  const [frameModalTab, setFrameModalTab] = useState<FrameMaterialTab>("character");
+  const [frameGenerateTab, setFrameGenerateTab] = useState<"first" | "last">("first");
+  const [framePromptInput, setFramePromptInput] = useState("");
+  const [frameReferences, setFrameReferences] = useState<FrameReference[]>([]);
+  const [frameGeneratingType, setFrameGeneratingType] = useState<"first" | "last" | null>(null);
+  const [frameFirstImageMap, setFrameFirstImageMap] = useState<Record<number, string[]>>({});
+  const [frameLastImageMap, setFrameLastImageMap] = useState<Record<number, string[]>>({});
+  const [frameAppliedMap, setFrameAppliedMap] = useState<Record<number, { first?: string; last?: string }>>({});
+  const [previewFrameUrl, setPreviewFrameUrl] = useState<string | null>(null);
+  const [frameError, setFrameError] = useState("");
+  const [frameEditTarget, setFrameEditTarget] = useState<{ frameType: "first" | "last"; imageUrl: string } | null>(null);
+  const [frameEditInput, setFrameEditInput] = useState("");
+  const [frameEditing, setFrameEditing] = useState(false);
   const [voiceError, setVoiceError] = useState("");
+  const [usePreviousEndFrameMap, setUsePreviousEndFrameMap] = useState<Record<number, boolean>>({});
   const [voiceSelection, setVoiceSelection] = useState<{ start: number; end: number; text: string }>({ start: 0, end: 0, text: "" });
   const voiceAudioRefs = useRef<Record<string, HTMLAudioElement | null>>({});
   const voiceTextareaRefs = useRef<Record<string, HTMLTextAreaElement | null>>({});
+  const frameEditorRef = useRef<HTMLDivElement | null>(null);
+  const frameModalRowIndexRef = useRef<number | null>(null);
+  const previewAudioRef = useRef<HTMLAudioElement | null>(null);
   // Initialize with specific value to ensure first sync happens if content is present
   const lastSerializedRef = useRef<string>('__INITIAL_EMPTY__'); 
   const isInternalUpdate = useRef(false);
+
+  const downloadVideo = useCallback(async (videoUrl: string, filename: string, key: string) => {
+    if (!videoUrl) return;
+    setDownloadingVideoKey(key);
+    try {
+      const response = await fetch(videoUrl);
+      if (!response.ok) {
+        throw new Error("下载视频失败");
+      }
+      const blob = await response.blob();
+      const objectUrl = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = objectUrl;
+      link.download = filename;
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      window.setTimeout(() => URL.revokeObjectURL(objectUrl), 1500);
+    } catch {
+      const fallback = document.createElement("a");
+      fallback.href = videoUrl;
+      fallback.download = filename;
+      fallback.target = "_blank";
+      fallback.rel = "noopener noreferrer";
+      document.body.appendChild(fallback);
+      fallback.click();
+      document.body.removeChild(fallback);
+    } finally {
+      setDownloadingVideoKey(null);
+    }
+  }, []);
 
   // Fetch project assets once
   useEffect(() => {
@@ -212,9 +366,74 @@ export function ScriptEditor({
       });
   }, [projectId]);
 
+  useEffect(() => {
+    setDialogueCellAudioMap(dialogueCellAudioMapProp || {});
+  }, [dialogueCellAudioMapProp]);
+
+  useEffect(() => {
+    frameModalRowIndexRef.current = frameModalRowIndex;
+  }, [frameModalRowIndex]);
+
+  useEffect(() => {
+    if (!projectId) {
+      setFrameFirstImageMap({});
+      setFrameLastImageMap({});
+      setFrameAppliedMap({});
+      return;
+    }
+    try {
+      const raw = localStorage.getItem(getFrameStateStorageKey(projectId));
+      if (!raw) {
+        setFrameFirstImageMap({});
+        setFrameLastImageMap({});
+        setFrameAppliedMap({});
+        return;
+      }
+      const parsed = JSON.parse(raw) as PersistedFrameState;
+      setFrameFirstImageMap(parsed.firstImageMap || {});
+      setFrameLastImageMap(parsed.lastImageMap || {});
+      setFrameAppliedMap(parsed.appliedMap || {});
+    } catch {
+      setFrameFirstImageMap({});
+      setFrameLastImageMap({});
+      setFrameAppliedMap({});
+    }
+  }, [projectId]);
+
+  useEffect(() => {
+    if (!projectId) return;
+    const payload: PersistedFrameState = {
+      firstImageMap: frameFirstImageMap,
+      lastImageMap: frameLastImageMap,
+      appliedMap: frameAppliedMap,
+    };
+    try {
+      localStorage.setItem(getFrameStateStorageKey(projectId), JSON.stringify(payload));
+    } catch {}
+  }, [projectId, frameFirstImageMap, frameLastImageMap, frameAppliedMap]);
+
   // Parse markdown content into blocks
+  const stripThinkingContent = useCallback((markdown: string) => {
+    const source = String(markdown || "");
+    let cleaned = source.replace(/<think>[\s\S]*?<\/think>/gi, "");
+    if (/<think>/i.test(cleaned) && !/<\/think>/i.test(cleaned)) {
+      const thinkStart = cleaned.search(/<think>/i);
+      const tail = cleaned.slice(thinkStart);
+      const firstContentOffset = tail.search(/^\s*(\|.+\||###\s+.+)$/m);
+      if (thinkStart >= 0) {
+        if (firstContentOffset >= 0) {
+          cleaned = `${cleaned.slice(0, thinkStart)}${tail.slice(firstContentOffset)}`;
+        } else {
+          cleaned = cleaned.slice(0, thinkStart);
+        }
+      }
+    }
+    return cleaned.replace(/<\/?think>/gi, "").trim();
+  }, []);
+
   const parseMarkdown = useCallback((markdown: string): Block[] => {
-    const lines = markdown.split('\n');
+    const sanitizedMarkdown = stripThinkingContent(markdown);
+    const lines = sanitizedMarkdown.split('\n');
     const newBlocks: Block[] = [];
     let currentTextLines: string[] = [];
     let currentTableLines: string[] = [];
@@ -278,35 +497,93 @@ export function ScriptEditor({
     }
 
     return newBlocks;
-  }, []);
+  }, [stripThinkingContent]);
 
   const parseTableBlock = (lines: string[]): Block => {
-    // lines[0]: header, lines[1]: separator, lines[2+]: rows
     const headerLine = lines[0];
     const rowLines = lines.slice(2);
 
-    const cleanSplit = (line: string) => {
-      // Split by pipe but handle escaped pipes
-      const placeholder = "___PIPE___";
-      const protectedLine = line.replace(/\\\|/g, placeholder);
-      const parts = protectedLine.split('|').map(p => p.replace(new RegExp(placeholder, 'g'), '|'));
-      
-      // Markdown tables have empty first/last elements if lines start/end with |
-      if (parts.length > 0 && parts[0].trim() === '') parts.shift();
-      if (parts.length > 0 && parts[parts.length - 1].trim() === '') parts.pop();
-      return parts; 
+    const splitTableLine = (line: string) => {
+      const parts: string[] = [];
+      let current = "";
+      let bracketDepth = 0;
+      let escaped = false;
+
+      for (let i = 0; i < line.length; i++) {
+        const ch = line[i];
+        if (escaped) {
+          current += ch;
+          escaped = false;
+          continue;
+        }
+        if (ch === "\\") {
+          escaped = true;
+          current += ch;
+          continue;
+        }
+        if (ch === "[") {
+          bracketDepth += 1;
+          current += ch;
+          continue;
+        }
+        if (ch === "]") {
+          bracketDepth = Math.max(0, bracketDepth - 1);
+          current += ch;
+          continue;
+        }
+        if (ch === "|" && bracketDepth === 0) {
+          parts.push(current);
+          current = "";
+          continue;
+        }
+        current += ch;
+      }
+      parts.push(current);
+      if (parts.length > 0 && parts[0].trim() === "") parts.shift();
+      if (parts.length > 0 && parts[parts.length - 1].trim() === "") parts.pop();
+      return parts;
     };
 
-    const headers = cleanSplit(headerLine).map(h => h.trim());
-    const rows = rowLines.map(line => cleanSplit(line).map(c => c.trim().replace(/<br\s*\/?>/gi, '\n')));
-    const klingIndex = headers.indexOf(KLING_COLUMN);
+    const normalizeRowByHeaders = (rawCells: string[], headers: string[]) => {
+      const expectedCount = headers.length;
+      if (expectedCount <= 0) return rawCells;
+      if (rawCells.length === expectedCount) return rawCells;
+      const normalizedHeaders = headers.map((header) => header.replace(/\s+/g, ""));
+      const timelineFirst = normalizedHeaders[0]?.includes("时间轴") || normalizedHeaders[0]?.includes("时长");
+      const anchorCount = timelineFirst && expectedCount > 1 ? 2 : 1;
+      const normalized = Array.from({ length: expectedCount }, () => "");
+
+      for (let i = 0; i < anchorCount; i++) {
+        normalized[i] = rawCells[i] ?? "";
+      }
+
+      const rightColumnCount = expectedCount - anchorCount;
+      const rightRawStart = Math.max(anchorCount, rawCells.length - rightColumnCount);
+
+      for (let headerIndex = expectedCount - 1, rawIndex = rawCells.length - 1; headerIndex >= anchorCount && rawIndex >= rightRawStart; headerIndex--, rawIndex--) {
+        normalized[headerIndex] = rawCells[rawIndex] ?? "";
+      }
+
+      if (rightRawStart > anchorCount) {
+        normalized[anchorCount] = rawCells.slice(anchorCount, rightRawStart).join(" | ");
+      }
+      return normalized;
+    };
+
+    const headers = splitTableLine(headerLine).map((header) => header.trim());
+    const rows = rowLines.map((line) => {
+      const cells = splitTableLine(line).map((cell) => cell.trim().replace(/<br\s*\/?>/gi, "\n"));
+      return normalizeRowByHeaders(cells, headers);
+    });
+    const klingIndex = headers.findIndex((header) => isKlingColumnHeader(header));
     if (klingIndex < 0) {
       headers.push(KLING_COLUMN);
-      rows.forEach((row) => row.push(KLING_DEFAULT_SPEC));
+      rows.forEach((row) => row.push(""));
     } else {
+      headers[klingIndex] = KLING_COLUMN;
       rows.forEach((row) => {
         if (!row[klingIndex]) {
-          row[klingIndex] = KLING_DEFAULT_SPEC;
+          row[klingIndex] = "";
         }
       });
     }
@@ -316,7 +593,13 @@ export function ScriptEditor({
 
   const getColumnWidthClass = (header: string) => {
     const text = header.replace(/\s+/g, '');
-    if (text === KLING_COLUMN) return 'min-w-[300px] w-[300px]';
+    if (isKlingColumnHeader(text)) return 'min-w-[160px] w-[160px]';
+    if (text.includes('时间轴') || text.includes('时长')) return 'w-[170px] min-w-[170px]';
+    if (text.includes('镜头调度与内容融合')) return 'w-[320px] min-w-[320px]';
+    if (text.includes('画面描述')) return 'w-[220px] min-w-[220px]';
+    if (text.includes('角色形象') || text === '形象') return 'w-[180px] min-w-[180px]';
+    if (text.includes('道具') || text.includes('场景')) return 'w-[180px] min-w-[180px]';
+    if (text.includes('备注')) return 'w-[160px] min-w-[160px]';
     if (text.includes('集数') || text.includes('时长')) return 'w-[80px] min-w-[80px]';
     if (text.includes('场景') || text.includes('人物') || text.includes('角色')) return 'w-[150px] min-w-[150px]';
     if (text.includes('剧情') || text.includes('内容') || text.includes('台词') || text.includes('画面')) return 'min-w-[400px]';
@@ -338,7 +621,10 @@ export function ScriptEditor({
         // For now just simple joining
         const headerLine = `| ${headers.join(' | ')} |`;
         const separatorLine = `| ${headers.map(() => '---').join(' | ')} |`;
-        const rowLines = rows.map(row => `| ${row.map(c => c.replace(/\n/g, '<br>')).join(' | ')} |`);
+        const rowLines = rows.map((row) => {
+          const escaped = row.map((cell) => cell.replace(/\|/g, "\\|").replace(/\n/g, "<br>"));
+          return `| ${escaped.join(' | ')} |`;
+        });
         
         return [headerLine, separatorLine, ...rowLines].join('\n');
       }
@@ -389,16 +675,41 @@ export function ScriptEditor({
     }));
   };
 
-  const openVoiceModal = (blockIndex: number, rowIndex: number, colIndex: number, initialText: string) => {
-    const initialSegmentId = `voice-segment-${Date.now()}`;
-    setVoiceModal({ blockIndex, rowIndex, colIndex });
+  const makeDialogueCellKey = (rowIndex: number, colIndex: number) => `${rowIndex}:${colIndex}`;
+
+  const openVoiceModal = (blockIndex: number, rowIndex: number, colIndex: number, globalRowIndex: number, initialText: string) => {
+    const cellKey = makeDialogueCellKey(rowIndex, colIndex);
+    const existingSegments = dialogueCellAudioMap[cellKey] || [];
+    const restoredSegments = existingSegments.map((item, index) => ({
+      id: `voice-segment-restored-${Date.now()}-${index}-${Math.random().toString(36).slice(2, 8)}`,
+      text: item.text,
+    }));
+    const initialSegmentId = restoredSegments[0]?.id || `voice-segment-${Date.now()}`;
+    const initialVoiceSegments = restoredSegments.length > 0 ? restoredSegments : [{ id: initialSegmentId, text: "" }];
+    const restoredAudioMap: Record<string, string> = {};
+    restoredSegments.forEach((segment, index) => {
+      const audioUrl = existingSegments[index]?.audioUrl;
+      if (audioUrl) restoredAudioMap[segment.id] = audioUrl;
+    });
+    setVoiceModal({ blockIndex, rowIndex, colIndex, globalRowIndex });
     setVoiceSourceText(initialText);
-    setVoiceSegments([{ id: initialSegmentId, text: "" }]);
+    setVoiceSegments(initialVoiceSegments);
     setActiveVoiceSegmentId(initialSegmentId);
-    setVoiceVolume(0);
     setVoiceSpeed(1);
-    setVoicePitch(0);
-    setVoiceSegmentAudioMap({});
+    setVoiceStability(0.45);
+    setVoiceSimilarityBoost(0.8);
+    setVoiceStyle(0.35);
+    setVoiceUseSpeakerBoost(true);
+    setVoiceModelId("eleven_v3");
+    setVoiceOutputFormat("mp3_44100_128");
+    setVoiceLanguageCode("");
+    setVoiceSeed("");
+    setVoicePreviousText("");
+    setVoiceNextText("");
+    setVoicePronunciationRules([{ id: "default-0", source: "", target: "" }]);
+    setVoicePronunciationDictId("");
+    setVoicePronunciationDictVersion("");
+    setVoiceSegmentAudioMap(restoredAudioMap);
     setVoiceError("");
     setVoiceSelection({ start: 0, end: 0, text: "" });
     setVoiceTagGroupKey("basic");
@@ -413,6 +724,19 @@ export function ScriptEditor({
   const closeVoiceModal = () => {
     setVoiceModal(null);
     setVoiceGeneratingSegmentId(null);
+  };
+
+  const playDialogueAudio = (audioUrl: string) => {
+    if (!audioUrl) return;
+    try {
+      if (previewAudioRef.current) {
+        previewAudioRef.current.pause();
+        previewAudioRef.current.currentTime = 0;
+      }
+      const audio = new Audio(audioUrl);
+      previewAudioRef.current = audio;
+      void audio.play();
+    } catch {}
   };
 
   const syncVoiceSelection = useCallback((segmentId: string) => {
@@ -581,10 +905,38 @@ export function ScriptEditor({
     });
   };
 
+  const addPronunciationRule = () => {
+    setVoicePronunciationRules((prev) => [
+      ...prev,
+      { id: `pron-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`, source: "", target: "" },
+    ]);
+  };
+
+  const updatePronunciationRule = (id: string, key: "source" | "target", value: string) => {
+    setVoicePronunciationRules((prev) => prev.map((item) => (item.id === id ? { ...item, [key]: value } : item)));
+  };
+
+  const removePronunciationRule = (id: string) => {
+    setVoicePronunciationRules((prev) => (prev.length <= 1 ? prev : prev.filter((item) => item.id !== id)));
+  };
+
   const applyVoiceTextToCell = () => {
     if (!voiceModal) return;
-    if (!combinedVoiceText) return;
-    updateTable(voiceModal.blockIndex, voiceModal.rowIndex, voiceModal.colIndex, combinedVoiceText);
+    const appliedSegments = voiceSegments
+      .map((item) => ({
+        text: item.text.trim(),
+        audioUrl: voiceSegmentAudioMap[item.id] || "",
+      }))
+      .filter((item) => item.text);
+    if (appliedSegments.length === 0) return;
+    const cellKey = makeDialogueCellKey(voiceModal.rowIndex, voiceModal.colIndex);
+    const nextDialogueCellAudioMap = {
+      ...dialogueCellAudioMap,
+      [cellKey]: appliedSegments,
+    };
+    setDialogueCellAudioMap(nextDialogueCellAudioMap);
+    onDialogueCellAudioMapChange?.(nextDialogueCellAudioMap);
+    closeVoiceModal();
   };
 
   const generateVoiceForSegment = async (segmentId: string) => {
@@ -599,14 +951,42 @@ export function ScriptEditor({
     setVoiceGeneratingSegmentId(segmentId);
     setVoiceError("");
     try {
+      const pronunciationOverrides = voicePronunciationRules
+        .map((item) => ({ source: item.source.trim(), target: item.target.trim() }))
+        .filter((item) => item.source && item.target);
+      const pronunciationDictionaryLocators =
+        voicePronunciationDictId.trim() && voicePronunciationDictVersion.trim()
+          ? [
+              {
+                pronunciation_dictionary_id: voicePronunciationDictId.trim(),
+                version_id: voicePronunciationDictVersion.trim(),
+              },
+            ]
+          : [];
+      const parsedSeed = Number(voiceSeed);
       const result = await generateTTS(token, projectId, {
         character_name: voiceCharacter,
         text: ttsText,
         speed: voiceSpeed,
-        volume: voiceVolume,
-        pitch: voicePitch,
+        tts_config: {
+          model_id: voiceModelId,
+          output_format: voiceOutputFormat,
+          language_code: voiceLanguageCode || undefined,
+          seed: Number.isInteger(parsedSeed) ? parsedSeed : undefined,
+          previous_text: voicePreviousText.trim() || undefined,
+          next_text: voiceNextText.trim() || undefined,
+          settings: {
+            stability: voiceStability,
+            similarity_boost: voiceSimilarityBoost,
+            style: voiceStyle,
+            speed: voiceSpeed,
+            use_speaker_boost: voiceUseSpeakerBoost,
+          },
+          pronunciation_overrides: pronunciationOverrides,
+          pronunciation_dictionary_locators: pronunciationDictionaryLocators,
+        },
       });
-      const apiBase = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://localhost:8002/api";
+      const apiBase = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://localhost:3000/api";
       const backendBase = apiBase.endsWith("/api") ? apiBase.slice(0, -4) : apiBase;
       const fullUrl = result.audio_url.startsWith("http") ? result.audio_url : `${backendBase}${result.audio_url}`;
       setVoiceSegmentAudioMap((prev) => ({
@@ -617,6 +997,267 @@ export function ScriptEditor({
       setVoiceError(error instanceof Error ? error.message : "生成配音失败");
     } finally {
       setVoiceGeneratingSegmentId(null);
+    }
+  };
+
+  const resolveAssetImageUrl = useCallback((asset: Asset) => {
+    const versions = asset.versions || [];
+    const isRemotePublicUrl = (raw: string) => {
+      const url = String(raw || "").trim();
+      if (!(url.startsWith("http://") || url.startsWith("https://"))) return false;
+      if (
+        url.includes("/static/") &&
+        (url.includes("localhost") || url.includes("127.0.0.1") || url.includes(":8003"))
+      ) {
+        return false;
+      }
+      return true;
+    };
+    const selectedRemote = versions.find(
+      (version) => version.is_selected && isRemotePublicUrl(version.image_url || "")
+    );
+    if (selectedRemote?.image_url) return String(selectedRemote.image_url).trim();
+    const latestRemote = [...versions]
+      .reverse()
+      .find((version) => isRemotePublicUrl(version.image_url || ""));
+    if (latestRemote?.image_url) return String(latestRemote.image_url).trim();
+    const selectedAny = versions.find((version) => version.is_selected && version.image_url);
+    if (selectedAny?.image_url) return String(selectedAny.image_url).trim();
+    const fallbackAny = versions.find((version) => Boolean(version.image_url));
+    return String(fallbackAny?.image_url || "").trim();
+  }, []);
+
+  const resolveAssetType = useCallback((asset: Asset): FrameMaterialTab | null => {
+    const typeText = String(asset.type || "").toLowerCase();
+    if (typeText.includes("character") || typeText.includes("角色")) return "character";
+    if (typeText.includes("prop") || typeText.includes("道具")) return "prop";
+    if (typeText.includes("scene") || typeText.includes("场景")) return "scene";
+    return null;
+  }, []);
+
+  const materialAssetsByTab = useMemo(() => {
+    const initial: Record<FrameMaterialTab, Array<{ asset: Asset; imageUrl: string }>> = {
+      character: [],
+      prop: [],
+      scene: [],
+    };
+    projectAssets.forEach((asset) => {
+      const tab = resolveAssetType(asset);
+      if (!tab) return;
+      const imageUrl = resolveAssetImageUrl(asset);
+      if (!imageUrl) return;
+      initial[tab].push({ asset, imageUrl });
+    });
+    return initial;
+  }, [projectAssets, resolveAssetImageUrl, resolveAssetType]);
+
+  const frameReferenceOptionMap = useMemo(() => {
+    const map: Record<string, FrameReference> = {};
+    (Object.values(materialAssetsByTab).flat() || []).forEach(({ asset, imageUrl }) => {
+      map[asset.id] = { assetId: asset.id, name: asset.name, imageUrl };
+    });
+    return map;
+  }, [materialAssetsByTab]);
+
+  const syncFrameEditorState = useCallback(() => {
+    const editor = frameEditorRef.current;
+    if (!editor) return;
+    const tokenNodes = Array.from(editor.querySelectorAll("span[data-frame-ref='1']")) as HTMLSpanElement[];
+    const refs: FrameReference[] = [];
+    tokenNodes.forEach((node) => {
+      const refId = String(node.dataset.refId || "").trim();
+      if (!refId) return;
+      const mapped = frameReferenceOptionMap[refId];
+      if (mapped) {
+        refs.push(mapped);
+      } else {
+        const refName = String(node.dataset.refName || "").trim();
+        const refUrl = String(node.dataset.refUrl || "").trim();
+        if (refName && refUrl) refs.push({ assetId: refId, name: refName, imageUrl: refUrl });
+      }
+    });
+    const prompt = String(editor.textContent || "").replace(/\u00a0/g, " ").trim();
+    setFrameReferences(refs);
+    setFramePromptInput(prompt);
+  }, [frameReferenceOptionMap]);
+
+  const openFrameModal = (globalRowIndex: number) => {
+    setFrameModalRowIndex(globalRowIndex);
+    setFrameModalTab("character");
+    setFrameGenerateTab("first");
+    setFramePromptInput("");
+    setFrameReferences([]);
+    setFrameError("");
+    window.setTimeout(() => {
+      if (frameEditorRef.current) {
+        frameEditorRef.current.innerHTML = "";
+      }
+    }, 0);
+  };
+
+  const insertFrameReferenceToken = useCallback((ref: FrameReference) => {
+    const editor = frameEditorRef.current;
+    if (!editor) return;
+    editor.focus();
+    const token = document.createElement("span");
+    token.dataset.frameRef = "1";
+    token.dataset.refId = ref.assetId;
+    token.dataset.refName = ref.name;
+    token.dataset.refUrl = ref.imageUrl;
+    token.contentEditable = "false";
+    token.className = "mx-1 inline-flex rounded bg-blue-100 px-2 py-0.5 text-xs text-blue-700 align-middle";
+    token.textContent = ref.name;
+    const space = document.createTextNode(" ");
+    const selection = window.getSelection();
+    if (selection && selection.rangeCount > 0 && editor.contains(selection.anchorNode)) {
+      const range = selection.getRangeAt(0);
+      range.deleteContents();
+      range.insertNode(space);
+      range.insertNode(token);
+      range.setStartAfter(space);
+      range.collapse(true);
+      selection.removeAllRanges();
+      selection.addRange(range);
+    } else {
+      editor.appendChild(token);
+      editor.appendChild(space);
+    }
+    syncFrameEditorState();
+  }, [syncFrameEditorState]);
+
+  const toggleFrameReference = (assetId: string, name: string, imageUrl: string) => {
+    insertFrameReferenceToken({ assetId, name, imageUrl });
+  };
+
+  const generateFrameImage = async (frameType: "first" | "last") => {
+    if (!projectId || frameModalRowIndex === null) return;
+    const rowIndex = frameModalRowIndex;
+    const token = getToken();
+    if (!token) return;
+    const prompt = framePromptInput.trim();
+    if (!prompt) {
+      setFrameError("请输入提示词");
+      return;
+    }
+    setFrameGeneratingType(frameType);
+    setFrameError("");
+    try {
+      const references = Array.from(new Set(frameReferences.map((item) => item.imageUrl))).filter(Boolean);
+      const result = await generateSegmentFrameImage(token, projectId, {
+        prompt,
+        references,
+        frame_type: frameType,
+        aspect_ratio: "16:9",
+      });
+      const generated = String(result.image_url || "").trim();
+      if (!generated) {
+        setFrameError("未返回图片地址");
+        return;
+      }
+      if (frameType === "first") {
+        setFrameFirstImageMap((prev) => {
+          const list = prev[rowIndex] || [];
+          return { ...prev, [rowIndex]: [generated, ...list] };
+        });
+      } else {
+        setFrameLastImageMap((prev) => {
+          const list = prev[rowIndex] || [];
+          return { ...prev, [rowIndex]: [generated, ...list] };
+        });
+      }
+    } catch (error) {
+      if (frameModalRowIndexRef.current === rowIndex) {
+        setFrameError(error instanceof Error ? error.message : "生成失败");
+      }
+    } finally {
+      setFrameGeneratingType(null);
+    }
+  };
+
+  const applyFrameForRow = (rowIndex: number, frameType: "first" | "last", imageUrl: string) => {
+    setFrameAppliedMap((prev) => {
+      const current = prev[rowIndex] || {};
+      const currentValue = frameType === "first" ? current.first : current.last;
+      const nextValue = currentValue === imageUrl ? undefined : imageUrl;
+      return {
+        ...prev,
+        [rowIndex]:
+          frameType === "first"
+            ? { ...current, first: nextValue }
+            : { ...current, last: nextValue },
+      };
+    });
+  };
+
+  const closeFrameModalAndApply = () => {
+    setFrameModalRowIndex(null);
+    setFramePromptInput("");
+    setFrameReferences([]);
+    setFrameError("");
+    setFrameEditTarget(null);
+    setFrameEditInput("");
+    setFrameEditing(false);
+    if (frameEditorRef.current) {
+      frameEditorRef.current.innerHTML = "";
+    }
+  };
+
+  const startFrameEdit = (frameType: "first" | "last", imageUrl: string) => {
+    setFrameEditTarget({ frameType, imageUrl });
+    setFrameEditInput("");
+    setFrameError("");
+  };
+
+  const submitFrameEdit = async () => {
+    if (!projectId || frameModalRowIndex === null || !frameEditTarget) return;
+    const rowIndex = frameModalRowIndex;
+    const editTarget = frameEditTarget;
+    const basePrompt = framePromptInput.trim();
+    const extraRefs = frameReferences.map((item) => item.imageUrl);
+    const token = getToken();
+    if (!token) return;
+    const editPrompt = frameEditInput.trim();
+    if (!editPrompt) {
+      setFrameError("请输入修改意见");
+      return;
+    }
+    setFrameEditing(true);
+    setFrameError("");
+    try {
+      const references = Array.from(new Set([editTarget.imageUrl, ...extraRefs])).filter(Boolean);
+      const mergedPrompt = `${basePrompt}\n修改意见：${editPrompt}`.trim();
+      const result = await generateSegmentFrameImage(token, projectId, {
+        prompt: mergedPrompt,
+        references,
+        frame_type: editTarget.frameType,
+        aspect_ratio: "16:9",
+      });
+      const generated = String(result.image_url || "").trim();
+      if (!generated) {
+        setFrameError("未返回图片地址");
+        return;
+      }
+      if (editTarget.frameType === "first") {
+        setFrameFirstImageMap((prev) => {
+          const list = prev[rowIndex] || [];
+          return { ...prev, [rowIndex]: [generated, ...list] };
+        });
+      } else {
+        setFrameLastImageMap((prev) => {
+          const list = prev[rowIndex] || [];
+          return { ...prev, [rowIndex]: [generated, ...list] };
+        });
+      }
+      if (frameModalRowIndexRef.current === rowIndex) {
+        setFrameEditTarget(null);
+        setFrameEditInput("");
+      }
+    } catch (error) {
+      if (frameModalRowIndexRef.current === rowIndex) {
+        setFrameError(error instanceof Error ? error.message : "修改失败");
+      }
+    } finally {
+      setFrameEditing(false);
     }
   };
 
@@ -657,69 +1298,166 @@ export function ScriptEditor({
                     <tr key={rowIndex} className="hover:bg-slate-50 group">
                       {block.headers.map((header, colIndex) => {
                         const normalizedHeader = header.replace(/\s+/g, '');
-                        const isKlingColumn = normalizedHeader === KLING_COLUMN;
+                        const isKlingColumn = isKlingColumnHeader(normalizedHeader);
                         const cell = row[colIndex] || '';
                         const globalRowIndex = blockRowBase + rowIndex;
+                        const isPending = Boolean(pendingRowIndexSet?.has(globalRowIndex));
+                        const rowVideoUrl = rowVideoUrlMap?.[globalRowIndex] || "";
+                        const rowVersions = rowVersionListMap?.[globalRowIndex] || [];
+                        const completedVersions = rowVersions.filter((version) => isCompletedVideoVersion(version));
+                        const completedVersionsForDisplay = [...completedVersions].reverse();
+                        const previousRow = rowIndex > 0 ? block.rows[rowIndex - 1] : null;
+                        const canUsePreviousEndFrame = Boolean(previousRow);
+                        const defaultUsePreviousEndFrame = isSameSceneAsPreviousRow(block.headers, row, previousRow);
+                        const usePreviousEndFrame = Object.prototype.hasOwnProperty.call(usePreviousEndFrameMap, globalRowIndex)
+                          ? Boolean(usePreviousEndFrameMap[globalRowIndex])
+                          : defaultUsePreviousEndFrame;
+                        const selectedVersionId = rowSelectedVersionIdMap?.[globalRowIndex] || "";
+                        const hasSelectedCompletedVersion = completedVersionsForDisplay.some((version) => version.id === selectedVersionId);
+                        const effectiveSelectedVersionId = hasSelectedCompletedVersion
+                          ? selectedVersionId
+                          : (completedVersions[0]?.id || "");
+                        const currentVersionDeleteKey = `${globalRowIndex}:${effectiveSelectedVersionId}`;
+                        const currentVersionDownloadKey = `${globalRowIndex}:${effectiveSelectedVersionId || "default"}`;
+                        const isDeletingVersion = deletingVersionKey === currentVersionDeleteKey;
+                        const isDownloadingVersion = downloadingVideoKey === currentVersionDownloadKey;
+                        const selectedVersion = completedVersions.find((version) => version.id === effectiveSelectedVersionId);
+                        const previewUrl = selectedVersion?.video_url || rowVideoUrl;
+                        const versionIndex = completedVersionsForDisplay.findIndex((version) => version.id === effectiveSelectedVersionId);
+                        const downloadFilename = `分镜${globalRowIndex + 1}-${versionIndex >= 0 ? `版本${versionIndex + 1}` : "当前版本"}.mp4`;
                         const normalized = header.replace(/\s+/g, '');
-                        const isDialogueColumn = normalized.includes('内容') || normalized.includes('台词');
+                        const appliedFrames = frameAppliedMap[globalRowIndex] || {};
                         return (
                           <td 
                             key={colIndex} 
-                            className={`px-4 py-3 min-w-[150px] relative align-top ${getColumnWidthClass(header)}`}
+                            className={`px-4 py-3 relative align-top ${getColumnWidthClass(header)}`}
                           >
-                            {isDialogueColumn && !isKlingColumn ? (
-                              <button
-                                onClick={(event) => {
-                                  event.stopPropagation();
-                                  openVoiceModal(index, rowIndex, colIndex, cell);
-                                }}
-                                className="absolute right-2 top-2 rounded-md border border-indigo-200 bg-white px-2 py-1 text-[11px] text-indigo-700 hover:bg-indigo-50"
-                              >
-                                生成配音
-                              </button>
-                            ) : null}
                             {isKlingColumn ? (
                               <div className="flex flex-col items-center gap-2">
-                                <select
-                                  value={cell || KLING_DEFAULT_SPEC}
-                                  onChange={(event) => updateTable(index, rowIndex, colIndex, event.target.value)}
-                                  className="w-full rounded border border-slate-200 px-2 py-1 text-xs"
-                                >
-                                  {KLING_SPEC_OPTIONS.map((option) => (
-                                    <option key={option.value} value={option.value}>
-                                      {option.label}
-                                    </option>
-                                  ))}
-                                </select>
                                 <button
                                   onClick={() =>
                                     onGenerateKlingRow?.({
                                       globalRowIndex,
+                                      previousGlobalRowIndex: previousRow ? globalRowIndex - 1 : undefined,
                                       headers: block.headers,
                                       row: block.headers.map((_, i) => row[i] || ""),
-                                      spec: cell || KLING_DEFAULT_SPEC,
+                                      usePreviousSegmentEndFrame: canUsePreviousEndFrame ? usePreviousEndFrame : false,
+                                      customFirstFrameUrl: appliedFrames.first,
+                                      customLastFrameUrl: appliedFrames.last,
                                     })
                                   }
-                                  disabled={generatingGlobalRowIndex === globalRowIndex}
+                                  disabled={generatingGlobalRowIndex === globalRowIndex || isPending}
                                   className={`rounded px-3 py-1 text-xs text-white ${
-                                    generatingGlobalRowIndex === globalRowIndex
+                                    generatingGlobalRowIndex === globalRowIndex || isPending
                                       ? "bg-slate-400"
                                       : "bg-blue-600 hover:bg-blue-700"
                                   }`}
                                 >
-                                  {generatingGlobalRowIndex === globalRowIndex ? "生成中..." : "Kling生成"}
+                                  {generatingGlobalRowIndex === globalRowIndex || isPending ? "生成中" : "生成视频"}
                                 </button>
-                                {generatedRowIndexSet?.has(globalRowIndex) ? (
+                                <label className={`flex items-center gap-1 text-[11px] ${canUsePreviousEndFrame ? "text-slate-600" : "text-slate-300"}`}>
+                                  <input
+                                    type="checkbox"
+                                    checked={canUsePreviousEndFrame ? usePreviousEndFrame : false}
+                                    disabled={!canUsePreviousEndFrame}
+                                    onChange={(event) => {
+                                      const checked = event.target.checked;
+                                      setUsePreviousEndFrameMap((prev) => ({ ...prev, [globalRowIndex]: checked }));
+                                    }}
+                                  />
+                                  使用前一条分镜频尾帧
+                                </label>
+                                <button
+                                  type="button"
+                                  onClick={() => openFrameModal(globalRowIndex)}
+                                  className="rounded border border-blue-200 px-3 py-1 text-xs text-blue-700 hover:bg-blue-50"
+                                >
+                                  自定义首尾帧
+                                </button>
+                                {(appliedFrames.first || appliedFrames.last) ? (
+                                  <div className="flex items-center gap-2">
+                                    {appliedFrames.first ? (
+                                      <button
+                                        type="button"
+                                        onClick={() => setPreviewFrameUrl(appliedFrames.first || null)}
+                                        className="rounded border border-cyan-200 px-2 py-1 text-[11px] text-cyan-700 hover:bg-cyan-50"
+                                      >
+                                        首帧预览
+                                      </button>
+                                    ) : null}
+                                    {appliedFrames.last ? (
+                                      <button
+                                        type="button"
+                                        onClick={() => setPreviewFrameUrl(appliedFrames.last || null)}
+                                        className="rounded border border-fuchsia-200 px-2 py-1 text-[11px] text-fuchsia-700 hover:bg-fuchsia-50"
+                                      >
+                                        尾帧预览
+                                      </button>
+                                    ) : null}
+                                  </div>
+                                ) : null}
+                                {!isPending && generatedRowIndexSet?.has(globalRowIndex) ? (
                                   <span className="text-xs text-green-600">已生成</span>
+                                ) : null}
+                                {completedVersions.length > 0 ? (
+                                  <div className="flex w-full items-center gap-1">
+                                    {completedVersionsForDisplay.length > 1 ? (
+                                      <select
+                                        value={effectiveSelectedVersionId}
+                                        onChange={(event) => onSelectKlingVersion?.(globalRowIndex, event.target.value)}
+                                        disabled={isDeletingVersion}
+                                        className="min-w-0 flex-1 rounded border border-slate-200 px-2 py-1 text-[11px] text-slate-700 disabled:opacity-50"
+                                      >
+                                        {completedVersionsForDisplay.map((version, versionIndex) => (
+                                          <option key={version.id} value={version.id}>
+                                            {`版本${versionIndex + 1}${version.id === effectiveSelectedVersionId ? "（当前）" : ""}`}
+                                          </option>
+                                        ))}
+                                      </select>
+                                    ) : (
+                                      <div className="min-w-0 flex-1 rounded border border-slate-200 px-2 py-1 text-[11px] text-slate-500">
+                                        版本1（当前）
+                                      </div>
+                                    )}
+                                    <button
+                                      type="button"
+                                      onClick={() => onDeleteKlingVersion?.(globalRowIndex, effectiveSelectedVersionId)}
+                                      disabled={!effectiveSelectedVersionId || isDeletingVersion}
+                                      className="rounded border border-rose-200 px-2 py-1 text-[11px] text-rose-600 hover:bg-rose-50 disabled:opacity-50"
+                                    >
+                                      {isDeletingVersion ? "删除中..." : "删除"}
+                                    </button>
+                                  </div>
+                                ) : null}
+                                {previewUrl ? (
+                                  <div className="flex items-center gap-2">
+                                    <button
+                                      onClick={() => setPreviewVideoUrl(previewUrl)}
+                                      className="rounded border border-green-300 px-3 py-1 text-xs text-green-700 hover:bg-green-50"
+                                    >
+                                      播放视频
+                                    </button>
+                                    <button
+                                      type="button"
+                                      onClick={() => downloadVideo(previewUrl, downloadFilename, currentVersionDownloadKey)}
+                                      disabled={isDownloadingVersion}
+                                      className="rounded border border-indigo-300 px-3 py-1 text-xs text-indigo-700 hover:bg-indigo-50 disabled:opacity-50"
+                                    >
+                                      {isDownloadingVersion ? "下载中..." : "下载视频"}
+                                    </button>
+                                  </div>
                                 ) : null}
                               </div>
                             ) : (
-                              <TableCell
-                                value={cell}
-                                onChange={(v) => updateTable(index, rowIndex, colIndex, v)}
-                                projectId={projectId}
-                                projectAssets={projectAssets}
-                              />
+                              <div className="space-y-2">
+                                <TableCell
+                                  value={cell}
+                                  onChange={(v) => updateTable(index, rowIndex, colIndex, v)}
+                                  projectId={projectId}
+                                  projectAssets={projectAssets}
+                                  columnHeader={header}
+                                />
+                              </div>
                             )}
                           </td>
                         );
@@ -734,6 +1472,285 @@ export function ScriptEditor({
       });
       })()}
     </div>
+    {previewVideoUrl ? (
+      <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-6">
+        <div className="w-full max-w-4xl rounded-xl bg-white p-4 shadow-2xl">
+          <div className="mb-3 flex items-center justify-between">
+            <div className="text-sm font-medium text-slate-700">视频预览</div>
+            <button
+              onClick={() => setPreviewVideoUrl(null)}
+              className="rounded-md border border-slate-200 px-3 py-1 text-xs text-slate-600 hover:bg-slate-50"
+            >
+              关闭
+            </button>
+          </div>
+          <video
+            src={previewVideoUrl}
+            controls
+            autoPlay
+            className="h-auto max-h-[75vh] w-full rounded-lg bg-black"
+          />
+        </div>
+      </div>
+    ) : null}
+    {previewFrameUrl ? (
+      <div className="fixed inset-0 z-[80] flex items-center justify-center bg-black/70 p-6">
+        <div className="w-full max-w-2xl rounded-xl bg-white p-4 shadow-2xl">
+          <div className="mb-3 flex items-center justify-between">
+            <div className="text-sm font-medium text-slate-700">帧图预览</div>
+            <button
+              onClick={() => setPreviewFrameUrl(null)}
+              className="rounded-md border border-slate-200 px-3 py-1 text-xs text-slate-600 hover:bg-slate-50"
+            >
+              关闭
+            </button>
+          </div>
+          <img src={previewFrameUrl} alt="帧图预览" className="h-auto max-h-[75vh] w-full rounded-lg object-contain bg-slate-100" />
+        </div>
+      </div>
+    ) : null}
+    {frameModalRowIndex !== null ? (
+      <div className="fixed inset-0 z-50 overflow-y-auto bg-black/50 px-4 py-6">
+        <div className="mx-auto w-full max-w-6xl rounded-2xl border border-slate-200 bg-white shadow-xl">
+          <div className="sticky top-0 z-10 flex items-center justify-between border-b border-slate-100 bg-white px-5 py-4">
+            <div className="text-sm font-semibold text-slate-900">自定义首尾帧</div>
+            <button
+              onClick={closeFrameModalAndApply}
+              className="rounded-md px-2 py-1 text-xs text-slate-500 hover:bg-slate-100"
+            >
+              关闭
+            </button>
+          </div>
+          <div className="space-y-4 p-5">
+            <div className="flex items-center gap-2 border-b border-slate-100 pb-2">
+              <button
+                type="button"
+                onClick={() => setFrameModalTab("character")}
+                className={`rounded px-3 py-1 text-xs ${frameModalTab === "character" ? "bg-blue-600 text-white" : "border border-slate-200 text-slate-600"}`}
+              >
+                角色形象
+              </button>
+              <button
+                type="button"
+                onClick={() => setFrameModalTab("prop")}
+                className={`rounded px-3 py-1 text-xs ${frameModalTab === "prop" ? "bg-blue-600 text-white" : "border border-slate-200 text-slate-600"}`}
+              >
+                道具
+              </button>
+              <button
+                type="button"
+                onClick={() => setFrameModalTab("scene")}
+                className={`rounded px-3 py-1 text-xs ${frameModalTab === "scene" ? "bg-blue-600 text-white" : "border border-slate-200 text-slate-600"}`}
+              >
+                场景
+              </button>
+            </div>
+            <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
+              {(materialAssetsByTab[frameModalTab] || []).map(({ asset, imageUrl }) => {
+                const selected = frameReferences.some((item) => item.assetId === asset.id);
+                return (
+                  <button
+                    key={asset.id}
+                    type="button"
+                    onClick={() => toggleFrameReference(asset.id, asset.name, imageUrl)}
+                    className={`overflow-hidden rounded-lg border text-left ${selected ? "border-blue-500 ring-2 ring-blue-200" : "border-slate-200"}`}
+                  >
+                    <img src={imageUrl} alt={asset.name} className="h-24 w-full object-cover bg-slate-100" />
+                    <div className="truncate px-2 py-1 text-xs">{asset.name}</div>
+                  </button>
+                );
+              })}
+            </div>
+            <div className="space-y-2">
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() => setFrameGenerateTab("first")}
+                  className={`rounded px-3 py-1 text-xs ${frameGenerateTab === "first" ? "bg-emerald-600 text-white" : "border border-slate-200 text-slate-600"}`}
+                >
+                  首帧
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setFrameGenerateTab("last")}
+                  className={`rounded px-3 py-1 text-xs ${frameGenerateTab === "last" ? "bg-fuchsia-600 text-white" : "border border-slate-200 text-slate-600"}`}
+                >
+                  尾帧
+                </button>
+              </div>
+              <div className="relative min-h-[96px] w-full rounded-lg border border-slate-200 px-3 py-2">
+                <div
+                  ref={frameEditorRef}
+                  contentEditable
+                  suppressContentEditableWarning
+                  onInput={syncFrameEditorState}
+                  className="min-h-[80px] w-full whitespace-pre-wrap break-words text-sm outline-none"
+                />
+                {!framePromptInput && frameReferences.length === 0 ? (
+                  <span className="pointer-events-none absolute left-3 top-2 text-sm text-slate-400">
+                    输入首尾帧提示词
+                  </span>
+                ) : null}
+              </div>
+              <div className="flex items-center gap-2">
+                {frameGenerateTab === "first" ? (
+                  <button
+                    type="button"
+                    onClick={() => generateFrameImage("first")}
+                    disabled={frameGeneratingType !== null}
+                    className="rounded bg-emerald-600 px-3 py-1.5 text-xs text-white hover:bg-emerald-700 disabled:opacity-50"
+                  >
+                    {frameGeneratingType === "first" ? "生成中..." : "生成首帧"}
+                  </button>
+                ) : (
+                  <button
+                    type="button"
+                    onClick={() => generateFrameImage("last")}
+                    disabled={frameGeneratingType !== null}
+                    className="rounded bg-fuchsia-600 px-3 py-1.5 text-xs text-white hover:bg-fuchsia-700 disabled:opacity-50"
+                  >
+                    {frameGeneratingType === "last" ? "生成中..." : "生成尾帧"}
+                  </button>
+                )}
+                {frameError ? <span className="text-xs text-rose-600">{frameError}</span> : null}
+              </div>
+            </div>
+            <div className="space-y-2">
+              <div className="text-xs font-semibold text-slate-600">首帧展示区</div>
+              <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
+                {(frameFirstImageMap[frameModalRowIndex] || []).map((imageUrl) => {
+                  const applied = frameAppliedMap[frameModalRowIndex]?.first === imageUrl;
+                  const editing = frameEditTarget?.frameType === "first" && frameEditTarget?.imageUrl === imageUrl;
+                  return (
+                    <div key={`first-${imageUrl}`} className="overflow-hidden rounded-lg border border-slate-200">
+                      <img
+                        src={imageUrl}
+                        alt="首帧"
+                        onClick={() => setPreviewFrameUrl(imageUrl)}
+                        className="h-28 w-full cursor-zoom-in object-cover bg-slate-100"
+                      />
+                      <div className="flex items-center justify-end gap-2 p-2">
+                        <button
+                          type="button"
+                          onClick={() => applyFrameForRow(frameModalRowIndex, "first", imageUrl)}
+                          className={`rounded px-2 py-1 text-xs ${applied ? "bg-emerald-600 text-white" : "border border-emerald-300 text-emerald-700"}`}
+                        >
+                          {applied ? "已应用" : "应用"}
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => startFrameEdit("first", imageUrl)}
+                          className={`rounded px-2 py-1 text-xs ${editing ? "bg-indigo-600 text-white" : "border border-indigo-300 text-indigo-700"}`}
+                        >
+                          输入修改意见
+                        </button>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+              {frameEditTarget?.frameType === "first" ? (
+                <div className="rounded-lg border border-slate-200 bg-slate-50 p-3">
+                  <textarea
+                    value={frameEditInput}
+                    onChange={(event) => setFrameEditInput(event.target.value)}
+                    placeholder="输入对当前首帧图片的修改意见"
+                    className="h-20 w-full rounded border border-slate-200 bg-white px-3 py-2 text-sm outline-none"
+                  />
+                  <div className="mt-2 flex justify-end gap-2">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setFrameEditTarget(null);
+                        setFrameEditInput("");
+                      }}
+                      disabled={frameEditing}
+                      className="rounded border border-slate-300 bg-white px-3 py-1.5 text-xs text-slate-700 hover:bg-slate-50 disabled:opacity-50"
+                    >
+                      取消
+                    </button>
+                    <button
+                      type="button"
+                      onClick={submitFrameEdit}
+                      disabled={frameEditing}
+                      className="rounded bg-indigo-600 px-3 py-1.5 text-xs text-white hover:bg-indigo-700 disabled:opacity-50"
+                    >
+                      {frameEditing ? "修改中..." : "修改图片"}
+                    </button>
+                  </div>
+                </div>
+              ) : null}
+            </div>
+            <div className="space-y-2">
+              <div className="text-xs font-semibold text-slate-600">尾帧展示区</div>
+              <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
+                {(frameLastImageMap[frameModalRowIndex] || []).map((imageUrl) => {
+                  const applied = frameAppliedMap[frameModalRowIndex]?.last === imageUrl;
+                  const editing = frameEditTarget?.frameType === "last" && frameEditTarget?.imageUrl === imageUrl;
+                  return (
+                    <div key={`last-${imageUrl}`} className="overflow-hidden rounded-lg border border-slate-200">
+                      <img
+                        src={imageUrl}
+                        alt="尾帧"
+                        onClick={() => setPreviewFrameUrl(imageUrl)}
+                        className="h-28 w-full cursor-zoom-in object-cover bg-slate-100"
+                      />
+                      <div className="flex items-center justify-end gap-2 p-2">
+                        <button
+                          type="button"
+                          onClick={() => applyFrameForRow(frameModalRowIndex, "last", imageUrl)}
+                          className={`rounded px-2 py-1 text-xs ${applied ? "bg-fuchsia-600 text-white" : "border border-fuchsia-300 text-fuchsia-700"}`}
+                        >
+                          {applied ? "已应用" : "应用"}
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => startFrameEdit("last", imageUrl)}
+                          className={`rounded px-2 py-1 text-xs ${editing ? "bg-indigo-600 text-white" : "border border-indigo-300 text-indigo-700"}`}
+                        >
+                          输入修改意见
+                        </button>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+              {frameEditTarget?.frameType === "last" ? (
+                <div className="rounded-lg border border-slate-200 bg-slate-50 p-3">
+                  <textarea
+                    value={frameEditInput}
+                    onChange={(event) => setFrameEditInput(event.target.value)}
+                    placeholder="输入对当前尾帧图片的修改意见"
+                    className="h-20 w-full rounded border border-slate-200 bg-white px-3 py-2 text-sm outline-none"
+                  />
+                  <div className="mt-2 flex justify-end gap-2">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setFrameEditTarget(null);
+                        setFrameEditInput("");
+                      }}
+                      disabled={frameEditing}
+                      className="rounded border border-slate-300 bg-white px-3 py-1.5 text-xs text-slate-700 hover:bg-slate-50 disabled:opacity-50"
+                    >
+                      取消
+                    </button>
+                    <button
+                      type="button"
+                      onClick={submitFrameEdit}
+                      disabled={frameEditing}
+                      className="rounded bg-indigo-600 px-3 py-1.5 text-xs text-white hover:bg-indigo-700 disabled:opacity-50"
+                    >
+                      {frameEditing ? "修改中..." : "修改图片"}
+                    </button>
+                  </div>
+                </div>
+              ) : null}
+            </div>
+          </div>
+        </div>
+      </div>
+    ) : null}
     {voiceModal ? (
       <div className="fixed inset-0 z-50 overflow-y-auto bg-black/40 px-4 py-6">
         <div className="mx-auto w-full max-w-4xl rounded-2xl border border-slate-200 bg-white shadow-xl">
@@ -849,56 +1866,11 @@ export function ScriptEditor({
                   ))}
                 </select>
                 {projectVoices.length === 0 ? (
-                  <div className="mt-2 text-[11px] text-amber-600">未检测到角色音色，请先在 Step2 配置。</div>
+                  <div className="mt-2 text-[11px] text-amber-600">未检测到角色音色，请先在 Step3 配置。</div>
                 ) : null}
               </div>
-              <div>
-                <div className="mb-2 flex items-center justify-between text-xs font-semibold text-slate-700">
-                  <span>生成音量</span>
-                  <span>{voiceVolume}</span>
-                </div>
-                <input
-                  type="range"
-                  min={-12}
-                  max={12}
-                  step={1}
-                  value={voiceVolume}
-                  onChange={(event) => setVoiceVolume(Number(event.target.value))}
-                  className="w-full accent-indigo-600"
-                />
-              </div>
-              <div>
-                <div className="mb-2 flex items-center justify-between text-xs font-semibold text-slate-700">
-                  <span>生成语速</span>
-                  <span>{voiceSpeed.toFixed(1)}x</span>
-                </div>
-                <input
-                  type="range"
-                  min={0.5}
-                  max={2}
-                  step={0.1}
-                  value={voiceSpeed}
-                  onChange={(event) => setVoiceSpeed(Number(event.target.value))}
-                  className="w-full accent-indigo-600"
-                />
-              </div>
-              <div>
-                <div className="mb-2 flex items-center justify-between text-xs font-semibold text-slate-700">
-                  <span>生成音高</span>
-                  <span>{voicePitch > 0 ? `+${voicePitch.toFixed(1)}` : voicePitch.toFixed(1)}</span>
-                </div>
-                <input
-                  type="range"
-                  min={-2}
-                  max={2}
-                  step={0.1}
-                  value={voicePitch}
-                  onChange={(event) => setVoicePitch(Number(event.target.value))}
-                  className="w-full accent-indigo-600"
-                />
-              </div>
               <div className="space-y-3 border-t border-slate-200 pt-4">
-                <div className="text-xs font-semibold text-slate-700">Fish 标签库</div>
+                <div className="text-xs font-semibold text-slate-700">ElevenLabs 表演标签库</div>
                 <div className="grid grid-cols-5 gap-1">
                   {VOICE_TAG_GROUPS.map((group) => (
                     <button
@@ -914,41 +1886,43 @@ export function ScriptEditor({
                     </button>
                   ))}
                 </div>
-                <div className="max-h-[300px] overflow-y-auto space-y-2 rounded-lg border border-slate-200 bg-white p-2">
-                  {activeTagGroup.tags.map((item) => (
-                    <button
-                      key={item.tag}
-                      onClick={() => insertVoiceTag(item.tag)}
-                      className="w-full rounded border border-violet-200 bg-violet-50 px-2 py-1.5 text-left hover:bg-violet-100"
-                    >
-                      <div className="text-[11px] font-medium text-violet-800">{item.label} {item.tag}</div>
-                      <div className="text-[10px] text-violet-600">{item.desc}</div>
-                    </button>
-                  ))}
-                </div>
-                <div className="space-y-2 rounded-lg border border-slate-200 bg-white p-2">
-                  <div className="text-[11px] font-medium text-slate-700">强度调节</div>
-                  <div className="grid grid-cols-3 gap-1">
-                    {[
-                      { key: "slightly" as const, label: "轻微" },
-                      { key: "very" as const, label: "明显" },
-                      { key: "extremely" as const, label: "极强" },
-                    ].map((item) => (
+                <div className="space-y-3 rounded-lg border border-slate-200 bg-white p-2">
+                  <div className="rounded-md border border-slate-100 bg-slate-50 p-2">
+                    <div className="mb-2 text-[11px] font-medium text-slate-700">强度调节（作用于情绪标签）</div>
+                    <div className="grid grid-cols-3 gap-1">
+                      {[
+                        { key: "slightly" as const, label: "轻微" },
+                        { key: "very" as const, label: "明显" },
+                        { key: "extremely" as const, label: "极强" },
+                      ].map((item) => (
+                        <button
+                          key={item.key}
+                          onClick={() => setVoiceEmotionIntensity(item.key)}
+                          className={`rounded px-2 py-1 text-[11px] ${
+                            voiceEmotionIntensity === item.key
+                              ? "bg-indigo-600 text-white"
+                              : "border border-slate-200 bg-white text-slate-600 hover:bg-slate-100"
+                          }`}
+                        >
+                          {item.label}
+                        </button>
+                      ))}
+                    </div>
+                    <div className="mt-2 text-[10px] text-slate-500">
+                      当前情绪标签示例：({voiceEmotionIntensity} happy)
+                    </div>
+                  </div>
+                  <div className="max-h-[300px] overflow-y-auto space-y-2">
+                    {activeTagGroup.tags.map((item) => (
                       <button
-                        key={item.key}
-                        onClick={() => setVoiceEmotionIntensity(item.key)}
-                        className={`rounded px-2 py-1 text-[11px] ${
-                          voiceEmotionIntensity === item.key
-                            ? "bg-indigo-600 text-white"
-                            : "border border-slate-200 bg-slate-50 text-slate-600 hover:bg-slate-100"
-                        }`}
+                        key={item.tag}
+                        onClick={() => insertVoiceTag(item.tag)}
+                        className="w-full rounded border border-violet-200 bg-violet-50 px-2 py-1.5 text-left hover:bg-violet-100"
                       >
-                        {item.label}
+                        <div className="text-[11px] font-medium text-violet-800">{item.label} {item.tag}</div>
+                        <div className="text-[10px] text-violet-600">{item.desc}</div>
                       </button>
                     ))}
-                  </div>
-                  <div className="text-[10px] text-slate-500">
-                    当前情绪标签示例：({voiceEmotionIntensity} happy)
                   </div>
                 </div>
                 <div className="space-y-2 rounded-lg border border-slate-200 bg-white p-2">
@@ -1012,6 +1986,74 @@ export function ScriptEditor({
                   先点击某个“台词片段”输入框，再点标签即可插入到该片段光标或选中位置。
                 </div>
               </div>
+              <div className="space-y-3 border-t border-slate-200 pt-4">
+                <div className="text-xs font-semibold text-slate-700">ElevenLabs 全量调节项</div>
+                <div className="grid grid-cols-1 gap-2">
+                  <select value={voiceModelId} onChange={(event) => setVoiceModelId(event.target.value)} className="w-full rounded border border-slate-200 px-2 py-1.5 text-xs">
+                    {ELEVEN_MODELS.map((item) => (
+                      <option key={item.value} value={item.value}>{item.label}</option>
+                    ))}
+                  </select>
+                  <select value={voiceOutputFormat} onChange={(event) => setVoiceOutputFormat(event.target.value)} className="w-full rounded border border-slate-200 px-2 py-1.5 text-xs">
+                    {ELEVEN_OUTPUT_FORMATS.map((item) => (
+                      <option key={item.value} value={item.value}>{item.label}</option>
+                    ))}
+                  </select>
+                  <select value={voiceLanguageCode} onChange={(event) => setVoiceLanguageCode(event.target.value)} className="w-full rounded border border-slate-200 px-2 py-1.5 text-xs">
+                    {ELEVEN_LANGUAGE_OPTIONS.map((item) => (
+                      <option key={item.value || "auto"} value={item.value}>{item.label}</option>
+                    ))}
+                  </select>
+                </div>
+                <div>
+                  <div className="mb-1 flex items-center justify-between text-[11px] text-slate-700">
+                    <span>语速</span>
+                    <span>{voiceSpeed.toFixed(2)}</span>
+                  </div>
+                  <input type="range" min={0.7} max={1.2} step={0.01} value={voiceSpeed} onChange={(event) => setVoiceSpeed(Number(event.target.value))} className="w-full accent-indigo-600" />
+                </div>
+                <div>
+                  <div className="mb-1 flex items-center justify-between text-[11px] text-slate-700">
+                    <span>稳定性</span>
+                    <span>{voiceStability.toFixed(2)}</span>
+                  </div>
+                  <input type="range" min={0} max={1} step={0.01} value={voiceStability} onChange={(event) => setVoiceStability(Number(event.target.value))} className="w-full accent-indigo-600" />
+                </div>
+                <div>
+                  <div className="mb-1 flex items-center justify-between text-[11px] text-slate-700">
+                    <span>相似度增强</span>
+                    <span>{voiceSimilarityBoost.toFixed(2)}</span>
+                  </div>
+                  <input type="range" min={0} max={1} step={0.01} value={voiceSimilarityBoost} onChange={(event) => setVoiceSimilarityBoost(Number(event.target.value))} className="w-full accent-indigo-600" />
+                </div>
+                <div>
+                  <div className="mb-1 flex items-center justify-between text-[11px] text-slate-700">
+                    <span>风格夸张度</span>
+                    <span>{voiceStyle.toFixed(2)}</span>
+                  </div>
+                  <input type="range" min={0} max={1} step={0.01} value={voiceStyle} onChange={(event) => setVoiceStyle(Number(event.target.value))} className="w-full accent-indigo-600" />
+                </div>
+                <label className="flex items-center gap-2 text-[11px] text-slate-700">
+                  <input type="checkbox" checked={voiceUseSpeakerBoost} onChange={(event) => setVoiceUseSpeakerBoost(event.target.checked)} />
+                  启用 Speaker Boost
+                </label>
+                <input value={voiceSeed} onChange={(event) => setVoiceSeed(event.target.value)} className="w-full rounded border border-slate-200 px-2 py-1.5 text-xs" placeholder="随机种子 seed（可选整数）" />
+                <textarea value={voicePreviousText} onChange={(event) => setVoicePreviousText(event.target.value)} className="h-14 w-full rounded border border-slate-200 px-2 py-1.5 text-xs" placeholder="上一段上下文 previous_text（可选）" />
+                <textarea value={voiceNextText} onChange={(event) => setVoiceNextText(event.target.value)} className="h-14 w-full rounded border border-slate-200 px-2 py-1.5 text-xs" placeholder="下一段上下文 next_text（可选）" />
+                <div className="space-y-2 rounded border border-slate-200 bg-white p-2">
+                  <div className="text-[11px] font-medium text-slate-700">发音控制（逐词替换）</div>
+                  {voicePronunciationRules.map((item) => (
+                    <div key={item.id} className="grid grid-cols-12 gap-1">
+                      <input value={item.source} onChange={(event) => updatePronunciationRule(item.id, "source", event.target.value)} className="col-span-5 rounded border border-slate-200 px-2 py-1 text-[11px]" placeholder="原词" />
+                      <input value={item.target} onChange={(event) => updatePronunciationRule(item.id, "target", event.target.value)} className="col-span-5 rounded border border-slate-200 px-2 py-1 text-[11px]" placeholder="替换发音文本/IPA" />
+                      <button onClick={() => removePronunciationRule(item.id)} className="col-span-2 rounded border border-rose-200 px-2 py-1 text-[11px] text-rose-600">删</button>
+                    </div>
+                  ))}
+                  <button onClick={addPronunciationRule} className="w-full rounded border border-slate-200 px-2 py-1 text-[11px] text-slate-700">新增发音规则</button>
+                </div>
+                <input value={voicePronunciationDictId} onChange={(event) => setVoicePronunciationDictId(event.target.value)} className="w-full rounded border border-slate-200 px-2 py-1.5 text-xs" placeholder="Pronunciation Dictionary ID（可选）" />
+                <input value={voicePronunciationDictVersion} onChange={(event) => setVoicePronunciationDictVersion(event.target.value)} className="w-full rounded border border-slate-200 px-2 py-1.5 text-xs" placeholder="Dictionary Version ID（可选）" />
+              </div>
             </div>
           </div>
         </div>
@@ -1021,48 +2063,218 @@ export function ScriptEditor({
   );
 }
 
-function TableCell({ value, onChange, projectId, projectAssets }: { value: string, onChange: (v: string) => void, projectId?: string, projectAssets?: any[] }) {
+function TableCell({
+  value,
+  onChange,
+  projectId,
+  projectAssets,
+  columnHeader,
+}: {
+  value: string;
+  onChange: (v: string) => void;
+  projectId?: string;
+  projectAssets?: Asset[];
+  columnHeader?: string;
+}) {
   const [isEditing, setIsEditing] = useState(false);
-  const [assetImages, setAssetImages] = useState<{id: string, url: string}[]>([]);
+  const [previewUrl, setPreviewUrl] = useState<string | null>(null);
+  const [previewTitle, setPreviewTitle] = useState("");
+  const [pickerOpen, setPickerOpen] = useState(false);
+  const [selectedPickerIds, setSelectedPickerIds] = useState<string[]>([]);
+  const normalizeAssetKey = React.useCallback((input: string) => {
+    return (input || "")
+      .trim()
+      .replace(/[（(][^）)]*[）)]/g, "")
+      .replace(/[\s【】\[\]{}《》<>:：,，。.!！?？、·|｜/\\_-]/g, "")
+      .toLowerCase();
+  }, []);
+  const preferredAssetTypes = React.useMemo(() => {
+    const text = (columnHeader || "").replace(/\s+/g, "");
+    if (text.includes("角色形象") || text === "形象") return ["CHARACTER_LOOK"];
+    if (text.includes("道具")) return ["PROP"];
+    if (text.includes("场景")) return ["SCENE"];
+    if (text.includes("角色")) return ["CHARACTER", "CHARACTER_LOOK"];
+    return null;
+  }, [columnHeader]);
+  const pickerAssetType = React.useMemo(() => {
+    const text = (columnHeader || "").replace(/\s+/g, "");
+    if (text.includes("角色形象") || text === "形象") return "CHARACTER_LOOK";
+    if (text.includes("道具")) return "PROP";
+    if (text.includes("场景")) return "SCENE";
+    return null;
+  }, [columnHeader]);
+  const resolveAssetImageUrl = React.useCallback((asset: Asset) => {
+    const versions = asset.versions || [];
+    const selectedVersion = versions.find((v) => v.is_selected && Boolean((v.image_url || "").trim()));
+    if (selectedVersion?.image_url) return String(selectedVersion.image_url).trim();
+    const latestVersion = [...versions].reverse().find((v) => Boolean((v.image_url || "").trim()));
+    if (latestVersion?.image_url) return String(latestVersion.image_url).trim();
+    return "";
+  }, []);
 
-  // Parse asset IDs and text for display
-  const { displayText, assetIds } = React.useMemo(() => {
-    // Allow optional whitespace after colon
-    const assetIdRegex = /\[AssetID:\s*([a-zA-Z0-9-]+)\]/g;
-    const ids: string[] = [];
-    let text = value;
-    let match;
-    
-    // Extract IDs
-    while ((match = assetIdRegex.exec(value)) !== null) {
-      ids.push(match[1]);
-    }
-    
-    // Remove tags for display
-    text = value.replace(assetIdRegex, '').trim();
-    
-    return { displayText: text, assetIds: ids };
-  }, [value]);
+  const { displayText, assetRefs } = React.useMemo(() => {
+    const assetTagRegex = /\[AssetID:\s*([^\]]+)\]/g;
+    const refs: Array<{ raw: string; id?: string; name: string }> = [];
+    const trimmedValue = value || "";
+    let text = trimmedValue;
+    let match: RegExpExecArray | null;
 
-  useEffect(() => {
-    if (assetIds.length > 0 && projectId && projectAssets && projectAssets.length > 0) {
-      const selectedImages: {id: string, url: string}[] = [];
-      for (const asset of projectAssets) {
-        if (assetIds.includes(asset.id)) {
-          const selectedVersion = asset.versions?.find((v: any) => v.is_selected);
-          if (selectedVersion && selectedVersion.image_url) {
-            selectedImages.push({
-              id: asset.id,
-              url: `/api/projects/${projectId}/assets/${asset.id}/image`
-            });
+    while ((match = assetTagRegex.exec(trimmedValue)) !== null) {
+      const raw = (match[1] || "").trim();
+      if (!raw) continue;
+      const rawKey = normalizeAssetKey(raw);
+      const allAssets = projectAssets || [];
+      const exact = allAssets.find((asset) => asset.id === raw);
+      const typeFiltered =
+        preferredAssetTypes && preferredAssetTypes.length > 0
+          ? allAssets.filter((asset) => preferredAssetTypes.includes(asset.type))
+          : allAssets;
+      const searchPool = typeFiltered.length > 0 ? typeFiltered : allAssets;
+      const scored = searchPool
+        .map((asset) => {
+          const versions = asset.versions || [];
+          const selectedVersion = versions.find((v) => v.is_selected && Boolean((v.image_url || "").trim()));
+          const latestVersion = [...versions].reverse().find((v) => Boolean((v.image_url || "").trim()));
+          const hasImage = Boolean(latestVersion);
+          const assetKey = normalizeAssetKey(asset.name);
+          let nameMatchScore = 0;
+          if (asset.name.trim() === raw) nameMatchScore = Math.max(nameMatchScore, 100);
+          if (assetKey && rawKey && assetKey === rawKey) nameMatchScore = Math.max(nameMatchScore, 80);
+          if (assetKey && rawKey && (assetKey.includes(rawKey) || rawKey.includes(assetKey))) {
+            nameMatchScore = Math.max(nameMatchScore, 50);
           }
-        }
-      }
-      setAssetImages(selectedImages);
-    } else {
-       setAssetImages([]);
+          if (nameMatchScore <= 0) {
+            return { asset, score: 0 };
+          }
+          let score = nameMatchScore;
+          if (preferredAssetTypes?.includes(asset.type)) score += 40;
+          if (hasImage) score += 30;
+          if (selectedVersion?.image_url) score += 10;
+          return { asset, score };
+        })
+        .filter((item) => item.score > 0)
+        .sort((a, b) => b.score - a.score);
+      const byName = exact || scored[0]?.asset;
+      refs.push({
+        raw,
+        id: byName?.id,
+        name: byName?.name || raw,
+      });
     }
-  }, [assetIds, projectId, projectAssets]);
+
+    text = trimmedValue.replace(assetTagRegex, "").trim();
+    return { displayText: text, assetRefs: refs };
+  }, [normalizeAssetKey, preferredAssetTypes, projectAssets, value]);
+  const pickerAssetData = React.useMemo<{
+    items: Array<{ id: string; name: string; hasImage: boolean; imageUrl: string }>;
+    canonicalIdBySourceId: Map<string, string>;
+  }>(() => {
+    const canonicalIdBySourceId = new Map<string, string>();
+    if (!pickerAssetType || !projectAssets || projectAssets.length === 0) {
+      return { items: [], canonicalIdBySourceId };
+    }
+    const grouped = new Map<
+      string,
+      {
+        id: string;
+        name: string;
+        hasImage: boolean;
+        imageUrl: string;
+        score: number;
+        sourceIds: string[];
+      }
+    >();
+    projectAssets
+      .filter((asset) => {
+        if (asset.type !== pickerAssetType) return false;
+        return Boolean(resolveAssetImageUrl(asset));
+      })
+      .forEach((asset) => {
+        const versions = asset.versions || [];
+        const resolvedImageUrl = resolveAssetImageUrl(asset);
+        const hasImage = Boolean(resolvedImageUrl);
+        const score = (hasImage ? 100 : 0) + Math.min(versions.length, 10);
+        const groupKey = `${asset.type}:${normalizeAssetKey(asset.name) || asset.id}`;
+        const existing = grouped.get(groupKey);
+        if (!existing || score > existing.score) {
+          grouped.set(groupKey, {
+            id: asset.id,
+            name: asset.name,
+            hasImage,
+            imageUrl: resolvedImageUrl || (projectId ? `/api/projects/${projectId}/assets/${asset.id}/image` : ""),
+            score,
+            sourceIds: existing ? [...existing.sourceIds, asset.id] : [asset.id],
+          });
+        } else {
+          existing.sourceIds.push(asset.id);
+        }
+      });
+    const items = Array.from(grouped.values())
+      .map((item) => ({
+        id: item.id,
+        name: item.name,
+        hasImage: item.hasImage,
+        imageUrl: item.imageUrl,
+      }))
+      .sort((a, b) => {
+        if (a.hasImage !== b.hasImage) return a.hasImage ? -1 : 1;
+        return a.name.localeCompare(b.name, "zh-CN");
+      });
+    grouped.forEach((item) => {
+      item.sourceIds.forEach((sourceId) => {
+        canonicalIdBySourceId.set(sourceId, item.id);
+      });
+    });
+    return { items, canonicalIdBySourceId };
+  }, [normalizeAssetKey, pickerAssetType, projectAssets, projectId, resolveAssetImageUrl]);
+  const pickerAssets = pickerAssetData.items;
+
+  const assetImages = React.useMemo(() => {
+    if (assetRefs.length === 0 || !projectAssets || projectAssets.length === 0) {
+      return [];
+    }
+    const selectedImages: { id: string; url: string; name: string }[] = [];
+    const idSet = new Set(assetRefs.map((item) => item.id).filter((id): id is string => Boolean(id)));
+    for (const asset of projectAssets) {
+      if (!idSet.has(asset.id)) continue;
+      const imageUrl = resolveAssetImageUrl(asset);
+      if (!imageUrl) continue;
+      selectedImages.push({
+        id: asset.id,
+        name: asset.name,
+        url: imageUrl,
+      });
+    }
+    return selectedImages;
+  }, [assetRefs, projectAssets, resolveAssetImageUrl]);
+  const openPicker = React.useCallback((event: React.MouseEvent<HTMLButtonElement>) => {
+    event.stopPropagation();
+    if (!pickerAssetType) return;
+    const currentIds = Array.from(
+      new Set(
+        assetRefs
+          .map((item) => item.id)
+          .filter((id): id is string => Boolean(id))
+          .map((id) => pickerAssetData.canonicalIdBySourceId.get(id) || id)
+      )
+    );
+    setSelectedPickerIds(currentIds);
+    setPickerOpen(true);
+  }, [assetRefs, pickerAssetData.canonicalIdBySourceId, pickerAssetType]);
+  const togglePickerAsset = React.useCallback((assetId: string) => {
+    setSelectedPickerIds((prev) => {
+      if (prev.includes(assetId)) {
+        return prev.filter((id) => id !== assetId);
+      }
+      return [...prev, assetId];
+    });
+  }, []);
+  const applyPickerSelection = React.useCallback(() => {
+    const tags = selectedPickerIds.map((id) => `[AssetID:${id}]`).join(" ");
+    const nextValue = displayText && tags ? `${displayText}\n${tags}` : displayText || tags;
+    onChange(nextValue);
+    setPickerOpen(false);
+  }, [displayText, onChange, selectedPickerIds]);
 
   if (isEditing) {
     return (
@@ -1077,35 +2289,115 @@ function TableCell({ value, onChange, projectId, projectAssets }: { value: strin
   }
 
   return (
-    <div 
-      onClick={() => setIsEditing(true)}
-      className="min-h-[24px] cursor-text"
-    >
-      <div className="whitespace-pre-wrap text-slate-700 leading-relaxed">
-        {displayText || <span className="text-slate-300 italic">空</span>}
-      </div>
-      
-      {assetImages.length > 0 && (
-        <div className="mt-2 flex flex-wrap gap-2">
-          {assetImages.map((img) => (
-            <div key={img.id} className="relative group/img">
-               <img 
-                 src={img.url} 
-                 alt="Asset" 
-                 className="w-16 h-16 object-cover rounded border border-slate-200 shadow-sm"
-                 onError={(e) => {
-                   // Show placeholder for broken images
-                   const target = e.target as HTMLImageElement;
-                   target.onerror = null; // Prevent infinite loop
-                   target.src = 'data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSI2NCIgaGVpZ2h0PSI2NCIgdmlld0JveD0iMCAwIDY0IDY0IiBmaWxsPSJub25lIiBzdHJva2U9IiM5NGEzYjgiIHN0cm9rZS13aWR0aD0iMiI+PHJlY3QgeD0iMiIgeT0iMiIgd2lkdGg9IjYwIiBoZWlnaHQ9IjYwIiByeD0iNCIvPjx0ZXh0IHg9IjMyIiB5PSIzNSIgdGV4dC1hbmNob3I9Im1pZGRsZSIgZm9udC1mYW1pbHk9InNhbnMtc2VyaWYiIGZvbnQtc2l6ZT0iMTQiIGZpbGw9IiM5NGEzYjgiPkltZzwvdGV4dD48L3N2Zz4=';
-                   target.title = `Image load failed: ${img.id}`;
-                 }}
-               />
-            </div>
-          ))}
+    <>
+      <div 
+        onClick={() => setIsEditing(true)}
+        className="min-h-[24px] cursor-text"
+      >
+        {pickerAssetType ? (
+          <div className="mb-1">
+            <button
+              type="button"
+              onClick={openPicker}
+              className="rounded border border-blue-200 px-2 py-0.5 text-xs text-blue-600 hover:bg-blue-50"
+            >
+              选择素材
+            </button>
+          </div>
+        ) : null}
+        <div className="whitespace-pre-wrap text-slate-700 leading-relaxed">
+          {displayText || <span className="text-slate-300 italic">空</span>}
         </div>
-      )}
-    </div>
+
+        {assetRefs.length > 0 ? (
+          <div className="mt-1 flex flex-wrap gap-2">
+            {assetRefs.map((assetRef, index) => {
+              const image = assetRef.id ? assetImages.find((item) => item.id === assetRef.id) : undefined;
+              const clickable = Boolean(image?.url);
+              return (
+                <button
+                  key={`${assetRef.raw}-${index}`}
+                  type="button"
+                  onClick={(event) => {
+                    event.stopPropagation();
+                    if (!clickable || !image) return;
+                    setPreviewTitle(assetRef.name);
+                    setPreviewUrl(image.url);
+                  }}
+                  className={`text-xs ${clickable ? "text-blue-600 hover:text-blue-700 underline underline-offset-2" : "text-slate-400"}`}
+                >
+                  {assetRef.name}
+                </button>
+              );
+            })}
+          </div>
+        ) : null}
+      </div>
+
+      {previewUrl ? (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4" onClick={() => setPreviewUrl(null)}>
+          <div className="max-w-3xl rounded-xl bg-white p-3" onClick={(event) => event.stopPropagation()}>
+            <div className="mb-2 text-sm font-medium text-slate-700">{previewTitle}</div>
+            <Image src={previewUrl} alt={previewTitle} width={960} height={960} className="h-auto w-full rounded-lg border border-slate-200" unoptimized />
+          </div>
+        </div>
+      ) : null}
+
+      {pickerOpen ? (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4" onClick={() => setPickerOpen(false)}>
+          <div className="w-full max-w-4xl rounded-xl bg-white p-4" onClick={(event) => event.stopPropagation()}>
+            <div className="mb-3 flex items-center justify-between">
+              <div className="text-sm font-medium text-slate-800">
+                {pickerAssetType === "CHARACTER_LOOK" ? "选择角色形象素材" : pickerAssetType === "PROP" ? "选择道具素材" : "选择场景素材"}
+              </div>
+              <button type="button" onClick={() => setPickerOpen(false)} className="text-xs text-slate-500 hover:text-slate-700">
+                关闭
+              </button>
+            </div>
+            <div className="max-h-[60vh] overflow-y-auto rounded-lg border border-slate-200">
+              {pickerAssets.length === 0 ? (
+                <div className="p-6 text-center text-sm text-slate-500">暂无可选素材</div>
+              ) : (
+                <div className="grid grid-cols-1 gap-3 p-3 md:grid-cols-2">
+                  {pickerAssets.map((asset) => {
+                    const checked = selectedPickerIds.includes(asset.id);
+                    return (
+                      <button
+                        key={asset.id}
+                        type="button"
+                        onClick={() => togglePickerAsset(asset.id)}
+                        className={`flex items-center gap-3 rounded-lg border p-2 text-left ${checked ? "border-blue-400 bg-blue-50" : "border-slate-200 hover:border-slate-300"}`}
+                      >
+                        <div className="h-16 w-16 shrink-0 overflow-hidden rounded bg-slate-100">
+                          {asset.hasImage && asset.imageUrl ? (
+                            <Image src={asset.imageUrl} alt={asset.name} width={96} height={96} className="h-full w-full object-cover" unoptimized />
+                          ) : (
+                            <div className="flex h-full w-full items-center justify-center text-[10px] text-slate-400">无图</div>
+                          )}
+                        </div>
+                        <div className="min-w-0 flex-1">
+                          <div className="truncate text-sm font-medium text-slate-700">{asset.name}</div>
+                          <div className="mt-1 truncate text-[11px] text-slate-400">{asset.id}</div>
+                        </div>
+                        <input type="checkbox" readOnly checked={checked} className="h-4 w-4 accent-blue-600" />
+                      </button>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+            <div className="mt-3 flex justify-end gap-2">
+              <button type="button" onClick={() => setPickerOpen(false)} className="rounded border border-slate-200 px-3 py-1.5 text-xs text-slate-600 hover:bg-slate-50">
+                取消
+              </button>
+              <button type="button" onClick={applyPickerSelection} className="rounded bg-blue-600 px-3 py-1.5 text-xs text-white hover:bg-blue-700">
+                添加所选素材
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
+    </>
   );
 }
 

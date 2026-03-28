@@ -3,10 +3,10 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   CharacterVoice,
-  FishAudioModel,
-  cloneVoice,
-  generateFishAudioPreview,
-  getFishAudioModels,
+  ElevenLabsVoiceModel,
+  cloneElevenLabsVoice,
+  generateElevenLabsPreview,
+  getElevenLabsVoices,
   updateCharacterVoice,
 } from "@/lib/api";
 import { getToken } from "@/lib/auth";
@@ -39,39 +39,115 @@ const TAG_LABEL_MAP: Record<string, string> = {
   emotional: "情感",
   commercial: "商业",
   professional: "专业",
-  young: "年轻",
+  young: "青年",
+  youth: "青年",
   middle: "中年",
+  "middle aged": "中年",
+  old: "老年",
+  senior: "老年",
+  neutral: "中性",
+  high_quality: "高质量",
+  "high quality": "高质量",
 };
+const LANGUAGE_ZH_MAP: Record<string, string> = {
+  ar: "阿拉伯语",
+  bg: "保加利亚语",
+  cs: "捷克语",
+  da: "丹麦语",
+  de: "德语",
+  el: "希腊语",
+  en: "英语",
+  es: "西班牙语",
+  fi: "芬兰语",
+  fil: "菲律宾语",
+  fr: "法语",
+  hi: "印地语",
+  hr: "克罗地亚语",
+  hu: "匈牙利语",
+  id: "印尼语",
+  it: "意大利语",
+  ja: "日语",
+  ko: "韩语",
+  ms: "马来语",
+  nl: "荷兰语",
+  no: "挪威语",
+  pl: "波兰语",
+  pt: "葡萄牙语",
+  ro: "罗马尼亚语",
+  ru: "俄语",
+  sk: "斯洛伐克语",
+  sv: "瑞典语",
+  ta: "泰米尔语",
+  tr: "土耳其语",
+  uk: "乌克兰语",
+  vi: "越南语",
+  zh: "中文",
+  chinese: "中文",
+  mandarin: "中文",
+  english: "英语",
+};
+const CHINESE_ACCENT_OPTIONS = [
+  "粤语（广州）",
+  "粤语（香港）",
+  "粤语（新加坡）",
+  "普通话（北京）",
+  "普通话（新加坡）",
+  "普通话（台湾）",
+  "标准",
+];
+const AGE_OPTIONS = ["青年", "中年", "老年"];
 
-const languageFromModel = (model: FishAudioModel) => {
+const normalizeFacetKey = (value: string) =>
+  String(value || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[_-]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+const displayTag = (tag: string) => TAG_LABEL_MAP[normalizeFacetKey(tag)] || TAG_LABEL_MAP[tag] || tag;
+const displayLanguage = (value: string) => {
+  const normalized = normalizeFacetKey(value);
+  if (LANGUAGE_ZH_MAP[normalized]) return LANGUAGE_ZH_MAP[normalized];
+  const locale = normalized.split(" ")[0].split("-")[0];
+  if (LANGUAGE_ZH_MAP[locale]) return LANGUAGE_ZH_MAP[locale];
+  return String(value || "").trim() ? `其他语言` : "未知语言";
+};
+const languageParamFromFilter = (language: string) => {
+  const normalized = normalizeFacetKey(language);
+  if (!normalized || normalized === normalizeFacetKey(UNIQUE_ALL)) return undefined;
+  if (["zh", "chinese", "mandarin", "中文", "汉语", "普通话"].includes(normalized)) return "zh";
+  if (["en", "english", "英语", "英文"].includes(normalized)) return "en";
+  const locale = normalized.split(" ")[0].split("-")[0];
+  return locale || undefined;
+};
+const modelLabel = (model: ElevenLabsVoiceModel, key: string) => String(model.labels?.[key] || "").trim();
+const languageFromModel = (model: ElevenLabsVoiceModel) => {
+  const label = modelLabel(model, "language");
+  if (label) return displayLanguage(label);
   const languages = Array.isArray(model.languages)
     ? model.languages.map((lang) => String(lang).toLowerCase().replace(/_/g, "-"))
     : [];
   if (languages.some((lang) => /^(zh|cn|cmn|yue)(-|$)/.test(lang) || ["zh-hans", "zh-hant"].includes(lang))) return "中文";
-  if (languages.some((lang) => /^(en)(-|$)/.test(lang))) return "英文";
-  const text = `${model.title || ""} ${(model.tags || []).join(" ")}`.toLowerCase();
-  if (/(中文|汉语|普通话|粤语|mandarin|cantonese|chinese|\bzh\b|\bcn\b)/.test(text)) return "中文";
-  if (/(英文|english|\ben\b)/.test(text)) return "英文";
-  return "未知";
+  if (languages.some((lang) => /^(en)(-|$)/.test(lang))) return "英语";
+  return "未知语言";
 };
-
-const genderFromModel = (model: FishAudioModel) => {
-  const text = `${model.title || ""} ${(model.tags || []).join(" ")}`.toLowerCase();
-  if (/(女|female|woman|girl)/.test(text)) return "女声";
-  if (/(男|male|man|boy)/.test(text)) return "男声";
+const genderFromModel = (model: ElevenLabsVoiceModel) => {
+  const label = modelLabel(model, "gender");
+  if (label) return displayTag(label);
   return "中性";
 };
-
-const displayTag = (tag: string) => TAG_LABEL_MAP[tag.toLowerCase()] || TAG_LABEL_MAP[tag] || tag;
-const previewFromModel = (model: FishAudioModel) =>
+const accentFromModel = (model: ElevenLabsVoiceModel) => displayTag(modelLabel(model, "accent") || "未知口音");
+const ageFromModel = (model: ElevenLabsVoiceModel) => displayTag(modelLabel(model, "age") || "未知年龄");
+const qualityFromModel = (model: ElevenLabsVoiceModel) => displayTag(modelLabel(model, "quality") || "");
+const previewFromModel = (model: ElevenLabsVoiceModel) =>
   model.preview_audio || model.samples?.find((sample) => sample.audio)?.audio || "";
 const MODELS_PAGE_SIZE = 100;
-const languageParamFromFilter = (language: "全部" | "中文" | "英文") => {
-  if (language === "中文") return "zh";
-  if (language === "英文") return "en";
-  return undefined;
-};
-const mergeModels = (base: FishAudioModel[], incoming: FishAudioModel[]) => {
+const ensureCurrentOption = (selected: string, options: string[]) =>
+  selected && selected !== "全部" && !options.some((item) => normalizeFacetKey(item) === normalizeFacetKey(selected))
+    ? [selected, ...options]
+    : options;
+const UNIQUE_ALL = "全部";
+const mergeModels = (base: ElevenLabsVoiceModel[], incoming: ElevenLabsVoiceModel[]) => {
   const next = [...base];
   const idSet = new Set(next.map((item) => String(item._id || "").trim()).filter(Boolean));
   incoming.forEach((item) => {
@@ -95,7 +171,7 @@ export function VoiceSelector({
   onVoiceUpdate,
 }: VoiceSelectorProps) {
   const [currentVoice, setCurrentVoice] = useState<CharacterVoice | null>(initialVoice ?? null);
-  const [models, setModels] = useState<FishAudioModel[]>([]);
+  const [models, setModels] = useState<ElevenLabsVoiceModel[]>([]);
   const [loadingModels, setLoadingModels] = useState(false);
   const [previewingId, setPreviewingId] = useState("");
   const [saving, setSaving] = useState(false);
@@ -108,15 +184,26 @@ export function VoiceSelector({
   const [searchQuery, setSearchQuery] = useState("");
   const [submittedSearchQuery, setSubmittedSearchQuery] = useState("");
   const [sortMode, setSortMode] = useState<"推荐" | "名称">("推荐");
-  const [selectedLanguage, setSelectedLanguage] = useState<"全部" | "中文" | "英文">("全部");
-  const [selectedGender, setSelectedGender] = useState<"全部" | "男声" | "女声" | "中性">("全部");
-  const [activeStyleTags, setActiveStyleTags] = useState<string[]>([]);
+  const [selectedLanguage, setSelectedLanguage] = useState(UNIQUE_ALL);
+  const [selectedAccent, setSelectedAccent] = useState(UNIQUE_ALL);
+  const [selectedGender, setSelectedGender] = useState(UNIQUE_ALL);
+  const [selectedAge, setSelectedAge] = useState(UNIQUE_ALL);
+  const [selectedQuality, setSelectedQuality] = useState(UNIQUE_ALL);
+  const [facetOptions, setFacetOptions] = useState({
+    languages: [] as string[],
+    accents: [] as string[],
+    genders: [] as string[],
+    ages: [] as string[],
+    qualities: [] as string[],
+  });
   const [currentPage, setCurrentPage] = useState(1);
   const [changingPage, setChangingPage] = useState(false);
-  const [styleTagsExpanded, setStyleTagsExpanded] = useState(false);
+  const [hasMorePage, setHasMorePage] = useState(false);
   const [totalCount, setTotalCount] = useState(0);
   const [cloneTitle, setCloneTitle] = useState(`${characterName}-clone`);
   const [cloneFile, setCloneFile] = useState<File | null>(null);
+  const [cloneDurationSec, setCloneDurationSec] = useState<number | null>(null);
+  const [detectingCloneDuration, setDetectingCloneDuration] = useState(false);
   const [clonedModelId, setClonedModelId] = useState("");
   const [clonedModelTitle, setClonedModelTitle] = useState("");
   const [clonedCoverImage, setClonedCoverImage] = useState("");
@@ -131,11 +218,16 @@ export function VoiceSelector({
     let lastError: unknown;
     for (let attempt = 0; attempt < 2; attempt += 1) {
       try {
-        return await getFishAudioModels(token, {
+        return await getElevenLabsVoices(token, {
           page,
           size: MODELS_PAGE_SIZE,
           language: languageParamFromFilter(selectedLanguage),
           query: submittedSearchQuery || undefined,
+          accent: selectedAccent !== UNIQUE_ALL ? selectedAccent : undefined,
+          gender: selectedGender !== UNIQUE_ALL ? selectedGender : undefined,
+          age: selectedAge !== UNIQUE_ALL ? selectedAge : undefined,
+          quality: selectedQuality !== UNIQUE_ALL ? selectedQuality : undefined,
+          includeLibrary: true,
         });
       } catch (err) {
         lastError = err;
@@ -144,8 +236,8 @@ export function VoiceSelector({
         }
       }
     }
-    throw lastError instanceof Error ? lastError : new Error("加载 Fish Audio 音色失败");
-  }, [selectedLanguage, submittedSearchQuery]);
+    throw lastError instanceof Error ? lastError : new Error("加载 ElevenLabs 音色失败");
+  }, [selectedLanguage, selectedAccent, selectedGender, selectedAge, selectedQuality, submittedSearchQuery]);
 
   useEffect(() => {
     let cancelled = false;
@@ -163,11 +255,19 @@ export function VoiceSelector({
         const firstItems = Array.isArray(first.items) ? first.items : [];
         const normalizedFirstItems = mergeModels([], firstItems);
         setTotalCount(typeof first.total === "number" ? first.total : 0);
+        setHasMorePage(Boolean(first.has_more));
         setModels(normalizedFirstItems);
+        setFacetOptions({
+          languages: Array.isArray(first.facets?.languages) ? first.facets.languages : [],
+          accents: Array.isArray(first.facets?.accents) ? first.facets.accents : [],
+          genders: Array.isArray(first.facets?.genders) ? first.facets.genders : [],
+          ages: Array.isArray(first.facets?.ages) ? first.facets.ages : [],
+          qualities: Array.isArray(first.facets?.qualities) ? first.facets.qualities : [],
+        });
         setCurrentPage(1);
       } catch (err) {
         console.error("Failed to fetch voice models", err);
-        setError(err instanceof Error ? err.message : "加载 Fish Audio 音色失败");
+        setError(err instanceof Error ? err.message : "加载 ElevenLabs 音色失败");
       } finally {
         if (!cancelled) {
           setLoadingModels(false);
@@ -194,6 +294,14 @@ export function VoiceSelector({
       const incoming = Array.isArray(res.items) ? res.items : [];
       setModels(mergeModels([], incoming));
       setTotalCount(typeof res.total === "number" ? res.total : incoming.length);
+      setHasMorePage(Boolean(res.has_more));
+      setFacetOptions({
+        languages: Array.isArray(res.facets?.languages) ? res.facets.languages : [],
+        accents: Array.isArray(res.facets?.accents) ? res.facets.accents : [],
+        genders: Array.isArray(res.facets?.genders) ? res.facets.genders : [],
+        ages: Array.isArray(res.facets?.ages) ? res.facets.ages : [],
+        qualities: Array.isArray(res.facets?.qualities) ? res.facets.qualities : [],
+      });
       setCurrentPage(targetPage);
     } catch (err) {
       setError(err instanceof Error ? err.message : "切换分页失败");
@@ -224,6 +332,8 @@ export function VoiceSelector({
     setClonePreviewText("你好，这是一段克隆音色试听");
     setClonePreviewAudioUrl("");
     setCloneFile(null);
+    setCloneDurationSec(null);
+    setDetectingCloneDuration(false);
   }, [characterName]);
 
   const s2ProModel = useMemo(
@@ -264,19 +374,32 @@ export function VoiceSelector({
     setMode("select");
   }, [initialVoice]);
 
-  const styleTagOptions = useMemo(() => {
-    const set = new Set<string>();
-    models.forEach((model) => {
-      (model.tags || []).forEach((tag) => {
-        const value = displayTag(tag.trim());
-        if (value && !["中文", "英文", "男声", "女声", "中性"].includes(value)) set.add(value);
-      });
-    });
-    return Array.from(set).sort((a, b) => a.localeCompare(b, "zh-CN"));
-  }, [models]);
-  const visibleStyleTagOptions = useMemo(
-    () => (styleTagsExpanded ? styleTagOptions : styleTagOptions.slice(0, 12)),
-    [styleTagOptions, styleTagsExpanded]
+  const languageOptions = useMemo(
+    () => ensureCurrentOption(selectedLanguage, facetOptions.languages),
+    [selectedLanguage, facetOptions.languages]
+  );
+  const accentOptions = useMemo(
+    () => {
+      if (selectedLanguage === UNIQUE_ALL) return [];
+      const languageParam = languageParamFromFilter(selectedLanguage);
+      if (languageParam === "zh") {
+        return ensureCurrentOption(selectedAccent, CHINESE_ACCENT_OPTIONS);
+      }
+      return ensureCurrentOption(selectedAccent, facetOptions.accents);
+    },
+    [selectedLanguage, selectedAccent, facetOptions.accents]
+  );
+  const genderOptions = useMemo(
+    () => ensureCurrentOption(selectedGender, facetOptions.genders),
+    [selectedGender, facetOptions.genders]
+  );
+  const ageOptions = useMemo(
+    () => ensureCurrentOption(selectedAge, AGE_OPTIONS),
+    [selectedAge]
+  );
+  const qualityOptions = useMemo(
+    () => ensureCurrentOption(selectedQuality, facetOptions.qualities),
+    [selectedQuality, facetOptions.qualities]
   );
   const totalPages = useMemo(
     () => Math.max(1, Math.ceil(Math.max(0, totalCount) / MODELS_PAGE_SIZE)),
@@ -336,7 +459,38 @@ export function VoiceSelector({
     }
   };
 
-  const handlePreview = async (model: FishAudioModel) => {
+  const detectAudioDuration = async (file: File): Promise<number | null> =>
+    new Promise((resolve) => {
+      const objectUrl = URL.createObjectURL(file);
+      const audio = new Audio();
+      let settled = false;
+      const finalize = (duration: number | null) => {
+        if (settled) return;
+        settled = true;
+        audio.pause();
+        audio.src = "";
+        URL.revokeObjectURL(objectUrl);
+        resolve(duration);
+      };
+      const timeoutId = setTimeout(() => finalize(null), 5000);
+      audio.preload = "metadata";
+      audio.onloadedmetadata = () => {
+        clearTimeout(timeoutId);
+        const duration = Number(audio.duration);
+        if (Number.isFinite(duration) && duration > 0) {
+          finalize(duration);
+          return;
+        }
+        finalize(null);
+      };
+      audio.onerror = () => {
+        clearTimeout(timeoutId);
+        finalize(null);
+      };
+      audio.src = objectUrl;
+    });
+
+  const handlePreview = async (model: ElevenLabsVoiceModel) => {
     setError("");
     setPreviewingId(model._id);
     try {
@@ -350,10 +504,10 @@ export function VoiceSelector({
         throw new Error("登录状态失效，请重新登录");
       }
       const text = (model.default_text || model.title || "你好，这是一段音色试听").slice(0, 80);
-      const blob = await generateFishAudioPreview(token, {
+      const blob = await generateElevenLabsPreview(token, {
         text,
-        reference_id: model._id,
-        format: "mp3",
+        voice_id: model._id,
+        output_format: "mp3_44100_128",
       });
       if (previewObjectUrlRef.current) {
         URL.revokeObjectURL(previewObjectUrlRef.current);
@@ -372,41 +526,24 @@ export function VoiceSelector({
   };
 
   const filteredModels = useMemo(() => {
-    const list = models.filter((m) => {
-      const language = languageFromModel(m);
-      const gender = genderFromModel(m);
-      if (selectedLanguage !== "全部" && language !== selectedLanguage) return false;
-      if (selectedGender !== "全部" && gender !== selectedGender) return false;
-      if (activeStyleTags.length > 0) {
-        const displayTags = (m.tags || []).map((tag) => displayTag(tag));
-        const matchAll = activeStyleTags.every((selectedTag) => displayTags.includes(selectedTag));
-        if (!matchAll) return false;
-      }
-      return true;
-    });
-
     if (sortMode === "名称") {
-      return [...list].sort((a, b) => (a.title || "").localeCompare(b.title || "", "zh-CN"));
+      return [...models].sort((a, b) => (a.title || "").localeCompare(b.title || "", "zh-CN"));
     }
-    return [...list].sort((a, b) => {
+    return [...models].sort((a, b) => {
       const aScore = ((a.title || "").toLowerCase().includes("s2") ? 2 : 0) + ((a.title || "").toLowerCase().includes("pro") ? 1 : 0);
       const bScore = ((b.title || "").toLowerCase().includes("s2") ? 2 : 0) + ((b.title || "").toLowerCase().includes("pro") ? 1 : 0);
       return bScore - aScore;
     });
-  }, [models, selectedLanguage, selectedGender, activeStyleTags, sortMode]);
-
-  const toggleStyleTag = (tag: string) => {
-    setActiveStyleTags((prev) =>
-      prev.includes(tag) ? prev.filter((item) => item !== tag) : [...prev, tag]
-    );
-  };
+  }, [models, sortMode]);
 
   const clearFilters = () => {
     setSearchQuery("");
     setSubmittedSearchQuery("");
-    setSelectedLanguage("全部");
-    setSelectedGender("全部");
-    setActiveStyleTags([]);
+    setSelectedLanguage(UNIQUE_ALL);
+    setSelectedAccent(UNIQUE_ALL);
+    setSelectedGender(UNIQUE_ALL);
+    setSelectedAge(UNIQUE_ALL);
+    setSelectedQuality(UNIQUE_ALL);
     setSortMode("推荐");
   };
 
@@ -479,7 +616,7 @@ export function VoiceSelector({
       }
       setError("");
       setCloning(true);
-      const result = await cloneVoice(token, cloneFile, cloneTitle.trim() || `${characterName}-clone`);
+      const result = await cloneElevenLabsVoice(token, cloneFile, cloneTitle.trim() || `${characterName}-clone`);
       const modelId = result._id || result.model_id || "";
       if (!modelId) {
         throw new Error("克隆成功但未返回模型 ID");
@@ -512,10 +649,10 @@ export function VoiceSelector({
       }
       setError("");
       setClonePreviewing(true);
-      const blob = await generateFishAudioPreview(token, {
+      const blob = await generateElevenLabsPreview(token, {
         text: text.slice(0, 200),
-        reference_id: clonedModelId,
-        format: "mp3",
+        voice_id: clonedModelId,
+        output_format: "mp3_44100_128",
       });
       if (clonePreviewObjectUrlRef.current) {
         URL.revokeObjectURL(clonePreviewObjectUrlRef.current);
@@ -675,39 +812,58 @@ export function VoiceSelector({
                   <div className="rounded border border-slate-100 bg-slate-50 p-2">
                     <div className="mb-2 flex flex-wrap items-center gap-2">
                       <span className="text-[11px] text-slate-500">语言</span>
-                      {(["全部", "中文", "英文"] as const).map((lang) => (
-                        <button key={lang} className={chipClass(selectedLanguage === lang)} onClick={() => setSelectedLanguage(lang)}>
-                          {lang}
+                      {[UNIQUE_ALL, ...languageOptions].map((lang) => (
+                        <button
+                          key={lang}
+                          className={chipClass(selectedLanguage === lang)}
+                          onClick={() => {
+                            setSelectedLanguage(lang);
+                            setSelectedAccent(UNIQUE_ALL);
+                          }}
+                        >
+                          {lang === UNIQUE_ALL ? UNIQUE_ALL : displayLanguage(lang)}
                         </button>
                       ))}
                     </div>
                     <div className="mb-2 flex flex-wrap items-center gap-2">
-                      <span className="text-[11px] text-slate-500">音色</span>
-                      {(["全部", "女声", "男声", "中性"] as const).map((gender) => (
+                      <span className="text-[11px] text-slate-500">口音</span>
+                      {selectedLanguage === UNIQUE_ALL ? (
+                        <span className="text-[11px] text-slate-400">请先选择语言，再选择对应口音</span>
+                      ) : (
+                        [UNIQUE_ALL, ...accentOptions].map((accent) => (
+                          <button key={accent} className={chipClass(selectedAccent === accent)} onClick={() => setSelectedAccent(accent)}>
+                            {displayTag(accent)}
+                          </button>
+                        ))
+                      )}
+                    </div>
+                    <div className="mb-2 flex flex-wrap items-center gap-2">
+                      <span className="text-[11px] text-slate-500">性别</span>
+                      {[UNIQUE_ALL, ...genderOptions].map((gender) => (
                         <button key={gender} className={chipClass(selectedGender === gender)} onClick={() => setSelectedGender(gender)}>
-                          {gender}
+                          {displayTag(gender)}
+                        </button>
+                      ))}
+                    </div>
+                    <div className="mb-2 flex flex-wrap items-center gap-2">
+                      <span className="text-[11px] text-slate-500">年龄</span>
+                      {[UNIQUE_ALL, ...ageOptions].map((age) => (
+                        <button key={age} className={chipClass(selectedAge === age)} onClick={() => setSelectedAge(age)}>
+                          {displayTag(age)}
                         </button>
                       ))}
                     </div>
                     <div className="flex flex-wrap items-center gap-2">
-                      <span className="text-[11px] text-slate-500">风格</span>
-                      {styleTagOptions.length > 12 ? (
+                      <span className="text-[11px] text-slate-500">质量</span>
+                      {[UNIQUE_ALL, ...qualityOptions].map((quality) => (
                         <button
-                          className="rounded border border-slate-200 px-2 py-0.5 text-[10px] text-slate-600 hover:bg-slate-100"
-                          onClick={() => setStyleTagsExpanded((prev) => !prev)}
+                          key={quality}
+                          className={chipClass(selectedQuality === quality)}
+                          onClick={() => setSelectedQuality(quality)}
                         >
-                          {styleTagsExpanded ? "收起" : `展开 ${styleTagOptions.length - 12} 项`}
+                          {displayTag(quality)}
                         </button>
-                      ) : null}
-                      {styleTagOptions.length === 0 ? (
-                        <span className="text-[11px] text-slate-400">暂无风格标签</span>
-                      ) : (
-                        visibleStyleTagOptions.map((tag) => (
-                          <button key={tag} className={chipClass(activeStyleTags.includes(tag))} onClick={() => toggleStyleTag(tag)}>
-                            {tag}
-                          </button>
-                        ))
-                      )}
+                      ))}
                     </div>
                   </div>
 
@@ -717,7 +873,7 @@ export function VoiceSelector({
 
                   <div className="max-h-[56vh] overflow-y-auto rounded border border-slate-100">
                     {loadingModels ? (
-                      <div className="p-3 text-xs text-slate-500">正在拉取 Fish Audio 官方预设音色...</div>
+                      <div className="p-3 text-xs text-slate-500">正在拉取 ElevenLabs 官方预设音色...</div>
                     ) : filteredModels.length === 0 ? (
                       <div className="p-3 text-xs text-slate-400">当前筛选条件下无可选音色</div>
                     ) : (
@@ -768,8 +924,16 @@ export function VoiceSelector({
                                 </div>
                               </div>
                               <div className="mt-2 flex flex-wrap gap-1">
+                                {normalizeFacetKey(model.category || "") === "library" ? (
+                                  <span className="rounded bg-indigo-100 px-2 py-0.5 text-[10px] text-indigo-700">Library</span>
+                                ) : null}
                                 <span className="rounded bg-slate-100 px-2 py-0.5 text-[10px] text-slate-600">{languageFromModel(model)}</span>
                                 <span className="rounded bg-slate-100 px-2 py-0.5 text-[10px] text-slate-600">{genderFromModel(model)}</span>
+                                <span className="rounded bg-slate-100 px-2 py-0.5 text-[10px] text-slate-600">{accentFromModel(model)}</span>
+                                <span className="rounded bg-slate-100 px-2 py-0.5 text-[10px] text-slate-600">{ageFromModel(model)}</span>
+                                {qualityFromModel(model) ? (
+                                  <span className="rounded bg-slate-100 px-2 py-0.5 text-[10px] text-slate-600">{qualityFromModel(model)}</span>
+                                ) : null}
                                 {displayTags.map((tag) => (
                                   <span key={`${model._id}-${tag}`} className="rounded bg-slate-100 px-2 py-0.5 text-[10px] text-slate-600">
                                     {tag}
@@ -801,7 +965,7 @@ export function VoiceSelector({
                     <button
                       className="rounded border border-slate-200 px-3 py-2 text-xs text-slate-600 hover:bg-slate-50 disabled:opacity-50"
                       onClick={() => void loadPage(currentPage + 1)}
-                      disabled={changingPage || currentPage >= totalPages}
+                      disabled={changingPage || (!hasMorePage && currentPage >= totalPages)}
                     >
                       {changingPage ? "切换中..." : "下一页"}
                     </button>
@@ -811,7 +975,7 @@ export function VoiceSelector({
 
               {mode === "custom" ? (
                 <div className="mt-3 space-y-2">
-                  <div className="text-xs text-slate-500">可直接输入 Fish Audio 音色 ID。</div>
+                  <div className="text-xs text-slate-500">可直接输入 ElevenLabs 音色 ID。</div>
                   <input
                     type="text"
                     placeholder="请输入音色 ID"
@@ -851,8 +1015,19 @@ export function VoiceSelector({
                           accept="audio/*"
                           className="hidden"
                           onChange={(e) => {
-                            setCloneFile(e.target.files?.[0] || null);
+                            const file = e.target.files?.[0] || null;
+                            setCloneFile(file);
+                            setCloneDurationSec(null);
                             resetCloneResult();
+                            if (!file) return;
+                            setDetectingCloneDuration(true);
+                            void detectAudioDuration(file)
+                              .then((duration) => {
+                                setCloneDurationSec(duration);
+                              })
+                              .finally(() => {
+                                setDetectingCloneDuration(false);
+                              });
                           }}
                           disabled={cloning}
                         />
@@ -861,6 +1036,20 @@ export function VoiceSelector({
                     <div className="mt-2 rounded border border-dashed border-slate-200 bg-white px-2 py-1.5 text-[11px] text-slate-500">
                       {cloneFile ? `已选择文件：${cloneFile.name}` : "尚未选择音频文件"}
                     </div>
+                    {cloneFile ? (
+                      <div className="mt-1 text-[11px] text-slate-500">
+                        {detectingCloneDuration
+                          ? "正在分析音频时长..."
+                          : cloneDurationSec
+                            ? `音频时长约 ${cloneDurationSec.toFixed(1)} 秒`
+                            : "未能识别音频时长，仍可继续克隆"}
+                      </div>
+                    ) : null}
+                    {cloneFile && !detectingCloneDuration && cloneDurationSec !== null && cloneDurationSec < 30 ? (
+                      <div className="mt-1 rounded border border-amber-200 bg-amber-50 px-2 py-1 text-[11px] text-amber-700">
+                        当前音频不足 30 秒，允许继续克隆，但可能出现音色相似度不足、稳定性较差或发音漂移。
+                      </div>
+                    ) : null}
                     <button
                       className="mt-2 w-full rounded bg-indigo-600 py-2 text-xs text-white hover:bg-indigo-700 disabled:opacity-50"
                       onClick={handleCloneSubmit}

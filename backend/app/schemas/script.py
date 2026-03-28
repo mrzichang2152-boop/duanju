@@ -57,6 +57,24 @@ class ScriptGenerateResponse(BaseModel):
     content: str
 
 
+class StoryboardTaskStartRequest(BaseModel):
+    episode_index: int
+    episode_title: str
+    episode_content: str
+    model: Optional[str] = None
+    instruction: Optional[str] = None
+
+
+class StoryboardTaskStatusResponse(BaseModel):
+    task_id: str
+    project_id: str
+    episode_index: int
+    episode_title: str
+    status: Literal["running", "completed", "failed"]
+    content: Optional[str] = None
+    error: Optional[str] = None
+
+
 class ScriptHistoryItem(BaseModel):
     id: str
     project_id: str
@@ -75,4 +93,3 @@ class ScriptHistoryItem(BaseModel):
 
 class ScriptHistoryResponse(BaseModel):
     items: list[ScriptHistoryItem]
-

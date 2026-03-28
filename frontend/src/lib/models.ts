@@ -25,6 +25,42 @@ export const extractModels = (raw: unknown): string[] => {
   return [];
 };
 
+/** 从 /linkapi/models 响应中提取 GRSAI 绘画模型（kind=draw 或 id 以 nano-banana 开头） */
+export const extractDrawModels = (raw: unknown): string[] => {
+  const ordered: string[] = [];
+  const seen = new Set<string>();
+  const push = (id: string) => {
+    const t = id.trim();
+    if (!t) return;
+    const k = t.toLowerCase();
+    if (seen.has(k)) return;
+    seen.add(k);
+    ordered.push(t);
+  };
+  const walk = (arr: unknown) => {
+    if (!Array.isArray(arr)) return;
+    for (const item of arr) {
+      if (!item || typeof item !== "object") continue;
+      const r = item as Record<string, unknown>;
+      const id = typeof r.id === "string" ? r.id : "";
+      if (!id.trim()) continue;
+      const kind = String(r.kind || "").toLowerCase();
+      if (kind === "draw" || id.toLowerCase().startsWith("nano-banana")) {
+        push(id.trim());
+      }
+    }
+  };
+  if (Array.isArray(raw)) {
+    walk(raw);
+    return ordered;
+  }
+  if (typeof raw === "object" && raw) {
+    const record = raw as Record<string, unknown>;
+    walk(record.data ?? record.models ?? record.results);
+  }
+  return ordered;
+};
+
 export const filterModels = (models: string[], kind: "text" | "image" | "video") => {
   const filtered = models.filter((model) => {
     const value = model.toLowerCase();
@@ -39,7 +75,9 @@ export const filterModels = (models: string[], kind: "text" | "image" | "video")
         value.includes("dream") ||
         value.includes("flux") ||
         value.includes("midjourney") ||
-        value.includes("dall-e")
+        value.includes("dall-e") ||
+        value.includes("nano-banana") ||
+        value.includes("nanobanana")
       );
     }
     if (kind === "video") {

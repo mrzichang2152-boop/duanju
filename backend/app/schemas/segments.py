@@ -8,6 +8,7 @@ class SegmentVersionResponse(BaseModel):
     video_url: str
     prompt: Optional[str]
     status: str
+    task_id: Optional[str] = None
     is_selected: bool
 
 
@@ -16,6 +17,8 @@ class SegmentResponse(BaseModel):
     order_index: int
     text_content: str
     status: str
+    task_status: Optional[str] = None
+    task_id: Optional[str] = None
     versions: list[SegmentVersionResponse]
 
 
@@ -28,3 +31,14 @@ class SegmentGenerateRequest(BaseModel):
 
 class SegmentSelectRequest(BaseModel):
     version_id: str
+
+
+class SegmentFrameGenerateRequest(BaseModel):
+    prompt: str
+    references: Optional[list[str]] = None
+    frame_type: Optional[str] = "first"
+    aspect_ratio: Optional[str] = "16:9"
+
+
+class SegmentFrameGenerateResponse(BaseModel):
+    image_url: str

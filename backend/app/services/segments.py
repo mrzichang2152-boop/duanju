@@ -1,4 +1,5 @@
 from __future__ import annotations
+import os
 from typing import Optional, Union
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -15,7 +16,12 @@ async def list_segments(session: AsyncSession, project_id: str) -> list[Segment]
 
 
 async def list_segment_versions(session: AsyncSession, segment_id: str) -> list[SegmentVersion]:
-    result = await session.execute(select(SegmentVersion).where(SegmentVersion.segment_id == segment_id))
+    # Use order_by to ensure consistent order, though not strictly required
+    result = await session.execute(
+        select(SegmentVersion)
+        .where(SegmentVersion.segment_id == segment_id)
+        .order_by(SegmentVersion.created_at.desc())
+    )
     return list(result.scalars().all())
 
 
@@ -100,10 +106,14 @@ async def create_segments_from_script(session: AsyncSession, project_id: str) ->
 
 
 async def create_segment_version(
-    session: AsyncSession, segment_id: str, video_url: str, prompt: Optional[str] = None
+    session: AsyncSession, segment_id: str, video_url: str, prompt: Optional[str] = None, task_id: Optional[str] = None, status: str = "COMPLETED"
 ) -> SegmentVersion:
+    result = await session.execute(select(SegmentVersion).where(SegmentVersion.segment_id == segment_id))
+    existing_versions = list(result.scalars().all())
+    for existing in existing_versions:
+        existing.is_selected = False
     version = SegmentVersion(
-        segment_id=segment_id, video_url=video_url, prompt=prompt, is_selected=False
+        segment_id=segment_id, video_url=video_url, prompt=prompt, task_id=task_id, status=status, is_selected=True
     )
     session.add(version)
     await session.commit()
@@ -117,3 +127,43 @@ async def select_segment_version(session: AsyncSession, segment_id: str, version
     for version in versions:
         version.is_selected = version.id == version_id
     await session.commit()
+
+
+def _remove_local_static_video(video_url: str) -> None:
+    normalized = str(video_url or "").strip()
+    if not normalized.startswith("/static/"):
+        return
+    base_dir = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
+    static_root = os.path.abspath(os.path.join(base_dir, "static"))
+    abs_path = os.path.abspath(os.path.join(static_root, normalized.replace("/static/", "", 1)))
+    try:
+        if os.path.commonpath([abs_path, static_root]) != static_root:
+            return
+    except ValueError:
+        return
+    if os.path.isfile(abs_path):
+        os.remove(abs_path)
+
+
+async def delete_segment_version(session: AsyncSession, segment_id: str, version_id: str) -> None:
+    result = await session.execute(
+        select(SegmentVersion)
+        .where(SegmentVersion.segment_id == segment_id)
+        .order_by(SegmentVersion.created_at.desc())
+    )
+    versions = list(result.scalars().all())
+    target = next((item for item in versions if item.id == version_id), None)
+    if not target:
+        raise ValueError("视频版本不存在")
+    target_video_url = str(target.video_url or "").strip()
+    was_selected = bool(target.is_selected)
+    await session.delete(target)
+    await session.flush()
+    remaining = [item for item in versions if item.id != version_id]
+    if remaining:
+        if was_selected or not any(bool(item.is_selected) for item in remaining):
+            latest = remaining[0]
+            for item in remaining:
+                item.is_selected = item.id == latest.id
+    await session.commit()
+    _remove_local_static_video(target_video_url)

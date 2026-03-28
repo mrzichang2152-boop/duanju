@@ -1,16 +1,19 @@
-version: '3.8'
+name: "duanju"
 
 services:
   backend:
     build: ./backend
     restart: always
+    env_file:
+      - ./backend/.env
     environment:
       - DATABASE_URL=sqlite+aiosqlite:////app/data/db.sqlite3
-      - SECRET_KEY=changeme
+      - SECRET_KEY=change-me
       - ACCESS_TOKEN_EXPIRE_MINUTES=10080
       - CORS_ORIGINS=*
     volumes:
       - ./data:/app/data
+      - ./backend/static:/app/static
     ports:
       - "8003:8000"
     networks:
@@ -22,6 +25,8 @@ services:
       args:
         NEXT_PUBLIC_API_BASE_URL: /api
     restart: always
+    environment:
+      - BACKEND_URL=http://backend:8000
     ports:
       - "3001:3000"
     networks:
@@ -31,9 +36,13 @@ services:
     image: nginx:alpine
     restart: always
     ports:
+      - "80:80"
       - "8088:80"
+      - "443:443"
     volumes:
       - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./zichang.fun.pem:/etc/nginx/certs/zichang.fun.pem:ro
+      - ./zichang.fun.key:/etc/nginx/certs/zichang.fun.key:ro
     depends_on:
       - frontend
       - backend

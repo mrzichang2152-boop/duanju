@@ -1,13 +1,16 @@
 import re
+import asyncio
 from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File
 from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 import json
 import logging
-from typing import Optional
+from typing import Optional, Any
+from uuid import uuid4
+from datetime import datetime
 
 from app.api.deps import get_current_user_id
-from app.core.db import get_db
+from app.core.db import get_db, SessionLocal
 from app.schemas.script import (
     ScriptGenerateRequest,
     ScriptGenerateResponse,
@@ -18,6 +21,8 @@ from app.schemas.script import (
     ScriptHistoryResponse,
     ScriptHistoryItem,
     ScriptParseResponse,
+    StoryboardTaskStartRequest,
+    StoryboardTaskStatusResponse,
 )
 from app.services.projects import get_project
 from app.services.script_validation import validate_script_with_model as run_validation
@@ -48,6 +53,172 @@ from app.core.script_prompts import (
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
+_storyboard_task_lock = asyncio.Lock()
+_storyboard_tasks: dict[str, dict[str, Any]] = {}
+_OPENROUTER_TEXT_MODEL = "gemini-3.1-pro"
+
+
+def _build_storyboard_text_from_episodes(episodes: list[dict[str, Any]]) -> str:
+    return "\n\n".join([f"### {str(item.get('title') or '').strip()}\n\n{str(item.get('storyboard') or '').strip()}" for item in episodes])
+
+
+def _normalize_mode_model(mode: str, model: Optional[str]) -> str:
+    return _OPENROUTER_TEXT_MODEL
+
+
+async def _build_storyboard_prompt_user_content(
+    db: AsyncSession,
+    project_id: str,
+    content: str,
+    instruction: Optional[str],
+) -> str:
+    assets = await list_assets(db, project_id)
+    asset_context = ""
+    if assets:
+        asset_context = "【可用素材库】\n请在生成分镜时，参考以下素材信息。如果当前镜头使用了某个素材（角色、道具、场景），请务必在该单元格描述的末尾加上 `[AssetID:素材ID]` 标记，以便程序自动关联图片。\n"
+        valid_asset_types = ["CHARACTER_LOOK", "PROP", "SCENE"]
+        filtered_assets = [a for a in assets if a.type in valid_asset_types]
+        type_mapping = {
+            "CHARACTER_LOOK": "角色形象",
+            "PROP": "道具",
+            "SCENE": "场景"
+        }
+        for asset in filtered_assets:
+            desc = asset.description or "无描述"
+            type_display = type_mapping.get(asset.type, asset.type)
+            asset_context += f"- [{type_display}] {asset.name} (ID: {asset.id}): {desc}\n"
+        asset_context += "\n"
+        logger.info(f"Attached {len(filtered_assets)} assets to storyboard prompt (filtered from {len(assets)})")
+
+    style_instruction = (instruction or "").strip()
+    style_block = f"【全局风格要求】\n{style_instruction}\n\n" if style_instruction else ""
+
+    return (
+        f"{style_block}"
+        f"{asset_context}"
+        f"请将以下剧本转换为分镜脚本：\n\n{content}\n\n"
+        "【再次提醒】\n"
+        "时间轴单行时长必须在3~15秒，禁止把7~8秒作为默认折中值；"
+        "同画面与同场景的连续动作优先在15秒范围内合并成长镜头，接近15秒再切分。\n"
+        "只要有台词，必须逐句标注角色名与起止秒（开始秒-结束秒），并在该句中写清说话时的表情变化、眼神指向和语气/音量/语速。\n"
+        "请务必使用素材库中的AssetID标记角色、道具和场景。严禁省略。"
+        "如果某个角色/道具/场景在素材库中存在，必须附带 `[AssetID:xxx]`，否则视为错误。"
+        "如果同一镜头出现多个角色，角色形象列必须逐个列出所有角色形象，且每个角色都要附带各自的 `[AssetID:xxx]`。"
+    )
+
+
+async def _run_storyboard_task(task_id: str) -> None:
+    async with _storyboard_task_lock:
+        task = _storyboard_tasks.get(task_id)
+        if not task:
+            return
+        task["status"] = "running"
+        task["started_at"] = datetime.utcnow().isoformat()
+    try:
+        async with SessionLocal() as session:
+            user_prompt = await _build_storyboard_prompt_user_content(
+                session,
+                task["project_id"],
+                task["episode_content"],
+                task.get("instruction"),
+            )
+            content_chunks: list[str] = []
+            async for chunk in create_chat_completion_stream(
+                session,
+                task["user_id"],
+                {
+                    "model": task["model"],
+                    "messages": [
+                        {"role": "system", "content": PROMPT_STORYBOARD},
+                        {"role": "user", "content": user_prompt},
+                    ],
+                    "temperature": 0.7,
+                    "max_tokens": 120000,
+                },
+            ):
+                if isinstance(chunk, str):
+                    if chunk.startswith("Error:"):
+                        raise RuntimeError(chunk[6:].strip() or "分镜生成失败")
+                    continue
+                if not isinstance(chunk, dict):
+                    continue
+                choices = chunk.get("choices") if isinstance(chunk, dict) else None
+                if not choices:
+                    continue
+                first_choice = choices[0] if isinstance(choices[0], dict) else {}
+                delta = first_choice.get("delta") if isinstance(first_choice, dict) else None
+                piece = None
+                if isinstance(delta, dict):
+                    piece = delta.get("content") or delta.get("reasoning_content")
+                if not piece and isinstance(first_choice.get("message"), dict):
+                    msg_obj = first_choice.get("message")
+                    piece = msg_obj.get("content") or msg_obj.get("reasoning_content")
+                if piece:
+                    content_chunks.append(str(piece))
+            generated = "".join(content_chunks).strip()
+            if not generated:
+                raise RuntimeError("分镜生成结果为空（上游返回空内容）")
+            logger.info("Storyboard task completed task_id=%s project_id=%s episode_index=%s content_len=%s", task_id, task["project_id"], task["episode_index"], len(generated))
+
+            script = await get_active_script(session, task["project_id"])
+            episodes: list[dict[str, Any]] = []
+            if script and script.episodes:
+                parsed = json.loads(script.episodes)
+                if isinstance(parsed, list):
+                    episodes = [dict(item) for item in parsed]
+            index = int(task["episode_index"])
+            if index < 0 or index >= len(episodes):
+                raise RuntimeError("分集索引已变化，请刷新后重试")
+            target = dict(episodes[index])
+            target["storyboard"] = generated
+            target["storyboardTaskId"] = task_id
+            target["storyboardTaskStatus"] = "completed"
+            target["storyboardTaskError"] = ""
+            episodes[index] = target
+            storyboard_text = _build_storyboard_text_from_episodes(episodes)
+            await save_script(
+                session,
+                task["project_id"],
+                None,
+                None,
+                storyboard_text,
+                None,
+                episodes,
+            )
+            async with _storyboard_task_lock:
+                latest = _storyboard_tasks.get(task_id) or {}
+                latest["status"] = "completed"
+                latest["content"] = generated
+                latest["error"] = ""
+                latest["finished_at"] = datetime.utcnow().isoformat()
+                _storyboard_tasks[task_id] = latest
+    except Exception as exc:
+        logger.exception("Storyboard task failed task_id=%s project_id=%s episode_index=%s", task_id, task.get("project_id"), task.get("episode_index"))
+        async with _storyboard_task_lock:
+            latest = _storyboard_tasks.get(task_id) or {}
+            latest["status"] = "failed"
+            latest["error"] = str(exc)
+            latest["finished_at"] = datetime.utcnow().isoformat()
+            _storyboard_tasks[task_id] = latest
+        try:
+            async with SessionLocal() as session:
+                script = await get_active_script(session, task["project_id"])
+                episodes: list[dict[str, Any]] = []
+                if script and script.episodes:
+                    parsed = json.loads(script.episodes)
+                    if isinstance(parsed, list):
+                        episodes = [dict(item) for item in parsed]
+                index = int(task["episode_index"])
+                if 0 <= index < len(episodes):
+                    target = dict(episodes[index])
+                    target["storyboardTaskId"] = task_id
+                    target["storyboardTaskStatus"] = "failed"
+                    target["storyboardTaskError"] = str(exc)
+                    episodes[index] = target
+                    await save_script(session, task["project_id"], None, None, None, None, episodes)
+        except Exception:
+            logger.exception("更新分镜任务失败状态时异常")
+
 
 @router.get("/{project_id}/script", response_model=ScriptResponse)
 async def fetch_script(
@@ -98,6 +269,18 @@ async def update_script(
         payload.outline,
         payload.episodes
     )
+    from app.services.media_storage import upload_script_snapshot_to_cos
+
+    snapshot = "\n\n".join(
+        part
+        for part in (
+            script.content or "",
+            script.storyboard or "",
+            script.outline or "",
+        )
+        if (part or "").strip()
+    )
+    await upload_script_snapshot_to_cos(project_id, script.version, snapshot or (script.content or ""))
     return ScriptResponse(
         id=script.id,
         project_id=project_id,
@@ -177,6 +360,141 @@ async def validate_script(
     )
 
 
+@router.post("/{project_id}/script/storyboard-tasks/start", response_model=StoryboardTaskStatusResponse)
+async def start_storyboard_task(
+    project_id: str,
+    payload: StoryboardTaskStartRequest,
+    user_id: str = Depends(get_current_user_id),
+    db: AsyncSession = Depends(get_db),
+) -> StoryboardTaskStatusResponse:
+    project = await get_project(db, user_id, project_id)
+    if not project:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="项目不存在")
+
+    episode_index = int(payload.episode_index)
+    if episode_index < 0:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="分集索引无效")
+    episode_title = str(payload.episode_title or "").strip() or f"第{episode_index + 1}集"
+    episode_content = str(payload.episode_content or "").strip()
+    if not episode_content:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="分集内容为空，无法生成分镜")
+    model = _normalize_mode_model("generate_storyboard", payload.model)
+
+    existing_task: dict[str, Any] | None = None
+    async with _storyboard_task_lock:
+        for item in _storyboard_tasks.values():
+            if (
+                item.get("project_id") == project_id
+                and item.get("user_id") == user_id
+                and int(item.get("episode_index", -1)) == episode_index
+                and item.get("status") in {"pending", "running"}
+            ):
+                existing_task = item
+                break
+        if not existing_task:
+            task_id = str(uuid4())
+            task = {
+                "task_id": task_id,
+                "project_id": project_id,
+                "user_id": user_id,
+                "episode_index": episode_index,
+                "episode_title": episode_title,
+                "episode_content": episode_content,
+                "instruction": payload.instruction,
+                "model": model,
+                "status": "pending",
+                "content": None,
+                "error": None,
+                "created_at": datetime.utcnow().isoformat(),
+                "started_at": None,
+                "finished_at": None,
+            }
+            _storyboard_tasks[task_id] = task
+            existing_task = task
+
+    script = await get_active_script(db, project_id)
+    episodes: list[dict[str, Any]] = []
+    if script and script.episodes:
+        parsed = json.loads(script.episodes)
+        if isinstance(parsed, list):
+            episodes = [dict(item) for item in parsed]
+    if 0 <= episode_index < len(episodes):
+        target = dict(episodes[episode_index])
+        target["storyboardTaskId"] = str(existing_task["task_id"])
+        target["storyboardTaskStatus"] = str(existing_task["status"])
+        target["storyboardTaskError"] = ""
+        episodes[episode_index] = target
+        await save_script(db, project_id, None, None, None, None, episodes)
+
+    status_value = str(existing_task.get("status") or "running")
+    if status_value == "pending":
+        asyncio.create_task(_run_storyboard_task(str(existing_task["task_id"])))
+        status_value = "running"
+        async with _storyboard_task_lock:
+            latest = _storyboard_tasks.get(str(existing_task["task_id"]))
+            if latest:
+                latest["status"] = "running"
+
+    return StoryboardTaskStatusResponse(
+        task_id=str(existing_task["task_id"]),
+        project_id=project_id,
+        episode_index=episode_index,
+        episode_title=episode_title,
+        status=status_value if status_value in {"running", "completed", "failed"} else "running",
+        content=existing_task.get("content"),
+        error=existing_task.get("error"),
+    )
+
+
+@router.get("/{project_id}/script/storyboard-tasks/{task_id}", response_model=StoryboardTaskStatusResponse)
+async def get_storyboard_task_status(
+    project_id: str,
+    task_id: str,
+    user_id: str = Depends(get_current_user_id),
+    db: AsyncSession = Depends(get_db),
+) -> StoryboardTaskStatusResponse:
+    project = await get_project(db, user_id, project_id)
+    if not project:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="项目不存在")
+    async with _storyboard_task_lock:
+        task = _storyboard_tasks.get(task_id)
+    if not task or task.get("project_id") != project_id or task.get("user_id") != user_id:
+        script = await get_active_script(db, project_id)
+        episodes: list[dict[str, Any]] = []
+        if script and script.episodes:
+            parsed = json.loads(script.episodes)
+            if isinstance(parsed, list):
+                episodes = [dict(item) for item in parsed]
+        for index, episode in enumerate(episodes):
+            if str(episode.get("storyboardTaskId") or "").strip() != task_id:
+                continue
+            status_value = str(episode.get("storyboardTaskStatus") or "running")
+            if status_value not in {"running", "completed", "failed"}:
+                status_value = "running"
+            return StoryboardTaskStatusResponse(
+                task_id=task_id,
+                project_id=project_id,
+                episode_index=index,
+                episode_title=str(episode.get("title") or f"第{index + 1}集"),
+                status=status_value,
+                content=str(episode.get("storyboard") or "") if status_value == "completed" else None,
+                error=str(episode.get("storyboardTaskError") or "") if status_value == "failed" else None,
+            )
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="任务不存在")
+    status_value = str(task.get("status") or "running")
+    if status_value not in {"running", "completed", "failed"}:
+        status_value = "running"
+    return StoryboardTaskStatusResponse(
+        task_id=str(task.get("task_id") or task_id),
+        project_id=project_id,
+        episode_index=int(task.get("episode_index") or 0),
+        episode_title=str(task.get("episode_title") or ""),
+        status=status_value,
+        content=str(task.get("content") or "") if status_value == "completed" else None,
+        error=str(task.get("error") or "") if status_value == "failed" else None,
+    )
+
+
 @router.post("/{project_id}/script/generate")
 async def generate_script(
     project_id: str,
@@ -189,60 +507,14 @@ async def generate_script(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="项目不存在")
 
     settings = await get_or_create_settings(db, user_id)
-    model = payload.model or settings.default_model_text
-    model_text = (model or "").strip()
-    model_text_lower = model_text.lower()
-    if (
-        not model_text
-        or model_text_lower == "doubao-pro"
-        or "gemini" in model_text_lower
-        or "gpt" in model_text_lower
-        or "openrouter" in model_text_lower
-    ):
-        model = "doubao-seed-2-0-pro-260215"
+    model = _normalize_mode_model(payload.mode, payload.model or settings.default_model_text)
     
     system_prompt = get_system_prompt(payload.mode)
     user_prompt = payload.content
     
     if payload.mode == "generate_storyboard":
         system_prompt = PROMPT_STORYBOARD
-        
-        # Build asset context first
-        assets = await list_assets(db, project_id)
-        asset_context = ""
-        if assets:
-            asset_context = "【可用素材库】\n请在生成分镜时，参考以下素材信息。如果当前镜头使用了某个素材（角色、道具、场景），请务必在该单元格描述的末尾加上 `[AssetID:素材ID]` 标记，以便程序自动关联图片。\n"
-            
-            # Filter out generic CHARACTER assets, only use CHARACTER_LOOK, PROP, SCENE
-            valid_asset_types = ["CHARACTER_LOOK", "PROP", "SCENE"]
-            filtered_assets = [a for a in assets if a.type in valid_asset_types]
-            
-            type_mapping = {
-                "CHARACTER_LOOK": "角色形象",
-                "PROP": "道具",
-                "SCENE": "场景"
-            }
-
-            for asset in filtered_assets:
-                desc = asset.description or "无描述"
-                # Map internal type to Chinese label for better LLM understanding
-                type_display = type_mapping.get(asset.type, asset.type)
-                asset_context += f"- [{type_display}] {asset.name} (ID: {asset.id}): {desc}\n"
-            
-            asset_context += "\n"
-            logger.info(f"Attached {len(filtered_assets)} assets to storyboard prompt (filtered from {len(assets)})")
-
-        style_instruction = (payload.instruction or "").strip()
-        style_block = f"【全局风格要求】\n{style_instruction}\n\n" if style_instruction else ""
-
-        user_prompt = (
-            f"{style_block}"
-            f"{asset_context}"
-            f"请将以下剧本转换为分镜脚本：\n\n{user_prompt}\n\n"
-            "【再次提醒】\n"
-            "请务必使用素材库中的AssetID标记角色、道具和场景。严禁省略。"
-            "如果某个角色/道具/场景在素材库中存在，必须附带 `[AssetID:xxx]`，否则视为错误。"
-        )
+        user_prompt = await _build_storyboard_prompt_user_content(db, project_id, payload.content, payload.instruction)
     
     if payload.mode == "suggestion_paid":
         system_prompt = PROMPT_SUGGESTION_PAID
@@ -263,7 +535,7 @@ async def generate_script(
             user_prompt = f"{user_prompt}\n\n【创作要求】\n{payload.instruction}"
 
         # Use Pro model for Step 0 but disable thinking mode
-        model = "doubao-seed-2-0-pro-260215"
+        model = _OPENROUTER_TEXT_MODEL
     elif payload.mode == "step0_continue":
         system_prompt = """你是一个专业的短剧编剧。请严格按照用户提供的上下文信息进行续写。
 请仔细区分以下信息块：
@@ -283,7 +555,7 @@ async def generate_script(
 【续写要求】
 {instruction_block}"""
         
-        model = "doubao-seed-2-0-pro-260215"
+        model = _OPENROUTER_TEXT_MODEL
     elif payload.mode == "step0_modify":
         system_prompt = """你是一个专业的短剧编剧。请根据用户提供的上下文信息（包含写作规范、角色设定、完整剧本）以及修改要求，对【指定集数】的内容进行修改。
 请仔细区分以下信息块：
@@ -303,7 +575,7 @@ async def generate_script(
 【修改要求】
 {instruction_block}"""
         
-        model = "doubao-seed-2-0-pro-260215"
+        model = _OPENROUTER_TEXT_MODEL
     elif payload.mode == "split_script":
         system_prompt = PROMPT_SPLIT_SCRIPT
         user_prompt = f"请将以下剧本进行分集拆分：\n\n{payload.content}"
@@ -333,12 +605,19 @@ async def generate_script(
             async for chunk in create_chat_completion_stream(db, user_id, api_payload):
                  # Check if chunk is a dict (parsed JSON) or raw bytes/string
                 if isinstance(chunk, dict):
+                    error_obj = chunk.get("error")
+                    error_text = ""
+                    if isinstance(error_obj, str):
+                        error_text = error_obj.strip()
+                    elif isinstance(error_obj, dict):
+                        error_text = str(error_obj.get("message") or error_obj.get("code") or "").strip()
+                    if error_text:
+                        yield f"data: {json.dumps({'error': error_text})}\n\n"
+                        return
                     delta = chunk.get("choices", [{}])[0].get("delta", {})
                     content = delta.get("content", "")
                     reasoning = delta.get("reasoning_content", "")
-                    
                     if content or reasoning:
-                        # Yield SSE format
                         yield f"data: {json.dumps({'choices': [{'delta': {'content': content, 'reasoning_content': reasoning}}]})}\n\n"
                 elif isinstance(chunk, str):
                     if chunk.startswith("Error:"):
@@ -404,7 +683,7 @@ async def parse_script_file(
         """
 
         payload = {
-            "model": "doubao-seed-2-0-pro-260215",
+            "model": _OPENROUTER_TEXT_MODEL,
             "messages": [
                 {"role": "system", "content": "你是一个严谨的剧本分析助手。请提取元数据和定位信息，不要生成剧本正文内容。"},
                 {"role": "user", "content": prompt}

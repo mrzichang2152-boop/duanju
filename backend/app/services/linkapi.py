@@ -104,14 +104,20 @@ def _map_openrouter_model(model: str) -> str:
 
 
 async def _resolve_openrouter_key(session: AsyncSession, user_id: str) -> str:
-    configured_key = await get_api_key(session, user_id)
-    return (
+    env_key = (
         str(getattr(app_settings, "grsai_api_key", "") or "").strip()
         or os.getenv("GRSAI_API_KEY", "").strip()
         or app_settings.suchuang_api_key.strip()
         or os.getenv("SUCHUANG_API_KEY", "").strip()
-        or str(configured_key or "").strip()
     )
+    if env_key:
+        return env_key
+    try:
+        configured_key = await get_api_key(session, user_id)
+    except Exception as exc:
+        logger.warning("读取用户配置 API Key 失败，回退到环境变量: %s", exc)
+        configured_key = ""
+    return str(configured_key or "").strip()
 
 
 def _normalize_message_content(content: Any) -> str:
@@ -187,15 +193,24 @@ def _extract_suchuang_text(value: Any) -> str:
                     content_text = _extract_suchuang_text(message.get("content"))
                     if content_text:
                         return content_text
+                    reasoning_text = _extract_suchuang_text(message.get("reasoning_content"))
+                    if reasoning_text:
+                        return reasoning_text
                 delta = item.get("delta")
                 if isinstance(delta, dict):
                     delta_text = _extract_suchuang_text(delta.get("content"))
                     if delta_text:
                         return delta_text
+                    delta_reasoning = _extract_suchuang_text(delta.get("reasoning_content"))
+                    if delta_reasoning:
+                        return delta_reasoning
                 item_text = _extract_suchuang_text(item.get("text"))
                 if item_text:
                     return item_text
-        for key in ("content", "text", "result", "output", "answer", "data", "message"):
+                item_reasoning = _extract_suchuang_text(item.get("reasoning_content"))
+                if item_reasoning:
+                    return item_reasoning
+        for key in ("content", "text", "result", "output", "answer", "reasoning_content", "data", "message"):
             if key not in value:
                 continue
             extracted = _extract_suchuang_text(value.get(key))
@@ -663,10 +678,13 @@ def _coerce_grsai_draw_image_size(model: str, payload: dict[str, Any]) -> str:
     """按 GRSAI 文档约束 imageSize；错误组合易导致任务卡住或久不返回终态。"""
     m = (model or "").strip().lower()
     base = _resolve_suchuang_size(payload)
+    # 临时策略：nano-banana-2 统一压到 2K，避免上游按 4K 专线归类为 -4k-cl
+    if m == "nano-banana-2":
+        return "2K"
     # 仅支持 4K
     if m in {"nano-banana-pro-4k-vip"}:
         return "4K"
-    # 仅支持 1K、2K（文档：nano-banana-2-cl / nano-banana-pro-vip；nano-banana-2 未标注限制）
+    # 仅支持 1K、2K（文档：nano-banana-2-cl / nano-banana-pro-vip）
     if m in {"nano-banana-2-cl", "nano-banana-pro-vip"}:
         if base == "4K":
             return "2K"
@@ -697,11 +715,16 @@ async def _poll_suchuang_image_result(
     except Exception:
         max_wall_seconds = 200.0
     max_wall_seconds = max(60.0, min(300.0, max_wall_seconds))
+    # running 状态下 progress 可能长时间不变（例如上游排队），默认不要早于总墙钟超时判失败。
+    default_stall_polls = int(max_wall_seconds // 2)  # 轮询间隔 2s
     try:
-        stall_poll_threshold = int(str(os.getenv("GRSAI_POLL_STALL_POLLS", "30")).strip() or "30")
+        stall_poll_threshold = int(
+            str(os.getenv("GRSAI_POLL_STALL_POLLS", str(default_stall_polls))).strip()
+            or str(default_stall_polls)
+        )
     except Exception:
-        stall_poll_threshold = 30
-    stall_poll_threshold = max(15, min(90, stall_poll_threshold))
+        stall_poll_threshold = default_stall_polls
+    stall_poll_threshold = max(30, min(300, stall_poll_threshold))
     # 用于检测 running 且 progress 长期不变（上游拉参考图失败/队列卡住常见表现）
     last_running_progress: Any = object()
     stall_polls = 0

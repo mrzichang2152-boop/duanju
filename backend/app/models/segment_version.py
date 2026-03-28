@@ -15,6 +15,7 @@ class SegmentVersion(Base):
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
     segment_id: Mapped[str] = mapped_column(String(36), index=True)
     video_url: Mapped[str] = mapped_column(Text)
+    task_id: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
     prompt: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     status: Mapped[str] = mapped_column(String(32), default="COMPLETED")
     is_selected: Mapped[bool] = mapped_column(Boolean, default=False)
