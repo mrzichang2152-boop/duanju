@@ -122,12 +122,8 @@ const resolveApiBaseUrl = () => {
 const baseUrl = resolveApiBaseUrl();
 const normalizeToken = (token?: string | null) => (token ?? "").trim();
 const REQUEST_TIMEOUT_MS = 15000;
-// 略大于后端 GRSAI_POLL_MAX_WALL_SECONDS（默认 600s），避免前端先断而后台仍在跑
-const ASSET_GENERATE_TIMEOUT_MS = 660000;
-// 图生图与文生图耗时相近（GRSAI 约 1~3 分钟），统一用 3 分钟超时
-const ASSET_GENERATE_I2I_TIMEOUT_MS = 180000;
 const VIDEO_GENERATE_TIMEOUT_MS = 420000;
-const FRAME_GENERATE_TIMEOUT_MS = 900000;
+const SCRIPT_GENERATE_TIMEOUT_MS = 240000;
 
 const request = async <T>(
   path: string,
@@ -284,7 +280,7 @@ export interface Episode {
   userInput: string;
   storyboard?: string;
   storyboardTaskId?: string;
-  storyboardTaskStatus?: "running" | "completed" | "failed";
+  storyboardTaskStatus?: "pending" | "running" | "completed" | "failed";
   storyboardTaskError?: string;
   dialogueCellAudioMap?: Record<string, Array<{ text: string; audioUrl: string }>>;
   isThinkingCollapsed?: boolean;
@@ -343,6 +339,7 @@ export type ScriptGeneratePayload = {
   content: string;
   model?: string;
   instruction?: string;
+  stream?: boolean;
 };
 
 export type ScriptGenerateResponse = {
@@ -363,9 +360,26 @@ export type StoryboardTaskStatusResponse = {
   project_id: string;
   episode_index: number;
   episode_title: string;
-  status: "running" | "completed" | "failed";
+  status: "pending" | "running" | "completed" | "failed";
   content?: string | null;
   error?: string | null;
+};
+
+export type AsyncTaskStatusResponse = {
+  task_id: string;
+  project_id: string;
+  task_type: string;
+  status: "PENDING" | "RUNNING" | "COMPLETED" | "FAILED";
+  result?: Record<string, unknown> | null;
+  error?: string | null;
+};
+
+export type Step2TaskStartPayload = {
+  op: "extract" | "modify" | "sync";
+  original_content?: string;
+  resources_content?: string;
+  model?: string;
+  instruction?: string;
 };
 
 type ScriptStreamDelta = {
@@ -385,6 +399,23 @@ export const generateScript = async (
   id: string,
   payload: ScriptGeneratePayload
 ): Promise<ScriptGenerateResponse> => {
+  if (payload.stream === false) {
+    const result = await request<ScriptGenerateResponse>(
+      `/projects/${id}/script/generate`,
+      {
+        method: "POST",
+        body: JSON.stringify(payload),
+      },
+      token,
+      SCRIPT_GENERATE_TIMEOUT_MS
+    );
+    const normalized = String(result?.content ?? "").trim();
+    if (!normalized) {
+      throw new Error("模型未返回可用内容，请检查模型权限或稍后重试");
+    }
+    return { content: normalized, thinking: String(result?.thinking ?? "") };
+  }
+
   let content = "";
   let thinking = "";
   await generateScriptStream(token, id, payload, (chunk: ScriptStreamChunk) => {
@@ -419,6 +450,23 @@ export const startStoryboardTask = (
 export const getStoryboardTaskStatus = (token: string, id: string, taskId: string) =>
   request<StoryboardTaskStatusResponse>(
     `/projects/${id}/script/storyboard-tasks/${taskId}`,
+    {},
+    token
+  );
+
+export const startStep2Task = (token: string, id: string, payload: Step2TaskStartPayload) =>
+  request<AsyncTaskStatusResponse>(
+    `/projects/${id}/script/step2-tasks/start`,
+    {
+      method: "POST",
+      body: JSON.stringify(payload),
+    },
+    token
+  );
+
+export const getStep2TaskStatus = (token: string, id: string, taskId: string) =>
+  request<AsyncTaskStatusResponse>(
+    `/projects/${id}/script/step2-tasks/${taskId}`,
     {},
     token
   );
@@ -569,18 +617,31 @@ export const generateAsset = (
   projectId: string,
   assetId: string,
   payload: { prompt?: string; model?: string; ref_image_url?: string; style?: string; options?: Record<string, unknown> }
-) => {
-  const hasRef = Boolean((payload.ref_image_url || "").trim());
-  return request<{ status: string }>(
+) =>
+  request<AsyncTaskStatusResponse>(
     `/projects/${projectId}/assets/${assetId}/generate`,
     {
       method: "POST",
       body: JSON.stringify(payload),
     },
-    token,
-    hasRef ? ASSET_GENERATE_I2I_TIMEOUT_MS : ASSET_GENERATE_TIMEOUT_MS
+    token
   );
-};
+
+export const getAssetGenerateTaskStatus = (token: string, projectId: string, taskId: string) =>
+  request<AsyncTaskStatusResponse>(
+    `/projects/${projectId}/assets/generate-tasks/${taskId}`,
+    {},
+    token
+  );
+
+export const generateAssetSubject = (token: string, projectId: string, assetId: string) =>
+  request<{ status: string; subject_id: string }>(
+    `/projects/${projectId}/assets/${assetId}/generate-subject`,
+    {
+      method: "POST",
+    },
+    token
+  );
 
 export const uploadAssetImage = async (
   token: string,
@@ -634,6 +695,9 @@ export type ElevenLabsVoiceModel = {
   labels?: Record<string, string>;
   category?: string;
   samples?: Array<{ audio?: string; text?: string; title?: string }>;
+  is_my_voice?: boolean;
+  is_clone?: boolean;
+  can_delete?: boolean;
 };
 
 export type ElevenLabsVoiceFacets = {
@@ -778,6 +842,23 @@ export const cloneElevenLabsVoice = async (token: string, file: File, title: str
   return response.json() as Promise<{ _id?: string; model_id?: string; title?: string; cover_image?: string }>;
 };
 
+export const getMyClonedElevenLabsVoices = (token: string) =>
+  request<{ items: ElevenLabsVoiceModel[]; total: number; limit: number; remaining: number }>(
+    `/eleven-labs/cloned-voices`,
+    {},
+    token,
+    45000
+  );
+
+export const deleteElevenLabsVoice = (token: string, voiceId: string) =>
+  request<{ status: string; voice_id: string }>(
+    `/eleven-labs/voices/${encodeURIComponent(voiceId)}`,
+    {
+      method: "DELETE",
+    },
+    token
+  );
+
 export const getFishAudioModels = getElevenLabsVoices;
 export type FishAudioModel = ElevenLabsVoiceModel;
 export const generateFishAudioPreview = (
@@ -818,6 +899,40 @@ export const updateCharacterVoice = (
     },
     token
   );
+
+export const uploadCharacterVoiceSample = async (
+  token: string,
+  projectId: string,
+  characterName: string,
+  file: File,
+  payload?: { title?: string; duration_sec?: number }
+) => {
+  const normalizedToken = normalizeToken(token);
+  const formData = new FormData();
+  formData.append("file", file);
+  if (payload?.title) {
+    formData.append("title", payload.title);
+  }
+  if (typeof payload?.duration_sec === "number" && Number.isFinite(payload.duration_sec)) {
+    formData.append("duration_sec", String(payload.duration_sec));
+  }
+  const response = await fetch(`${baseUrl}/projects/${projectId}/voices/${characterName}/upload-sample`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${normalizedToken}`,
+    },
+    body: formData,
+  });
+  if (response.status === 401) {
+    const bodyText = await response.text();
+    throw new Error(parseApiErrorMessage(bodyText, response.status, "登录状态校验失败，请重试"));
+  }
+  if (!response.ok) {
+    const bodyText = await response.text();
+    throw new Error(parseApiErrorMessage(bodyText, response.status, "上传音频失败"));
+  }
+  return response.json() as Promise<CharacterVoice>;
+};
 
 export const generateTTS = (
   token: string,
@@ -906,14 +1021,21 @@ export const generateSegmentFrameImage = (
   projectId: string,
   payload: { prompt: string; references?: string[]; frame_type?: "first" | "last"; aspect_ratio?: string }
 ) =>
-  request<{ image_url: string }>(
+  request<AsyncTaskStatusResponse>(
     `/projects/${projectId}/segments/frame-images/generate`,
     {
       method: "POST",
       body: JSON.stringify(payload),
     },
     token,
-    FRAME_GENERATE_TIMEOUT_MS
+    REQUEST_TIMEOUT_MS
+  );
+
+export const getSegmentFrameImageTaskStatus = (token: string, projectId: string, taskId: string) =>
+  request<AsyncTaskStatusResponse>(
+    `/projects/${projectId}/segments/frame-images/tasks/${taskId}`,
+    {},
+    token
   );
 
 export const selectSegmentVersion = (

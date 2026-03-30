@@ -169,6 +169,16 @@ async def download_image_as_local_file(image_url: str, filename_base: Optional[s
 EXCLUDED_FIELDS = ["性格", "小传", "人物小传", "角色基础信息", "信息来源", "引用", "备注"]
 
 
+def _sanitize_step2_metadata(text: str) -> str:
+    value = str(text or "").strip()
+    if not value:
+        return ""
+    value = re.sub(r"[，,；;。\s]*出场集数\s*[：:]?\s*[^，,；;。\n\r]*", "", value, flags=re.IGNORECASE)
+    value = re.sub(r"[，,；;。\s]*信息来源\s*[：:]?\s*[^，,；;。\n\r]*", "", value, flags=re.IGNORECASE)
+    value = re.sub(r"\s{2,}", " ", value)
+    return value.strip(" ，,；;。\t\n\r")
+
+
 def _extract_role_descriptions(body: str) -> dict[str, str]:
     roles: dict[str, str] = {}
     current_role: Optional[str] = None
@@ -677,7 +687,7 @@ async def extract_assets_from_script(
             continue
         name = _normalize_role_name(item.get("name", ""))
 
-        desc = item.get("description", "")
+        desc = _sanitize_step2_metadata(item.get("description", ""))
         if not name:
             continue
         key = _asset_identity_key("CHARACTER", name)
@@ -716,7 +726,7 @@ async def extract_assets_from_script(
             continue
         role = _normalize_role_name(item.get("role", ""))
         look = item.get("look", "").strip()
-        desc = item.get("description", "")
+        desc = _sanitize_step2_metadata(item.get("description", ""))
         if not role or not look:
             continue
         
@@ -762,7 +772,7 @@ async def extract_assets_from_script(
         if not isinstance(item, dict):
             continue
         name = item.get("name", "").strip()
-        desc = item.get("description", "")
+        desc = _sanitize_step2_metadata(item.get("description", ""))
         if not name:
             continue
         key = _asset_identity_key("PROP", name)
@@ -800,7 +810,7 @@ async def extract_assets_from_script(
         if not isinstance(item, dict):
             continue
         name = item.get("name", "").strip()
-        desc = item.get("description", "")
+        desc = _sanitize_step2_metadata(item.get("description", ""))
         if not name:
             continue
         key = _asset_identity_key("SCENE", name)
