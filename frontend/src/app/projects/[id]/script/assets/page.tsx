@@ -8,9 +8,7 @@ import {
   CharacterVoice,
   deleteAssetVersion,
   generateAsset,
-  generateAssetSubject,
   getAssets,
-  getAssetGenerateTaskStatus,
   getProjectVoices,
   getModels,
   getSettings,
@@ -46,14 +44,14 @@ const getAssetIdentityKey = (asset: Asset) => {
 };
 
 /** 刷新/切页后仍显示「生成中」，并在新版本落库后自动清除 */
-const ASSET_GEN_PENDING_STORAGE_KEY = "duanju-asset-gen-pending-v3";
+const ASSET_GEN_PENDING_STORAGE_KEY = "duanju-asset-gen-pending-v2";
 const MAX_ASSET_GEN_PENDING_AGE_MS = 18 * 60 * 1000;
 
 type PendingAssetGenJob = {
+  /** 合并卡片下所有底层素材 id，用于快照/对账（避免只盯 activeAssetId 漏检新版本） */
   sourceAssetIds: string[];
   uiKey: string;
   versionIdsSnapshot: string[];
-  taskId: string;
   startedAt: number;
 };
 
@@ -72,16 +70,14 @@ function normalizePendingJob(raw: unknown): PendingAssetGenJob | null {
   const versionIdsSnapshot = Array.isArray(j.versionIdsSnapshot)
     ? j.versionIdsSnapshot.filter((x): x is string => typeof x === "string")
     : [];
-  const taskId = typeof j.taskId === "string" ? j.taskId.trim() : "";
-  if (!taskId) return null;
   const startedAt = typeof j.startedAt === "number" ? j.startedAt : Date.now();
-  return { uiKey, sourceAssetIds, versionIdsSnapshot, taskId, startedAt };
+  return { uiKey, sourceAssetIds, versionIdsSnapshot, startedAt };
 }
 
 function readPendingAssetGenJobs(projectId: string): PendingAssetGenJob[] {
   if (typeof window === "undefined") return [];
   try {
-    const raw = localStorage.getItem(ASSET_GEN_PENDING_STORAGE_KEY);
+    const raw = sessionStorage.getItem(ASSET_GEN_PENDING_STORAGE_KEY);
     if (!raw) return [];
     const all = JSON.parse(raw) as Record<string, unknown[]>;
     const list = all[projectId];
@@ -95,14 +91,14 @@ function readPendingAssetGenJobs(projectId: string): PendingAssetGenJob[] {
 function writePendingAssetGenJobs(projectId: string, jobs: PendingAssetGenJob[]) {
   if (typeof window === "undefined") return;
   try {
-    const raw = localStorage.getItem(ASSET_GEN_PENDING_STORAGE_KEY);
+    const raw = sessionStorage.getItem(ASSET_GEN_PENDING_STORAGE_KEY);
     const all: Record<string, PendingAssetGenJob[]> = raw ? JSON.parse(raw) : {};
     if (jobs.length === 0) {
       delete all[projectId];
     } else {
       all[projectId] = jobs;
     }
-    localStorage.setItem(ASSET_GEN_PENDING_STORAGE_KEY, JSON.stringify(all));
+    sessionStorage.setItem(ASSET_GEN_PENDING_STORAGE_KEY, JSON.stringify(all));
   } catch {
     /* ignore quota / private mode */
   }
@@ -120,7 +116,6 @@ function removePendingAssetGenJob(projectId: string, uiKey: string) {
 }
 
 function reconcilePendingJobs(projectId: string, currentAssets: Asset[]): Set<string> {
-  void currentAssets;
   const jobs = readPendingAssetGenJobs(projectId);
   const now = Date.now();
   const kept: PendingAssetGenJob[] = [];
@@ -131,6 +126,20 @@ function reconcilePendingJobs(projectId: string, currentAssets: Asset[]): Set<st
     }
     const ids = job.sourceAssetIds.length ? job.sourceAssetIds : [];
     if (ids.length === 0) {
+      continue;
+    }
+    const raws = ids
+      .map((id) => currentAssets.find((a) => a.id === id))
+      .filter((a): a is Asset => Boolean(a));
+    if (raws.length === 0) {
+      kept.push(job);
+      activeUiKeys.add(job.uiKey);
+      continue;
+    }
+    const hasNew = raws.some((raw) =>
+      raw.versions.some((v) => !job.versionIdsSnapshot.includes(v.id))
+    );
+    if (hasNew) {
       continue;
     }
     kept.push(job);
@@ -153,15 +162,6 @@ type AggregatedAsset = Omit<Asset, "versions"> & {
 
 const OPENROUTER_IMAGE_MODEL = "nano-banana-2";
 
-const isProjectMissingError = (message: string) => {
-  const normalized = (message || "").toLowerCase();
-  return (
-    message.includes("项目不存在") ||
-    normalized.includes("project not found") ||
-    normalized.includes("project not exists")
-  );
-};
-
 export default function AssetsPage() {
   const MAX_PARALLEL_GENERATIONS = 3;
   const params = useParams<{ id: string }>();
@@ -178,26 +178,7 @@ export default function AssetsPage() {
   const [defaultImageModel, setDefaultImageModel] = useState("");
   const [savedModel, setSavedModel] = useState("");
   const [message, setMessage] = useState<string | null>(null);
-  const redirectingMissingProjectRef = useRef(false);
-
-  const redirectToProjectsOnMissing = useCallback(() => {
-    if (redirectingMissingProjectRef.current) {
-      return;
-    }
-    redirectingMissingProjectRef.current = true;
-    setStatus(null);
-    setError("项目不存在或无权限，正在返回项目列表...");
-    window.setTimeout(() => {
-      router.replace("/projects");
-    }, 900);
-  }, [router]);
-
-  useEffect(() => {
-    if (!message) return;
-    const timer = setTimeout(() => setMessage(null), 2200);
-    return () => clearTimeout(timer);
-  }, [message]);
-
+  
   const STYLE_OPTIONS = [
     "真人电影写实", "3D 写实渲染", "3D 超写实渲染", "3D 虚幻引擎风", "3D 游戏 CG",
     "3D 半写实", "3D 皮克斯风", "3D 迪士尼风", "3D 萌系 Q 版", "3D 粘土风",
@@ -278,7 +259,6 @@ export default function AssetsPage() {
   const [uploadTarget, setUploadTarget] = useState<{ aggregatedAssetId: string; sourceAssetId: string } | null>(null);
   const [selectingVersionKey, setSelectingVersionKey] = useState<string | null>(null);
   const [deletingVersionKey, setDeletingVersionKey] = useState<string | null>(null);
-  const [generatingSubjectAssetIds, setGeneratingSubjectAssetIds] = useState<Set<string>>(new Set());
   const uploadInputRef = useRef<HTMLInputElement | null>(null);
   const defaultTemplate =
     "为{{type_cn}} {{name}} 生成高质量、写实风格的参考图，包含细节描述、风格、光照与色调。{{description}}";
@@ -298,16 +278,6 @@ export default function AssetsPage() {
     }
     return assetType;
   }, []);
-
-  const getAssetDisplayTitle = useCallback(
-    (asset: AggregatedAsset) => {
-      if (asset.type === "CHARACTER_LOOK") {
-        return asset.name;
-      }
-      return `${asset.name} · ${getAssetTypeLabel(asset.type)}`;
-    },
-    [getAssetTypeLabel]
-  );
 
   const renderAssetTemplate = useCallback(
     (template: string, asset: Asset) =>
@@ -400,19 +370,13 @@ export default function AssetsPage() {
         return next;
       });
     } catch (err) {
-      const errorMessage = err instanceof Error ? err.message : "获取素材失败";
-      if (isProjectMissingError(errorMessage)) {
-        redirectToProjectsOnMissing();
-        return;
-      }
-      setError(errorMessage);
+      setError(err instanceof Error ? err.message : "获取素材失败");
     }
   }, [
     buildCharacterLookPrompt,
     buildCharacterPrompt,
     defaultTemplate,
     projectId,
-    redirectToProjectsOnMissing,
     renderAssetTemplate,
   ]);
 
@@ -423,26 +387,8 @@ export default function AssetsPage() {
   useEffect(() => {
     if (!projectId) return;
     const timer = window.setInterval(() => {
-      const jobs = readPendingAssetGenJobs(projectId);
-      if (jobs.length === 0) return;
-      const token = getToken();
-      if (!token) return;
-      void Promise.all(
-        jobs.map(async (job) => {
-          try {
-            const status = await getAssetGenerateTaskStatus(token, projectId, job.taskId);
-            if (status.status === "COMPLETED" || status.status === "FAILED") {
-              removePendingAssetGenJob(projectId, job.uiKey);
-              if (status.status === "FAILED") {
-                setError(status.error || "素材生成失败");
-              }
-            }
-          } catch {
-          }
-        })
-      ).finally(() => {
-        void loadAssets({ preserveError: true });
-      });
+      if (readPendingAssetGenJobs(projectId).length === 0) return;
+      void loadAssets({ preserveError: true });
     }, 3000);
     return () => window.clearInterval(timer);
   }, [projectId, loadAssets]);
@@ -511,11 +457,6 @@ export default function AssetsPage() {
         );
       }
     } catch (err) {
-      const errorMessage = err instanceof Error ? err.message : "加载失败";
-      if (isProjectMissingError(errorMessage)) {
-        redirectToProjectsOnMissing();
-        return;
-      }
       if (scriptCacheKey) {
         const cached = localStorage.getItem(scriptCacheKey);
         if (cached) {
@@ -529,11 +470,11 @@ export default function AssetsPage() {
         }
       }
       setScriptContent("");
-      setError(errorMessage);
+      setError(err instanceof Error ? err.message : "加载失败");
     } finally {
       setScriptLoading(false);
     }
-  }, [projectId, redirectToProjectsOnMissing, scriptCacheKey]);
+  }, [projectId, scriptCacheKey]);
 
   useEffect(() => {
     void loadScript();
@@ -592,8 +533,17 @@ export default function AssetsPage() {
     setStatus(
       `生成中（${readPendingAssetGenJobs(projectId).length + 1}/${MAX_PARALLEL_GENERATIONS}）...`
     );
+    pushPendingAssetGenJob(projectId, {
+      sourceAssetIds,
+      uiKey,
+      versionIdsSnapshot,
+      startedAt: Date.now(),
+    });
+    setGeneratingUiKeys(reconcilePendingJobs(projectId, assets));
 
-    let shouldClearPending = false;
+    let success = false;
+    let aborted = false;
+    let generatedOk = false;
     try {
       if (modifyingImage && modifyingImage.uiKey === uiKey) {
         const rawRefUrl = (modifyingImage.url || "").trim();
@@ -631,7 +581,7 @@ export default function AssetsPage() {
           }
           // 否则仍提交当前参考地址，由后端结合 PUBLIC_BASE_URL 解析 /static 与 data 图
         }
-        const task = await generateAsset(token, projectId, activeAssetId, {
+        await generateAsset(token, projectId, activeAssetId, {
           prompt: modificationPrompt || undefined,
           model: assetModels[activeAssetId] || undefined,
           ref_image_url: refImageUrl,
@@ -641,14 +591,6 @@ export default function AssetsPage() {
             size: "4K",
           },
         });
-        pushPendingAssetGenJob(projectId, {
-          sourceAssetIds,
-          uiKey,
-          versionIdsSnapshot,
-          taskId: task.task_id,
-          startedAt: Date.now(),
-        });
-        setGeneratingUiKeys(reconcilePendingJobs(projectId, assets));
       } else {
         let refImageUrl: string | undefined;
         if (asset.type === "CHARACTER_LOOK") {
@@ -671,7 +613,7 @@ export default function AssetsPage() {
           }
         }
 
-        const task = await generateAsset(token, projectId, activeAssetId, {
+        await generateAsset(token, projectId, activeAssetId, {
           prompt: assetPrompts[activeAssetId] || undefined,
           model: assetModels[activeAssetId] || undefined,
           ref_image_url: refImageUrl,
@@ -681,76 +623,35 @@ export default function AssetsPage() {
             size: "4K",
           },
         });
-        pushPendingAssetGenJob(projectId, {
-          sourceAssetIds,
-          uiKey,
-          versionIdsSnapshot,
-          taskId: task.task_id,
-          startedAt: Date.now(),
-        });
-        setGeneratingUiKeys(reconcilePendingJobs(projectId, assets));
       }
-      setStatus("任务已提交，正在生成中...");
+      // HTTP 已成功落库：立刻清 pending，避免「接口成功但刷新列表/对账失败」导致永久「生成中」
+      removePendingAssetGenJob(projectId, uiKey);
+      generatedOk = true;
+      await loadAssets();
+      setStatus("生成完成");
+      success = true;
     } catch (err) {
-      shouldClearPending = true;
       const msg = err instanceof Error ? err.message : "生成失败";
-      setError(msg);
-      setStatus(null);
-    } finally {
-      if (shouldClearPending) {
-        removePendingAssetGenJob(projectId, uiKey);
+      if (
+        err instanceof Error &&
+        (/请求超时|AbortError|aborted/i.test(msg) || err.name === "AbortError")
+      ) {
+        aborted = true;
+        setStatus(null);
+        setError(
+          "请求等待超时，服务端可能仍在生成；列表将自动刷新，完成后新版本会出现在下方。您也可以手动刷新页面。"
+        );
+      } else if (generatedOk) {
+        success = true;
+        setError("生成已返回，同步列表时出错；下方将自动重试刷新，也可手动刷新页面。");
+      } else {
+        setError(msg);
+        setStatus(null);
       }
-      void loadAssets({ preserveError: true });
-    }
-  };
-
-  const runGenerateSubject = async (asset: AggregatedAsset) => {
-    if (!projectId) return;
-    const token = getToken();
-    if (!token) {
-      window.location.href = "/login";
-      return;
-    }
-    if (asset.type !== "CHARACTER_LOOK") {
-      setError("仅角色形象支持生成主体");
-      return;
-    }
-    const selectedVersion = asset.versions.find(
-      (item) => item.is_selected && Boolean((item.image_url || "").trim())
-    );
-    if (!selectedVersion) {
-      setError("请先选中角色形象图片，再生成主体");
-      return;
-    }
-    const targetAssetId = selectedVersion.assetId || asset.activeAssetId;
-    const roleKey = normalizeRoleKey(asset.name);
-    const voice = voicesByCharacter[roleKey] || voicesByCharacter[asset.name];
-    if (!voice?.voice_id || (voice.voice_type || "").toUpperCase() !== "KLING_CUSTOM") {
-      setError("请先上传角色音频文件，再生成主体");
-      return;
-    }
-
-    setError(null);
-    setStatus("正在生成主体...");
-    setGeneratingSubjectAssetIds((prev) => {
-      const next = new Set(prev);
-      next.add(asset.activeAssetId);
-      return next;
-    });
-    try {
-      await generateAssetSubject(token, projectId, targetAssetId);
-      setStatus("主体生成成功");
-      setMessage("主体生成成功");
-    } catch (err) {
-      setMessage(null);
-      setError(err instanceof Error ? err.message : "生成主体失败");
-      setStatus(null);
     } finally {
-      setGeneratingSubjectAssetIds((prev) => {
-        const next = new Set(prev);
-        next.delete(asset.activeAssetId);
-        return next;
-      });
+      // 超时/失败也必须清 pending，否则 reconcile 会一直把该卡片标成「生成中」
+      removePendingAssetGenJob(projectId, uiKey);
+      void loadAssets({ preserveError: true });
     }
   };
 
@@ -910,7 +811,7 @@ export default function AssetsPage() {
         return (
       <div className="flex flex-col gap-2 md:flex-row md:items-center md:justify-between">
         <div className="text-sm font-semibold">
-          {getAssetDisplayTitle(asset)}
+          {asset.name} · {getAssetTypeLabel(asset.type)}
         </div>
         <div className="flex w-full items-center gap-2 md:w-auto">
           {(() => {
@@ -940,7 +841,7 @@ export default function AssetsPage() {
                   triggerAutoSave(editableAssetId, { model: newVal });
                 }}
                 disabled={configLoading && imageModels.length === 0}
-                className="w-full rounded-lg border border-slate-200 px-3 py-2 text-xs md:w-44"
+                className="w-full rounded-lg border border-slate-200 px-3 py-2 text-xs md:w-60"
                 title="绘画模型（由后端映射为 GRSAI 接口 model）"
               >
                 {selectOptions.map((m) => (
@@ -997,15 +898,6 @@ export default function AssetsPage() {
               >
                 {isGeneratingCurrent ? "生成中..." : "生成素材"}
               </button>
-              {asset.type === "CHARACTER_LOOK" ? (
-                <button
-                  onClick={() => runGenerateSubject(asset)}
-                  disabled={generatingSubjectAssetIds.has(asset.activeAssetId)}
-                  className="whitespace-nowrap rounded-lg border border-slate-200 px-3 py-2 text-xs"
-                >
-                  {generatingSubjectAssetIds.has(asset.activeAssetId) ? "生成中..." : "生成主体"}
-                </button>
-              ) : null}
             </>
           )}
         </div>
@@ -1034,7 +926,6 @@ export default function AssetsPage() {
                 alt="参考图"
                 fill
                 unoptimized
-                referrerPolicy="no-referrer"
                 className="object-cover"
               />
             </div>
@@ -1145,7 +1036,6 @@ export default function AssetsPage() {
                     height={1200}
                     sizes="(min-width: 1024px) 33vw, (min-width: 640px) 50vw, 100vw"
                     unoptimized
-                    referrerPolicy="no-referrer"
                     className="h-auto w-full object-contain"
                   />
                 </div>
@@ -1200,40 +1090,6 @@ export default function AssetsPage() {
           </button>
         </div>
       )}
-      {message && (
-        <div className="fixed top-20 left-1/2 -translate-x-1/2 z-50 flex items-center gap-2 rounded-lg border border-emerald-200 bg-emerald-50 px-4 py-3 text-sm text-emerald-700 shadow-lg">
-          <svg
-            xmlns="http://www.w3.org/2000/svg"
-            className="h-5 w-5 text-emerald-500"
-            viewBox="0 0 20 20"
-            fill="currentColor"
-          >
-            <path
-              fillRule="evenodd"
-              d="M10 18a8 8 0 100-16 8 8 0 000 16zm3.707-9.707a1 1 0 00-1.414-1.414L9 10.172 7.707 8.879a1 1 0 00-1.414 1.414l2 2a1 1 0 001.414 0l4-4z"
-              clipRule="evenodd"
-            />
-          </svg>
-          <span>{message}</span>
-          <button
-            onClick={() => setMessage(null)}
-            className="ml-2 rounded-full p-1 hover:bg-emerald-100"
-          >
-            <svg
-              xmlns="http://www.w3.org/2000/svg"
-              className="h-4 w-4 text-emerald-500"
-              viewBox="0 0 20 20"
-              fill="currentColor"
-            >
-              <path
-                fillRule="evenodd"
-                d="M4.293 4.293a1 1 0 011.414 0L10 8.586l4.293-4.293a1 1 0 111.414 1.414L11.414 10l4.293 4.293a1 1 0 01-1.414 1.414L10 11.414l-4.293 4.293a1 1 0 01-1.414-1.414L8.586 10 4.293 5.707a1 1 0 010-1.414z"
-                clipRule="evenodd"
-              />
-            </svg>
-          </button>
-        </div>
-      )}
       <div className="flex items-center justify-between">
         <h1 className="text-2xl font-semibold">Step 3: 生成素材</h1>
         <div className="flex items-center gap-2">
@@ -1247,7 +1103,7 @@ export default function AssetsPage() {
             onClick={() => router.push(`/projects/${projectId}/script/storyboard`)}
             className="rounded-lg bg-slate-900 px-4 py-2 text-sm text-white hover:bg-slate-800"
           >
-            下一步：一键生成分镜
+            下一步：生成分镜
           </button>
         </div>
       </div>
@@ -1291,7 +1147,7 @@ export default function AssetsPage() {
                 {renderAssetContent(
                   asset,
                   <div className="rounded-lg border border-slate-100 bg-slate-50 p-3">
-                    <div className="mb-2 text-xs font-semibold text-slate-600">角色音频（自动创建 Kling 自定义音色）</div>
+                    <div className="mb-2 text-xs font-semibold text-slate-600">角色音色</div>
                     <VoiceSelector
                       projectId={projectId}
                       characterName={normalizeRoleKey(asset.name)}
@@ -1343,7 +1199,6 @@ export default function AssetsPage() {
               height={2400}
               sizes="100vw"
               unoptimized
-              referrerPolicy="no-referrer"
               className="max-w-full object-contain"
               priority
             />

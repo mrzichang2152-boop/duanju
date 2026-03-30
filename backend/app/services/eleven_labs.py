@@ -282,19 +282,7 @@ class ElevenLabsService:
             return ["en"]
         return [lower]
 
-    def _is_cloned_voice(self, voice: Dict[str, Any]) -> bool:
-        category = self._normalize_label_value(voice.get("category", ""))
-        if category in {"generated", "cloned"}:
-            return True
-        if category in {"professional", "premade", "library"}:
-            return False
-        labels = voice.get("labels") if isinstance(voice.get("labels"), dict) else {}
-        source_value = self._normalize_label_value(labels.get("source", ""))
-        if source_value in {"generated", "cloned"}:
-            return True
-        return False
-
-    def _normalize_voice(self, voice: Dict[str, Any], is_my_voice: bool = False) -> Dict[str, Any]:
+    def _normalize_voice(self, voice: Dict[str, Any]) -> Dict[str, Any]:
         voice_id = str(voice.get("voice_id", "")).strip()
         name = str(voice.get("name", "")).strip()
         description = str(voice.get("description", "")).strip()
@@ -311,7 +299,6 @@ class ElevenLabsService:
         category = str(voice.get("category", "")).strip()
         if not category and bool(voice.get("public_owner_id")):
             category = "library"
-        is_clone = self._is_cloned_voice(voice)
         return {
             "_id": voice_id,
             "title": name or voice_id,
@@ -324,9 +311,6 @@ class ElevenLabsService:
             "labels": labels,
             "category": category,
             "samples": [],
-            "is_my_voice": bool(is_my_voice),
-            "is_clone": bool(is_clone),
-            "can_delete": bool(is_my_voice and is_clone),
         }
 
     def _normalize_model(self, model: Dict[str, Any]) -> Dict[str, Any]:
@@ -482,14 +466,11 @@ class ElevenLabsService:
                     shared_total_value = shared_payload.get("total")
                     if isinstance(shared_total_value, int):
                         shared_total = shared_total_value
-        merged_sources: List[tuple[Dict[str, Any], bool]] = [
-            (item, False) for item in shared_voices if isinstance(item, dict)
-        ]
+        merged: List[Dict[str, Any]] = list(shared_voices)
         if safe_page == 1:
-            merged_sources.extend((item, True) for item in my_voices if isinstance(item, dict))
+            merged.extend(my_voices)
         voices_by_id: Dict[str, Dict[str, Any]] = {}
-        for raw, is_my_voice in merged_sources:
-            item = self._normalize_voice(raw, is_my_voice=is_my_voice)
+        for item in [self._normalize_voice(raw) for raw in merged if isinstance(raw, dict)]:
             voice_id = str(item.get("_id", "")).strip()
             if not voice_id:
                 continue
@@ -524,11 +505,6 @@ class ElevenLabsService:
                 and self._normalize_label_value(str(item.get("category", ""))) == "library"
             ):
                 existing["category"] = "library"
-            if bool(item.get("is_my_voice")):
-                existing["is_my_voice"] = True
-            if bool(item.get("is_clone")):
-                existing["is_clone"] = True
-            existing["can_delete"] = bool(existing.get("is_my_voice") and existing.get("is_clone"))
         normalized_items = list(voices_by_id.values())
 
         query_text = (query or "").strip().lower()
@@ -586,35 +562,7 @@ class ElevenLabsService:
                 raise RuntimeError(f"ElevenLabs 克隆失败：{response.text}")
             payload = response.json()
         voice_id = str(payload.get("voice_id", "")).strip()
-        return {"_id": voice_id, "model_id": voice_id, "title": title, "cover_image": "", "is_clone": True, "can_delete": True}
-
-    async def list_my_cloned_voices(self) -> List[Dict[str, Any]]:
-        headers = self._headers(accept="application/json")
-        async with httpx.AsyncClient(timeout=45.0) as client:
-            response = await client.get(f"{BASE_URL}/v1/voices", headers=headers)
-            if response.is_error:
-                raise RuntimeError(f"ElevenLabs 音色列表获取失败：{response.text}")
-            payload = response.json()
-        voices = payload.get("voices")
-        if not isinstance(voices, list):
-            return []
-        normalized = [
-            self._normalize_voice(item, is_my_voice=True)
-            for item in voices
-            if isinstance(item, dict) and self._is_cloned_voice(item)
-        ]
-        normalized.sort(key=lambda item: str(item.get("title", "")).lower())
-        return normalized
-
-    async def delete_voice(self, voice_id: str) -> None:
-        normalized_voice_id = str(voice_id or "").strip()
-        if not normalized_voice_id:
-            raise RuntimeError("voice_id 不能为空")
-        headers = self._headers(accept="application/json")
-        async with httpx.AsyncClient(timeout=45.0) as client:
-            response = await client.delete(f"{BASE_URL}/v1/voices/{normalized_voice_id}", headers=headers)
-            if response.is_error:
-                raise RuntimeError(f"ElevenLabs 删除音色失败：{response.text}")
+        return {"_id": voice_id, "model_id": voice_id, "title": title, "cover_image": ""}
 
     async def list_models(
         self,

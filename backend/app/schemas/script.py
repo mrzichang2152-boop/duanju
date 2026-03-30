@@ -51,7 +51,6 @@ class ScriptGenerateRequest(BaseModel):
     content: str
     model: Optional[str] = None
     instruction: Optional[str] = None
-    stream: Optional[bool] = True
 
 
 class ScriptGenerateResponse(BaseModel):
@@ -71,26 +70,9 @@ class StoryboardTaskStatusResponse(BaseModel):
     project_id: str
     episode_index: int
     episode_title: str
-    status: Literal["pending", "running", "completed", "failed"]
+    status: Literal["running", "completed", "failed"]
     content: Optional[str] = None
     error: Optional[str] = None
-
-
-class AsyncTaskStatusResponse(BaseModel):
-    task_id: str
-    project_id: str
-    task_type: str
-    status: Literal["PENDING", "RUNNING", "COMPLETED", "FAILED"]
-    result: Optional[dict] = None
-    error: Optional[str] = None
-
-
-class Step2TaskStartRequest(BaseModel):
-    op: Literal["extract", "modify", "sync"]
-    original_content: Optional[str] = None
-    resources_content: Optional[str] = None
-    model: Optional[str] = None
-    instruction: Optional[str] = None
 
 
 class ScriptHistoryItem(BaseModel):

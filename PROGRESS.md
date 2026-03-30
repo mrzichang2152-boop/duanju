@@ -1,9 +1,980 @@
-2026-03-30 - 后端 - 为 Kling 视频生成增加角色音色校验，选中角色但未配置音色时显式报错避免静默使用默认音色。
-2026-03-30 - 后端 - 修复角色主体复用逻辑：当角色已配置 Kling 自定义音色但历史主体无 voice_id 或 voice_id 不一致时，强制重建主体并绑定当前音色，已同步至 82.156.124.215 后端容器。
-2026-03-30 - 后端 - Step4 组装 Kling 请求时新增 `<<<element_n>>>` 角色主体语义映射，明确角色名与主体ID对应关系，并保持“角色走 element_list，不重复下发角色图片”。
-2026-03-30 - 后端 - 修正主体创建降级策略：角色存在音色时仅尝试携带 `element_voice_id`（含 string/int 双格式）创建主体，不再静默降级为无音色主体，并补充失败日志以便排查平台侧绑定失败。
-2026-03-30 - 后端 - 调整 Step2/Step4 提示词：Step2 强制为每个角色形象补充“出场集数”；Step4 强化角色命名约束，要求分镜按“角色名（角色形象全名）[AssetID]”引用，降低角色简称导致的音色失配。
-2026-03-31 - 后端 - 修正 Step4 Kling 参考图策略：角色已命中主体（element_list）时不再追加顶层 `image_url`；若角色暂无主体则自动回退为角色形象图参考，避免“主体+角色图”重复下发。
-2026-03-31 - 后端 - 修正 Step2→Step3 素材描述透传：提取素材时自动剔除“出场集数/信息来源”元信息，避免进入 Step3 素材描述字段。
-2026-03-31 - 后端 - 调整 Step2/Step4 规则与分镜素材下发：Step2 要求角色形象/道具/场景统一标注完整出场集数；分镜生成仅下发当前分集命中的素材；Step4 角色命名改为直接使用“角色形象全名[AssetID]”，并要求镜头调度与内容融合中同样使用全名。
-2026-03-31 - 后端 - 取消分镜素材按集筛选的全量兜底：当前分集未命中“出场集数”时不再回退下发全素材列表，改为不传素材列表直接生成该集分镜。
+# 项目进度与变更日志 (Project Progress & Changelog)
+
+本文档用于追踪项目的所有变更、功能新增、Bug 修复以及待办事项。所有主要的开发活动必须在此记录。
+
+## 待办事项 (Backlog)
+- [ ] 排查任务状态返回 FAILED 的原因（验证 API 域名及 Key）
+- [ ] 运行 test_create_video.py 验证最新的 Kling 接口调用逻辑
+- [ ] 确保生成视频时使用当前分镜脚本内容+系统prompt
+- [ ] 验证 fetch_segments 接口中处理中的版本计数是否恢复正常
+- [ ] 优化视频生成逻辑 (Step 5)
+- [ ] 完善前端错误提示与加载状态
+- [ ] 部署准备 (Docker/Aliyun) - 已部署 v5/v6
+
+## 已完成 (Completed)
+
+### 2026-03-01 (Volcengine Migration & Fixes)
+- **部署**: 成功迁移至 Volcengine 新服务器 (115.190.202.134)，使用 Docker Compose 部署。
+- **配置**: 修改 `docker-compose.yml` 端口为 `8088` (Nginx), `3001` (Frontend), `8003` (Backend) 以避免与现有项目冲突。
+- **配置**: 配置 Docker 镜像加速器 (daocloud, 1panel, 163) 解决国内拉取超时问题。
+- **后端**: 修复 Doubao 2.0 模型输出截断问题，强制设置 `max_tokens=4096` 以支持长文本生成。
+- **后端**: Step 2/3 LLM 模型全面迁移至 Volcengine Doubao 2.0 Pro。
+- **后端**: Step 4 图片生成模型迁移至 `doubao-seedream-4-5-251128`。
+- **后端**: 修复 `linkapi.py` 中 Volcengine 参数透传逻辑 (sequential_image_generation, watermark 等)。
+- **后端**: 实现 `extract_assets_from_script` 使用 LLM 进行智能提取，替代正则表达式。
+- **后端**: 修复 Step 2 前端模型选择器，仅展示可用模型。
+- **配置**: 更新 `next.config.ts` 允许 Volcengine 图片域名。
+- **后端**: **重大变更** - 图片生成直接下载并存储为 Base64 Data URI，不再依赖临时 URL。
+- **后端**: 修复图生图 (Image-to-Image) 逻辑，支持透传 Base64 图片数据至 Volcengine。
+- **后端**: 优化 `size` 参数处理，默认使用 `2K` 并自动升级过小的尺寸 (1024x1024 -> 2048x2048 等) 以满足模型最小像素要求。
+- **后端**: **核心修复**: 实现输入 `image_url` 自动下载并转换为 Base64 Data URI，确保 "直接发送图片" 给火山引擎 API。
+- **后端**: 优化 `assets.py` 中的提示词生成逻辑，移除 `bikini`, `swimwear` 等敏感关键词，防止触发火山引擎内容安全拦截。
+- **后端**: 增强 `linkapi.py` 错误处理，增加对 `OutputImageSensitiveContentDetected` 错误码的识别，返回友好提示。
+- **验证**: 创建 `test_volc_safe.py` 验证修复后的提示词可正常生成图片。
+- **验证**: 创建 `test_volc_sensitive.py` 复现并确认敏感内容拦截机制。
+- **后端**: 修复图生图 (Image-to-Image) 参数传递错误，针对 `doubao-seedream` 模型强制使用 `image_urls` (list) 替代 `image_url`，解决参考图无效问题。
+- **验证**: 创建 `test_volc_img2img.py` 验证修复后的图生图功能，确认生成结果与参考图相关。
+- **部署**: 更新部署包 `deploy_update_v7.tar.gz`，包含上述修复。
+
+### 2026-02-14
+- **文档**: 创建 `TECH_DESIGN.md`，定义技术架构与数据库设计。
+- **配置**: 创建 `.gitignore`，排除 AI 临时文件与敏感信息。
+- **文档**: 创建 `RULES.md` 与 `.cursorrules`，确立 AI 协作规范。
+- **后端**: 初始化 FastAPI 基础结构与健康检查接口。
+- **依赖**: 添加后端依赖清单 `backend/requirements.txt`。
+- **后端**: 完成认证、项目、剧本与流程骨架 API，启用 SQLite 数据库与 CORS。
+- **后端**: 增加用户、项目、剧本模型与基础服务层。
+- **前端**: 初始化 Next.js 前端并新增登录/注册/项目/步骤页面与设置中心。
+- **前端**: 新增 API Client 与本地 Token 管理，完成页面联通。
+- **后端**: 新增用户设置与 LinkAPI 代理接口，支持密钥加密存储与模型默认值。
+- **后端**: 补充剧本模板校验规则与脚本生成接口。
+- **前端**: 设置中心接入后端配置读取/保存，支持模型默认值与云端同步开关。
+- **前端**: Step1 增加 AI 格式化/补齐/改稿入口与校验警告提示。
+- **后端**: 新增素材/版本与分段/版本数据模型与基础服务。
+- **后端**: Step2/Step3 API 支持提取、生成、列表与版本选择。
+- **前端**: Step2/Step3 接入素材与分段列表、版本生成与选择交互。
+- **后端**: 接入 LinkAPI 生图/生视频调用并支持模型与提示词参数。
+- **前端**: Step2/Step3 增加提示词与模型输入以触发真实生成。
+- **前端**: 设置中心接入模型列表读取并支持默认模型选择。
+- **前端**: Step2/Step3 接入模型列表筛选与默认模型联动展示。
+- **前端**: Step2/Step3 增加默认模型快捷按钮与模型筛选增强。
+- **前端**: Step2/Step3 增加提示词模板快捷按钮。
+- **后端**: 新增项目级提示词模板 API 与数据模型。
+- **后端**: 分段版本支持提示词记录与返回。
+- **前端**: Step2/Step3 模板管理、模板应用与历史提示词回填。
+- **前端**: Step2/Step3 模板支持变量渲染与占位符提示。
+- **后端**: 模板支持更新接口。
+- **前端**: Step2/Step3 模板编辑与批量应用。
+- **前端**: Step2/Step3 模板排序、搜索、复制与导出。
+- **后端**: 模板支持标签字段。
+- **前端**: Step2/Step3 模板标签过滤与导入。
+- **后端**: 修复本地运行依赖与配置（greenlet/bcrypt 兼容与数据库路径）。
+- **前端**: Step1 增加剧本上传入口并支持导入 txt 内容。
+- **后端**: 修复设置保存逻辑，允许关闭同步时仍可使用本地 Key。
+- **后端**: Step1 剧本生成接口返回 LinkAPI Key 缺失等明确错误。
+- **前端**: 顶部导航登录态显示头像并悬浮展示设置入口。
+- **后端**: Step1 生成内容为空时返回错误避免覆盖原剧本。
+- **前端**: Step1 生成结果为空时保留原内容并提示失败。
+- **后端**: Step1 剧本格式化/补齐按 PRD 模板结构输出。
+- **后端**: LinkAPI 失败时返回真实错误信息便于排查。
+- **后端**: Step1 恢复完整模板提示并增加 LinkAPI 错误日志与超时配置。
+
+### 2026-03-17
+- **规范**: 更新 `RULES.md`，明确临时 `.md` 与测试脚本零污染要求，禁止污染项目目录与版本库。
+- **规范**: 更新模块解耦要求，补充跨模块接口边界与最小侵入改造原则。
+- **规范**: 更新交付要求，明确所有任务必须验证通过后才能交付。
+- **规范**: 更新进度管理要求，明确 `PROGRESS.md` 必须按追加方式记录所有改动。
+- **规范**: 更新沟通要求，明确所有回复与文档统一使用中文。
+- **规范**: 新增 Trae 可加载规则入口 `.trae/rules/project_rules.md`，确保 IDE 按项目规则自动生效。
+- **规范**: 更新 `RULES.md`，补充 Trae 规则入口路径与双向同步要求。
+- **前端**: 调整文本转语音弹窗右侧布局，将生成音量/语速/音高参数区移动到右侧底部。
+- **前端**: 调整 Fish 标签库布局，将强度调节内聚到标签库卡片中并明确其对情绪标签的作用关系。
+- **前端**: 精简 Step2 提取结果页为纯文本编辑，移除角色音色配置入口并避免 Fish 音色请求干扰提取流程。
+- **前端**: 调整 Step3 素材生成并发策略，支持最多 3 张图片同时生成并放开跨卡片生成按钮互斥限制。
+- **前端**: 修复 Step3 重复素材展示，按“类型+名称”自动合并重复项并保留更优素材记录。
+- **前后端**: 修复 Step2 回改后 Step3 素材重复问题，服务端合并同名同类资产并迁移历史版本，保留旧版本供最终选择。
+- **前后端**: Step2 回改资源后 Step3 按新增版本累积，保留原始/历史版本并支持跨同名资产统一选中最终版本。
+- **前端**: Step3 新增显式“版本管理”操作区，支持直接“设为最终”并在无版本时展示清晰引导。
+- **前端**: 按需求移除 Step3 版本管理交互，仅保留最新素材展示与 AI 修改入口。
+- 2026-03-17 - 前端 - Step4 分镜表按钮文案由“Kling生成”改为“生成视频”。
+- 2026-03-17 - 前端 - Step4 生成视频请求新增 AssetID 语义绑定，按角色/场景/道具/首尾帧透传主体信息。
+- 2026-03-17 - 后端 - 可灵视频请求新增主体管理编译链路，支持资产解析、多图引用、主体创建与 elements 入参透传。
+- 2026-03-17 - 后端 - Step4 可灵主体创建增加项目级内存缓存与过期回收，复用已创建主体避免重复请求。
+- 2026-03-17 - 前端 - 修复首页导航 Link 规范与首页 effect setState lint 报错，恢复 `npm run lint` 无 error。
+- 2026-03-17 - 前端 - Step1/Step4 类型收敛：移除 `as any[]` 与 `@ts-ignore`，补齐分集保存与流式错误处理类型。
+- 2026-03-17 - 验证 - 前端执行 `npm run lint` 与 `npm run typecheck` 均通过。
+- 2026-03-17 - 前端 - Step4 资产标记解析支持名称映射 ID，生成视频时统一回传 Step3 资产真实 ID。
+- 2026-03-17 - 前端 - Step4 表格中角色形象/道具/场景资产名改为蓝色可点击，点击弹窗预览对应图片。
+- 2026-03-17 - 验证 - 前端再次执行 `npm run lint` 与 `npm run typecheck` 通过（无 error）。
+- 2026-03-17 - 前端 - 修复 Step4 资产预览点击失效，资产名称匹配支持归一化比对并兼容最新版本兜底预览。
+- 2026-03-17 - 验证 - 前端执行 `npm run lint && npm run typecheck` 通过（0 error）。
+- 2026-03-17 - 前端 - 修复 Step4 角色形象/道具/场景预览匹配：按列约束资产类型并按可用图片优先级选择正确素材。
+- 2026-03-17 - 验证 - 前端执行 `npm run lint && npm run typecheck` 通过（0 error）。
+- 2026-03-17 - 前端 - Step4 生成视频绑定支持同镜头多角色形象自动补全，按整行文本匹配角色形象资产并去重提交。
+- 2026-03-17 - 后端 - Step4 分镜提示词强化多角色规则：同镜头出现多个角色时，角色形象列必须逐个附带各自 AssetID。
+- 2026-03-17 - 验证 - 前端执行 `npm run lint && npm run typecheck` 通过（0 error），后端脚本执行 `python3 -m compileall` 通过。
+- 2026-03-17 - 前端 - 回退 Step4 生成视频时的角色形象自动补全，改为仅提交用户在表格中明确选择的资产绑定。
+- 2026-03-17 - 前端 - 在 Step4 的角色形象/道具/场景单元格新增素材选择按钮，弹框展示 Step3 全量素材并支持多选写回 AssetID。
+- 2026-03-17 - 验证 - 前端执行 `npm run lint && npm run typecheck` 通过（0 error）。
+- 2026-03-17 - 前端 - 移除 Step4 表格内逐行视频规格下拉框，改为仅保留“生成视频”按钮。
+- 2026-03-17 - 前端 - 在 Step4 表格上方新增全局视频设置下拉框：分辨率（720p/1080p）与画幅（横屏/竖屏/方幕），默认竖屏+720p。
+- 2026-03-17 - 前后端 - Step4 生成视频请求新增画幅参数透传（aspect_ratio），并按分辨率映射 Kling mode（720p→std，1080p→pro）。
+- 2026-03-17 - 验证 - 前端执行 `npm run lint` 与 `npm run typecheck` 通过（0 error）。
+- 2026-03-17 - 后端 - 按业务边界回退 Step1-4 通用分辨率/画幅提示注入，恢复仅聚焦 Step4 分镜提示词与素材约束。
+- 2026-03-17 - 后端 - 强化 Step4 分镜提示词通用落地约束：输出需同时满足导演可拍、绘图可画、程序可解析，并补充高风险镜头执行约束要求。
+- 2026-03-17 - 验证 - 前端执行 `npm run lint && npm run typecheck` 通过（0 error，存在历史 warning）；后端执行 `python3 -m compileall` 通过。
+- 2026-03-17 - 后端 - 按需求移除 Step4 分镜提示词中“适配古装/现代等题材列表”条目，保留动作、表情、光源、素材引用等细粒度执行约束。
+- 2026-03-17 - 验证 - 前端执行 `npm run lint && npm run typecheck` 通过（0 error，存在历史 warning）；后端执行 `python3 -m compileall` 通过。
+- 2026-03-17 - 文档 - 归档 Kling 官方 API 参考到 `.vibecoding/kling_官方API参考_2026-03-17.md`，补充 Prompt 长度与 Omni 多镜头长度约束，供后续开发对照。
+- 2026-03-17 - 文档 - 补充 Kling-v3-omni 时长口径说明：生成时长按 3~15s，3~10s 归类为视频参考输入时长限制，避免后续实现误读。
+- 2026-03-17 - 前后端 - Step4 视频生成请求改造：行级字段按标准顺序透传、新增 system_prompt 传递并在后端拼接到 Kling prompt、duration 由时间轴解析并统一钳制到 3~15s，避免参数不合规与语义丢失。
+- 2026-03-17 - 前端 - Step4 时间轴时长解析增强：支持 `00:07-00:12` 与 `hh:mm:ss` 区间格式，自动换算为秒数后用于视频生成 duration。
+- 2026-03-17 - 后端 - 更新 Step4 分镜系统提示词时间轴规则：强制每个分镜 3~15 秒、禁止输出时长推荐、以剧情需要为最高优先级并在不影响叙事前提下同场景尽量合并分镜。
+- 2026-03-17 - 前后端 - 修复点击“生成视频”瞬时报错：精简单行视频 prompt 结构以降低Kling参数校验失败概率，并将第三方视频接口错误原文透传到前端用于定位。
+- 2026-03-17 - 前后端 - 按排障需求恢复单行视频完整提示词结构（含字段定义与字段别名），并新增视频生成全量请求/响应日志输出用于复现与定位第三方400错误。
+- 2026-03-17 - 后端 - 针对Kling持续400新增视频请求降级重试链路：主请求失败后自动尝试精简参数版本与小写模型名版本，并逐次打印完整请求/响应以定位网关兼容性问题。
+- 2026-03-17 - 后端 - 针对“瞬间失败”再加网络层兜底：视频生成请求新增 trust_env=False/True 双通道重试与分通道日志，兼容本地代理/直连差异导致的SSL握手或网关连接异常。
+- 2026-03-17 - 前端 - 强化通用API错误解析：支持 detail/message/error 多结构与嵌套 message 提取，失败时附带状态码和原始响应文本，避免“请求失败”吞掉后端真实报错。
+- 2026-03-17 - 后端 - 视频生成改为优先读取用户设置中的 endpoint/api_key，并新增 Kling ultra_min 最小请求兜底及多尝试错误聚合输出，减少网关参数兼容差异导致的瞬间失败。
+- 2026-03-17 - 后端 - 修复视频 endpoint 误拼接问题：当用户配置为 OpenRouter/文本端点时自动回退到 magic666 视频端点，避免请求打到错误站点返回 HTML 404。
+- 2026-03-17 - 后端 - 修复分段生成瞬间失败前置问题：`options` 兼容 JSON 字符串入参并在失败时返回耗时毫秒，便于区分“请求未发出”与“上游快速拒绝”。
+- 2026-03-17 - 后端 - 修复视频 endpoint 回退后的 key 错配：仅在 magic666 endpoint 下使用自定义 key，并在 401/403 时自动尝试默认 key，避免因 OpenRouter key 误用导致秒级失败。
+- 2026-03-17 - 后端 - 新增视频鉴权健壮性：识别并拒绝非 `sk-` 令牌格式自定义 key（如 AK/SK），自动回退默认视频 key；网络异常按尝试维度输出异常类型与 repr。
+- 2026-03-17 - 后端 - 参考本地 Kling 文档补齐兼容重试：Kling 模型新增 `/videos/omni-video` 与 `/videos/image2video` 端点轮询，并增加 `model_name` 请求体版本，降低网关路由差异导致的瞬时 400。
+- 2026-03-17 - 后端 - 对齐 Kling v3 Omni 官方鉴权链路：支持从设置 key 解析 AK/SK（含“Access Key/Secret Key”文本格式）并本地生成 JWT，Kling 模型仅使用 `https://api.klingai.com/v1/videos/omni-video` 主链路，不再追加 `image2video` 兜底。
+- 2026-03-17 - 后端 - 彻底移除 Kling 对 magic666 的默认回退：只要模型为 Kling 即强制走 `api.klingai.com/v1/videos/omni-video`，且未检测到 AK/SK 或 JWT 时直接报配置错误，避免再出现 magic666 瞬时连接失败。
+- 2026-03-17 - 后端/前端 - 扩展 Kling 官方鉴权输入兼容：Key 支持 `AK|SK`、`ak=...;sk=...`、同一行双令牌与 Access/Secret 文本格式；设置页占位文案同步提示单行格式，避免密码框无法换行导致的 2ms 预校验失败。
+- 2026-03-17 - 后端 - 排查“仍是 1~2ms 失败”后补强鉴权诊断：Kling 官方鉴权缺失报错增加 `current_user/has_saved_key/key_len`，用于快速识别“当前登录用户未保存 Key”场景。
+- 2026-03-17 - 后端 - 修复项目读取越权回退：`get_project` 移除按 project_id 的兜底查询，严格要求 `project_id + user_id` 匹配，避免跨账号访问项目时误用错误账号配置导致视频鉴权失败。
+- 2026-03-17 - 后端 - 新增 Kling 鉴权预探测：在调用 `omni-video` 前先请求 `text2video` 鉴权探针，若返回 401/403（如 code=1002）则直接提示“AK/SK 无效或站点不匹配”，不再把 1200 空消息误判为参数错误。
+- 2026-03-17 - 后端 - 根据官方中文文档修正区域域名：默认 Kling 端点改为 `https://api-beijing.klingai.com/v1/videos/omni-video`；实测同一 AK/SK 在 beijing 域名鉴权通过（code=0），在 `api.klingai.com` 与 `api-singapore.klingai.com` 会报 1002。
+- 2026-03-17 - 后端/前端 - 修复“生成视频看似跨域失败”实为超时：Kling 请求默认补齐 `aspect_ratio=16:9` 并支持按 `task_id` 轮询 `GET /v1/videos/omni-video/{task_id}` 直到拿到视频 URL；前端 `generateSegment(s)` 超时从 15s 提升到 420s，避免浏览器中断后误报 `net::ERR_FAILED/CORS`。
+- 2026-03-17 - 后端/前端 - 新增可视化任务状态：Kling 分镜生成改为“提交即返回”（`submitted`），后端在 `GET /segments` 按官方 `GET /v1/videos/omni-video/{task_id}` 刷新任务状态并在成功后落库版本；前端 Step5 表格显示 `任务已提交/任务生成中/任务失败` 与 `task_id`，并每 5 秒自动刷新。
+- 2026-03-18 - 前端 - Step5 视频播放区改造为分集宽屏卡片布局，播放器移出表格并在视频上方新增“该集剧本（来源 Step1）”展示区，默认收起可手动展开。
+- 2026-03-18 - 前端 - Step5 台词音频展示对齐 Step4 交互，改为蓝色原文点击试听；修复音频映射读取导致的“暂无已应用台词音频”误判问题。
+- 2026-03-18 - 前端 - Step5 播放器交互优化：播放键与进度条内嵌到视频框内，并缩小分镜标记条与视频框间距以提升连贯性。
+- 2026-03-18 - 验证 - 前端执行 `npm run lint` 与 `npm run typecheck` 通过（0 error，存在历史 warning）。
+- 2026-03-18 - 前端 - Step5 进度条位置调整为视频框最底部，采用底部渐变控制层承载播放控件与进度轨道，提升播放器层级一致性。
+- 2026-03-18 - 前端 - Step5 分镜标记条与进度条统一横向内边距与宽度基准，修复标记点与时间轴未对齐问题。
+- 2026-03-18 - 前端 - Step5 分镜标记点改为挂载在进度条同一坐标容器内，使用统一百分比定位，修复“分镜点与视频进度未对齐”问题。
+- 2026-03-18 - 前端 - Step5 分镜点定位语义调整为按分镜中心时间计算（start+duration/2），避免播放进度在当前分镜内出现“进度条明显快于分镜点”的视觉偏差。
+- 2026-03-18 - 前端 - Step5 移除进度条下方分镜圆圈与标签，改为在进度条内部按相邻分镜边界渲染分界点，支持点击分界点跳转对应分镜。
+- 2026-03-18 - 前端 - Step5 移除播放器“上一段/下一段/片段计数”控件，并将“Step4台词音频（顺序）”改为逐条单行展示的蓝字点击试听列表。
+- 2026-03-18 - 前端 - Step5 新增视频下方音轨编辑区：默认单音轨、支持手动新增音轨、支持将台词音频拖拽到音轨并按视频时间轴定位起始点。
+- 2026-03-18 - 前端 - Step5 新增音轨与视频联动播放：点击视频播放键后，音轨内已放置台词音频按时间轴同步播放。
+- 2026-03-18 - 验证 - 前端执行 `npm run lint` 与 `npm run typecheck` 通过（0 error，存在历史 warning）。
+- 2026-03-18 - 前端 - Step5 移除“Step4台词音频（顺序）”展示框，改为仅保留视频下方音轨编辑交互。
+- 2026-03-18 - 前端 - Step5 音轨编辑支持音频块二次拖拽调位与删除，并按音频真实时长自动适配音频块长度。
+- 2026-03-18 - 前端 - Step5 调整音轨布局为无左侧占位，保证视频进度条起点与音轨条起点纵轴对齐。
+- 2026-03-18 - 验证 - 前端执行 `npm run lint` 与 `npm run typecheck` 通过（0 error，存在历史 warning）。
+- 2026-03-18 - 前端 - Step5 进一步调整播放器下方音轨容器布局：音轨区贴紧视频框，并统一与视频进度条相同横向内边距，修复起始点视觉不一致。
+- 2026-03-18 - 验证 - 前端执行 `npm run lint` 与 `npm run typecheck` 通过（0 error，存在历史 warning）。
+- 2026-03-18 - 前端 - Step5 音轨落点改为按当前视频播放进度定位（非按鼠标横向坐标），确保新拖入配音起始时间与视频进度一致。
+- 2026-03-18 - 前端 - Step5 音频块长度改为绑定真实音频时长：拖入后异步读取元数据并回填时长，音轨宽度自动按时长比例更新。
+- 2026-03-18 - 前端 - Step5 音轨容器进一步收紧到播放器下缘并减少顶部留白，强化贴边时间轴编辑体验。
+- 2026-03-18 - 验证 - 前端执行 `npm run lint` 与 `npm run typecheck` 通过（0 error，存在历史 warning）。
+- 2026-03-19 - 后端 - 修复 Step4 使用“前一条分镜尾帧”时强制静音的问题：保留前端传入的 `sound/with_audio`，不再在尾帧续接路径里覆盖为 `off`。
+- 2026-03-19 - 验证 - 后端执行 `python3 -m py_compile backend/app/services/linkapi.py` 通过。
+- 2026-03-19 - 前端 - 重构 Step5 音轨编辑为统一时间轴控件：进度条与多音轨共享同一坐标轴，新增播放头对齐线、音频块指针拖拽调位、跨音轨拖移与吸附开关，降低误触并提升配音落点精度。
+- 2026-03-19 - 前端 - Step5 台词配音新增“放到播放头”快捷放置，支持按当前选中音轨一键落点，减少拖拽依赖提升无声视频配音效率。
+- 2026-03-19 - 验证 - 前端执行 `npm run lint` 与 `npm run typecheck` 通过（0 error，存在历史 warning）。
+- 2026-03-19 - 前端 - 修复 Step5 统一时间轴中“台词音频拖入音轨无反应”：恢复台词源可拖拽与音轨落区 `onDrop`，支持按鼠标落点时间插入到目标音轨。
+- 2026-03-19 - 验证 - 前端再次执行 `npm run lint` 与 `npm run typecheck` 通过（0 error，存在历史 warning）。
+- 2026-03-19 - 前后端 - 修复 Step4 点击“生成视频”即报错：当启用“使用上一条分镜尾帧”时自动按接口约束降级为无声提交，避免 `sound=on` 与尾帧参考组合导致任务提交失败。
+- 2026-03-19 - 前端 - Step4 生成提示补充音频降级说明：用户选择“有声”且使用上一条尾帧时，提交后明确提示已自动切换无声，避免误判“无反应”。
+- 2026-03-19 - 验证 - 前端执行 `npm run lint` 与 `npm run typecheck` 通过（0 error，存在历史 warning）；后端执行 `python3 -m py_compile backend/app/services/linkapi.py` 通过。
+- 2026-03-19 - 前后端 - 修复 Step4 有声与“使用上一条分镜尾帧”冲突回归：取消静默降级策略，改为前端禁用冲突组合并在提交前阻断，后端同步返回明确约束错误，避免“选有声却生成无声”。
+- 2026-03-19 - 前端 - ScriptEditor 新增音频模式联动：有声模式下自动禁用“使用前一条分镜频尾帧”勾选并提示限制，防止用户进入不可用组合。
+- 2026-03-19 - 验证 - 前端执行 `npm run lint` 与 `npm run typecheck` 通过（0 error，存在历史 warning）；后端执行 `python3 -m py_compile backend/app/services/linkapi.py` 通过。
+- 2026-03-19 - 前后端 - 根据本地 OmniVideo 官方文档纠偏 Step4 约束：撤销“上一条尾帧必无声”限制；仅保留“参考视频(reference_video_url)场景 sound 只能 off”这一官方约束。
+- 2026-03-19 - 前端 - 恢复有声模式可勾选“使用前一条分镜频尾帧”，生成请求按用户所选 `with_audio/sound` 透传，不再前置阻断该组合。
+- 2026-03-19 - 验证 - 前端执行 `npm run lint` 与 `npm run typecheck` 通过（0 error，存在历史 warning）；后端执行 `python3 -m py_compile backend/app/services/linkapi.py` 通过。
+- 2026-03-19 - 前端 - 修复 Step4 点击“生成视频”无反馈：点击后立即展示“正在提交”状态，并对 token 失效、分段未同步等前置失败场景返回可见错误信息，不再静默 return。
+- 2026-03-19 - 前端 - Step4 行级生成新增分段兜底刷新：若当前行分段索引缺失，先自动刷新 segments 再重试映射，降低“按钮可点但无动作”概率。
+- 2026-03-19 - 验证 - 前端执行 `npm run lint` 与 `npm run typecheck` 通过（0 error，存在历史 warning）。
+- 2026-03-19 - 前后端 - Step4 视频版本管理新增删除能力：后端新增分镜版本删除接口，支持删除任意指定版本并在删除当前版本后自动回落选择最新剩余版本。
+- 2026-03-19 - 前端 - Step4“视频生成”列版本区域新增删除按钮：可删除当前选中版本，删除中禁用下拉与按钮并显示进行状态。
+- 2026-03-19 - 验证 - 前端执行 `npm run lint` 与 `npm run typecheck` 通过（0 error，存在历史 warning）；后端执行 `python3 -m py_compile backend/app/services/segments.py backend/app/api/segments.py` 通过。
+- 2026-03-19 - 前后端 - Step5 每集卡片前新增“下载本集”入口：前端发起分集合并下载请求，后端按该集选中分镜 URL 执行 ffmpeg 自动拼接并直接返回下载文件。
+- 2026-03-19 - 前端 - Step5 新增分集下载状态反馈：支持“合并下载中/完成/失败”提示，并在无可用视频时禁用下载按钮。
+- 2026-03-19 - 验证 - 前端执行 `npm run lint` 与 `npm run typecheck` 通过（0 error，存在历史 warning）；后端执行 `python3 -m py_compile backend/app/api/final.py` 通过。
+- 2026-03-19 - 前端 - 修复项目列表“任务全没了/一直加载”感知问题：项目页登录态检测改为稳定初始化，避免无 token 时停留加载态；当账号无项目时显示当前登录邮箱与账号确认提示，支持快速定位“登录错账号”场景。
+- 2026-03-19 - 验证 - 前端执行 `npm run lint` 与 `npm run typecheck` 通过（0 error，存在历史 warning）。
+- 2026-03-19 - 前端 - 修复项目页直接报错：移除在首屏渲染阶段读取 localStorage（token/email）导致的 hydration mismatch，统一在 effect 中读取 token 后拉取项目并处理登录跳转。
+- 2026-03-19 - 验证 - 前端执行 `npm run lint && npm run typecheck` 通过（0 error，存在历史 warning）。
+- 2026-03-19 - 前端 - 修复项目页再次卡在“加载中”：增加项目加载守卫与超时兜底（20s 自动落错误态），并在 token 缺失场景明确提示后跳转登录，避免页面长期停留加载状态。
+- 2026-03-19 - 验证 - 前端执行 `npm run lint && npm run typecheck` 通过（0 error，存在历史 warning）。
+- 2026-03-19 - 后端 - 修复 Step5 分集合并下载引入的启动回归：`BackgroundTask` 导入改为 `starlette.background`，并将 `episode_title` 类型从 `str | None` 改为 `Optional[str]` 以兼容当前 Python 3.9 运行环境。
+- 2026-03-19 - 验证 - 后端执行 `python3 -m py_compile backend/app/api/final.py` 通过；本地启动 `uvicorn app.main:app --port 8010` 成功，`/health` 返回 200，`/api/projects` 返回 403（未鉴权）；重启 8002 开发服务后接口恢复响应。
+- 2026-03-19 - 前后端 - Step3 新增素材图片上传能力：后端新增 `POST /projects/{project_id}/assets/{asset_id}/upload` 保存上传图片并创建素材版本，前端素材卡片新增“上传图片”入口与上传状态反馈。
+- 2026-03-19 - 验证 - 后端执行 `python3 -m py_compile app/api/assets.py` 通过；前端执行 `npm run lint && npm run typecheck` 通过（0 error，存在历史 warning）；新上传接口未鉴权访问返回 403（路由生效）。
+- 2026-03-19 - 前端 - 调整 Step4 分镜表“生成配音”按钮定位：由内容台词单元格右上角改为右下角，减少对正文阅读区域遮挡。
+- 2026-03-19 - 验证 - 前端执行 `npm run lint && npm run typecheck` 通过（0 error，存在历史 warning）。
+- 2026-03-19 - 前后端 - 强化 Step4 分镜生成系统 Prompt：新增“定格画面”列并要求逐镜基于上一镜定格画面衔接；细化内容/台词与画面描述的量化规则（距离、位移、动作轨迹、转场机制）并限制空泛形容词。
+- 2026-03-19 - 验证 - 后端执行 `python3 -m py_compile backend/app/core/script_prompts.py` 通过；前端执行 `npm run lint && npm run typecheck` 通过（0 error，存在历史 warning）。
+- 2026-03-19 - 后端 - 继续强化 Step4 分镜系统 Prompt：要求多角色镜头逐角色综合描述动作表情与互动关系；要求“镜头景别与机位”和“运镜手法”按起始到定格的动态过程输出，并强制上一镜定格机位对齐下一镜起始机位。
+- 2026-03-19 - 验证 - 后端执行 `python3 -m py_compile backend/app/core/script_prompts.py` 通过；前端执行 `npm run lint && npm run typecheck` 通过（0 error，存在历史 warning）。
+- 2026-03-19 - 后端 - 细化 Step4 分镜 Prompt 的“定格画面”规则：强制逐角色描述画面位置、身体姿势、表情百分比，以及人物与道具关系（持握手、朝向、高度、距离），并补充标准写法示例。
+- 2026-03-19 - 验证 - 后端执行 `python3 -m py_compile backend/app/core/script_prompts.py` 通过；前端执行 `npm run lint && npm run typecheck` 通过（0 error，存在历史 warning）。
+- 2026-03-19 - 前后端 - 调整 Step4 分镜 Prompt 为单列融合结构：将“镜头景别与机位/运镜手法/内容台词/定格画面”融合为“镜头调度与内容融合”，强制按“起始-过程-定格画面”输出；同时将“画面描述”聚焦为光源、色调与场景结构描述。
+- 2026-03-19 - 验证 - 后端执行 `python3 -m py_compile backend/app/core/script_prompts.py` 通过；前端执行 `npm run lint && npm run typecheck` 通过（0 error，存在历史 warning）。
+- 2026-03-19 - 后端 - 强化 Step4 分镜 Prompt：新增“同场景变化必须写明从什么变成什么”约束，覆盖分镜内过程变化与跨分镜衔接变化，并要求跨分镜起始逐项对齐上一镜定格状态。
+- 2026-03-19 - 验证 - 后端执行 `python3 -m py_compile backend/app/core/script_prompts.py` 通过；前端执行 `npm run lint && npm run typecheck` 通过（0 error，存在历史 warning）。
+- 2026-03-19 - 后端 - 继续强化 Step4 分镜 Prompt：新增“如何变化”强约束，要求每次变化必须写明驱动因素、变化路径、速度节奏、阶段节点与达到终态条件，禁止只写变化结果。
+- 2026-03-19 - 验证 - 后端执行 `python3 -m py_compile backend/app/core/script_prompts.py` 通过；前端执行 `npm run lint && npm run typecheck` 通过（0 error，存在历史 warning）。
+- 2026-03-19 - 后端 - 强化 Step4 分镜 Prompt 画面描述可执行性：禁止使用“主光参数不变/同上/同前/延续上一镜”等省略写法，要求每行完整重述光源与色调参数，适配单行独立视频模型请求。
+- 2026-03-19 - 验证 - 后端执行 `python3 -m py_compile backend/app/core/script_prompts.py` 通过；前端执行 `npm run lint && npm run typecheck` 通过（0 error，存在历史 warning）。
+- 2026-03-19 - 前端 - 修复 Step4 分镜视频生成素材引用回归：增强单元格 AssetID 解析，支持在素材列表未加载完成时直接识别 UUID，并从图片 URL 中提取 asset_id，确保角色/道具/场景绑定稳定传入视频请求。
+- 2026-03-19 - 验证 - 前端执行 `npm run lint && npm run typecheck` 通过（0 error，存在历史 warning）。
+- 2026-03-19 - 后端 - 对齐 Kling Omni 素材引用约束：当用户已绑定素材但服务端未解析到可用图片时直接报错；尾帧无首帧时自动降级为普通参考图；参考图列表按官方上限裁剪为最多7张并保持首尾帧优先。
+- 2026-03-19 - 验证 - 后端执行 `python3 -m py_compile backend/app/services/linkapi.py` 通过；前端执行 `npm run lint && npm run typecheck` 通过（0 error，存在历史 warning）。
+- 2026-03-19 - 后端 - 修正 Kling 素材引用策略：移除“尾帧无首帧自动降级”和“参考图最多7张裁剪”逻辑，避免误删用户显式设置的 reference_images.type 与素材引用；保留素材解析失败即报错，防止静默丢引用。
+- 2026-03-19 - 验证 - 后端执行 `python3 -m py_compile backend/app/services/linkapi.py` 通过；前端执行 `npm run lint && npm run typecheck` 通过（0 error，存在历史 warning）。
+- 2026-03-19 - 前后端 - 收敛为仅首帧链路：前端移除尾帧列识别与 `end_frame_asset_id` 透传；后端移除 `end_frame_asset_id` 与 `end_frame` 类型处理，素材引用仅保留 `first_frame` 与角色/场景/道具。
+- 2026-03-19 - 验证 - 后端执行 `python3 -m py_compile backend/app/services/linkapi.py` 通过；前端执行 `npm run lint && npm run typecheck` 通过（0 error，存在历史 warning）。
+- 2026-03-19 - 后端 - 强化分镜空间参照规则：在“镜头调度与内容融合”中新增坐标原点与轴线强制说明，禁止“左侧2米/右侧8米”无参照写法，要求量化距离绑定参照物并补充可执行坐标示例。
+- 2026-03-19 - 验证 - 后端执行 `python3 -m py_compile backend/app/core/script_prompts.py` 通过；前端执行 `npm run lint && npm run typecheck` 通过（0 error，存在历史 warning）。
+- 2026-03-19 - 后端 - 强化分镜时长策略：明确禁止将7~8秒作为默认折中时长，要求同场景连续内容优先合并为10~15秒长镜头，并在连续7~8秒分段时强制备注切分原因；同时在分镜生成接口追加同规则提醒。
+- 2026-03-19 - 验证 - 后端执行 `python3 -m py_compile backend/app/core/script_prompts.py backend/app/api/script.py` 通过；前端执行 `npm run lint && npm run typecheck` 通过（0 error，存在历史 warning）。
+- 2026-03-19 - 前端 - 修复 Step4 素材选择弹窗类型错误：统一 `pickerAssetData` 返回结构，移除空数据分支的数组返回，恢复素材列表与映射类型稳定性。
+- 2026-03-19 - 后端 - 修复素材图片预览回退逻辑：`GET /projects/{project_id}/assets/{asset_id}/image` 在“已选版本无图”时回退到“最新有图版本”，避免部分素材返回404导致前端不展示。
+- 2026-03-19 - 验证 - 前端执行 `npm run lint` 与 `npm run typecheck` 通过（0 error，保留历史 warning）；后端执行 `python3 -m py_compile backend/app/api/assets.py` 通过。
+- 2026-03-19 - 后端 - 修复 Step4 素材预览本地图片链路：`GET /projects/{project_id}/assets/{asset_id}/image` 遇到 `/static/...` 路径时直接回传文件，不再重定向到前端域名导致 404。
+- 2026-03-19 - 前端 - 修复 Step4 素材有图判定策略：统一按“最新有图版本”判定并过滤空白 URL，避免选中版本缺图时误显示“无图”。
+- 2026-03-19 - 验证 - 前端执行 `npm run lint && npm run typecheck` 通过（0 error，保留历史 warning）；后端执行 `python3 -m py_compile backend/app/api/assets.py` 通过。
+- 2026-03-19 - 前端 - 修复 Step4 AssetID 解析误匹配：仅在名称存在实际匹配时才参与候选打分，避免因“有图/类型偏好”把道具误映射为场景素材。
+- 2026-03-19 - 验证 - 前端执行 `npm run lint` 与 `npm run typecheck` 通过（0 error，保留历史 warning）。
+- 2026-03-19 - 后端 - 调整 Step4 分镜 Prompt 空间表达规则：弃用 X/Y/Z 坐标系与原点轴线写法，统一改为“人物/机位/地标”相对位置与相对距离描述，提升视频模型可理解性。
+- 2026-03-19 - 后端 - 调整 Step4 分镜 Prompt 定格文案：移除“作为下一分镜初始画面”固定措辞要求，保留镜头衔接约束但不强制该字样。
+- 2026-03-19 - 验证 - 后端执行 `python3 -m py_compile backend/app/core/script_prompts.py` 通过；前端执行 `npm run lint` 与 `npm run typecheck` 通过（0 error，保留历史 warning）。
+- 2026-03-19 - 后端 - 强化 Step4 分镜 Prompt 目光朝向规则：要求在起始/过程/定格中明确每个角色“看向谁或何处”，并标注过程中的视线变化时点；若不变化需写“全程注视XXX”。
+- 2026-03-19 - 后端 - 更新 Step4 分镜 Prompt 示例与自检项：示例加入双角色目光锁定与切换，自检新增“目光朝向与变化时点完整性”检查。
+- 2026-03-19 - 验证 - 后端执行 `python3 -m py_compile backend/app/core/script_prompts.py` 通过；前端执行 `npm run lint` 与 `npm run typecheck` 通过（0 error，保留历史 warning）。
+- 2026-03-19 - 后端 - 强化 Step4 分镜 Prompt 动作拆解规则：要求`过程`按时间切片逐段写清动作发起者、受力点、轨迹、反馈与终态，禁止用“高速/极快/激烈”等形容词替代动作细节。
+- 2026-03-19 - 后端 - 更新 Step4 分镜 Prompt 打斗示例与自检项：示例改为分秒级可执行动作链（起步/格挡/反切/卸力），自检新增“超过3秒动作段必须细分并写全动作要素”检查。
+- 2026-03-19 - 验证 - 后端执行 `python3 -m py_compile backend/app/core/script_prompts.py` 通过；前端执行 `npm run lint` 与 `npm run typecheck` 通过（0 error，保留历史 warning）。
+- 2026-03-19 - 后端 - 修正 Step4 分镜 Prompt 动作规则：取消“超过3秒才细分”的门槛，改为所有动作节点都必须细致可执行，禁止以“高速/极快/激烈”等形容词一带而过。
+- 2026-03-19 - 后端 - 强化 Step4 分镜 Prompt 动作联动表达：要求关键动作节点同步写明表情百分比变化与目光指向变化（看向谁/何处），并在示例与自检中强制校验。
+- 2026-03-19 - 验证 - 后端执行 `python3 -m py_compile backend/app/core/script_prompts.py` 通过；前端执行 `npm run lint` 与 `npm run typecheck` 通过（0 error，保留历史 warning）。
+- 2026-03-19 - 后端 - 强化 Step4 分镜 Prompt 交互先后手规则：多角色对抗必须写成“动作触发-对方反馈-再次应对”的因果链，禁止双方并列各做各的动作清单。
+- 2026-03-19 - 后端 - 更新 Step4 分镜 Prompt 打斗示例与自检项：示例改为明确先后手触发链，自检新增“交互因果链完整性”检查。
+- 2026-03-19 - 验证 - 后端执行 `python3 -m py_compile backend/app/core/script_prompts.py` 通过；前端执行 `npm run lint` 与 `npm run typecheck` 通过（0 error，保留历史 warning）。
+- 2026-03-19 - 前端 - 在 Step4「视频生成」栏新增“下载视频”按钮，点击后下载当前选中版本视频（无直连下载能力时自动回退为新标签下载）。
+- 2026-03-19 - 验证 - 前端执行 `npm run lint` 与 `npm run typecheck` 通过（0 error，保留历史 warning）。
+- 2026-03-20 - 后端 - 强化 Step4 分镜生成 Prompt 台词约束：要求每句台词强制标注“角色名+开始秒+结束秒”，并同步写明该句对应的表情变化、眼神指向与语气/音量/语速。
+- 2026-03-20 - 后端 - 更新分镜生成接口“再次提醒”文案：新增台词逐句时间标注与说话状态（表情/眼神/语气）强制要求，减少模型漏写台词节拍信息。
+- 2026-03-20 - 验证 - 后端执行 `python3 -m py_compile backend/app/core/script_prompts.py backend/app/api/script.py` 通过；前端执行 `npm run lint`（0 error，17 warnings）与 `npm run typecheck` 通过。
+- 2026-03-20 - 前后端 - Step3/Step4 配音链路切换为 ElevenLabs：新增 `eleven_labs` 服务与 API 路由，前端音色选择与配音生成改用 ElevenLabs 声线与生成接口。
+- 2026-03-20 - 前端 - Step4 配音面板改造为 ElevenLabs 全量调节：补齐模型、输出格式、语言、稳定性、相似度、风格、Speaker Boost、Seed、上下文文本、发音覆盖与词典定位参数输入。
+- 2026-03-20 - 验证 - 前端执行 `npm run lint`（0 error，17 warnings）与 `npm run typecheck` 通过；后端执行 `python3 -m compileall app` 通过。
+- 2026-03-20 - 配置 - 更新本地后端 `.env`，补充 ElevenLabs API Key 环境变量用于配音服务鉴权。
+- 2026-03-21 - 前端 - Step4 移除“角色台词配音（ElevenLabs）”整栏，清理分镜表中“生成配音”入口。
+- 2026-03-21 - 前端 - Step4 下一步按钮文案调整为“下一步：合并视频并生成配音”，并改为携带 `autoMerge=1` 跳转 Step5。
+- 2026-03-21 - 前端 - Step5 新增自动分集合并流程：从 Step4 跳入时自动调用服务端合并并将播放器切换为合并后视频。
+- 2026-03-21 - 验证 - 前端执行 `npm run lint`（0 error，19 warnings）与 `npm run typecheck` 通过。
+- 2026-03-20 - 前后端 - ElevenLabs 配音默认模型切换为 `eleven_v3`：同步更新前端 Step3/Step4 默认值与后端接口/服务兜底默认值。
+- 2026-03-20 - 验证 - 前端执行 `npm run lint`（0 error，17 warnings）与 `npm run typecheck` 通过；后端执行 `python3 -m compileall app` 通过。
+- 2026-03-20 - 前后端 - Step5 新增“每集配音处理”三按钮链路：一键合并视频、一键提取配音、一键生成分段配音，按“先合并再提取”流程打通分集处理入口。
+- 2026-03-20 - 后端 - 新增 Step5 音频处理 API：分集合并下载后提取音频、人声增强、静音检测自动分段、分割点回写、分段切片与 ElevenLabs S2S 分段音色替换。
+- 2026-03-20 - 前端 - Step5 新增音轨分割编辑区：展示提取后波形与分割点，支持拖拽调整分割点并应用保存，支持分段试听与分段音色选择生成。
+- 2026-03-20 - 验证 - 后端执行 `python3 -m py_compile app/api/final.py app/services/eleven_labs.py` 通过；前端执行 `npm run lint`（0 error，17 warnings）与 `npm run typecheck` 通过。
+- 2026-03-20 - 前端 - Step5 分段 S2S 模型改为动态拉取 ElevenLabs `/v1/models` 并按 `can_do_voice_conversion=true` 过滤，新增每个分段可选模型下拉框，提交时按用户所选模型调用 S2S。
+- 2026-03-20 - 验证 - 前端执行 `npm run lint`（0 error，17 warnings）与 `npm run typecheck` 通过。
+- 2026-03-20 - 后端 - Step5 提取配音链路改为 ElevenLabs 人声分离：分集合并后先抽取音频并调用 `/v1/audio-isolation` 获取干净人声，再转换为标准 WAV 供波形展示、分割点编辑与后续分段 S2S。
+- 2026-03-20 - 验证 - 后端执行 `python3 -m py_compile app/api/final.py app/services/eleven_labs.py` 通过；前端执行 `npm run lint`（0 error，17 warnings）与 `npm run typecheck` 通过。
+- 2026-03-20 - 前后端 - Step5 一键合并改为服务端持久化：新增 `/episodes/merge-store` 接口按分集内容生成 `merge_key` 并缓存合并视频；一键提取优先复用已合并视频，避免重复下载与重复合并。
+- 2026-03-20 - 验证 - 后端执行 `python3 -m py_compile app/api/final.py app/services/eleven_labs.py` 通过；前端执行 `npm run lint`（0 error，17 warnings）与 `npm run typecheck` 通过。
+- 2026-03-20 - 后端 - 修复 Step5 一键提取在部分环境报 `Error opening output files: Invalid argument`：ffmpeg 提取与转码改在 ASCII 临时目录执行，完成后再回写到项目目录，规避路径兼容问题。
+- 2026-03-20 - 验证 - 后端执行 `python3 -m py_compile app/api/final.py app/services/eleven_labs.py` 通过；前端执行 `npm run lint`（0 error，17 warnings）与 `npm run typecheck` 通过。
+- 2026-03-20 - 后端 - 修复持久化合并阶段中文路径兼容：`_prepare_merged_video` 先在 ASCII 临时目录完成 ffmpeg 合并，再复制到缓存目录，避免在中文绝对路径直接写输出导致 `Invalid argument`。
+- 2026-03-20 - 验证 - 后端执行 `python3 -m py_compile app/api/final.py app/services/eleven_labs.py` 通过；执行自测脚本 `SELFTEST_OK 4687 4687 137294`（本地生成视频→合并→复制到项目目录→提取音频全链路通过）；前端执行 `npm run lint`（0 error，17 warnings）与 `npm run typecheck` 通过。
+- 2026-03-20 - 后端 - 增强 Step5 音频提取稳健性：新增 `_extract_audio_with_fallback`，提取时按“直出 WAV → 先出 MP3 再转 WAV”双路径回退；并保留失败细节，避免单一路径在特定素材/参数下直接中断。
+- 2026-03-20 - 验证 - 后端执行 `python3 -m py_compile app/api/final.py app/services/eleven_labs.py` 通过；执行自测脚本输出 `EXTRACT_OK 45134`（本地生成含音轨视频并成功提取 WAV）；前端执行 `npm run lint`（0 error，17 warnings）与 `npm run typecheck` 通过。
+- 2026-03-20 - 后端 - 修复无音轨分集导致提取失败：新增 `_probe_has_audio_stream`，提取链路在检测到视频无音轨时自动按视频时长生成静音 WAV 并继续后续波形/分段流程，不再因 ffmpeg `Output file does not contain any stream` 中断。
+- 2026-03-20 - 验证 - 后端执行 `python3 -m py_compile app/api/final.py app/services/eleven_labs.py` 通过；针对真实缓存合并文件 `3135ea4dd2053652b512.mp4` 实测 `HAS_AUDIO False DUR 64.871582` 且 `SILENT_OK 5721788 5721788`；前端执行 `npm run lint`（0 error，17 warnings）与 `npm run typecheck` 通过。
+- 2026-03-20 - 前端 - Step5 提取结果区新增“提取原始音轨/人声分离结果”播放器；分割点未应用前隐藏分段角色选择与S2S区；应用后按每个片段单行展示并支持逐段播放。
+- 2026-03-20 - 前端 - Step5 新增分段批量“一键S2S”：按当前每段所选音色与模型顺序执行，支持与单段 S2S 共存。
+- 2026-03-20 - 验证 - 前端执行 `npm run lint`（0 error，17 warnings）与 `npm run typecheck` 通过。
+- 2026-03-20 - 前端 - 修复 Step5 人声分离音频无法播放：新增 `resolveBackendMediaUrl` 将后端返回的 `/static/...` 资源转换为完整后端地址，统一用于原始音轨、人声结果与分段音频播放器。
+- 2026-03-20 - 验证 - 前端执行 `npm run lint`（0 error，17 warnings）与 `npm run typecheck` 通过。
+- 2026-03-20 - 后端 - 修复 Step5 音频文件静态路径错位：统一 `final.py` 的静态根目录到 `backend/static`；并在应用启动时自动把历史 `backend/app/static/audio_pipeline` 数据迁移到当前静态目录，保障旧任务可直接播放。
+- 2026-03-20 - 验证 - 后端执行 `python3 -m py_compile app/main.py app/api/final.py` 通过；本地实测 `GET /static/audio_pipeline/.../vocals.wav` 返回 `200 audio/x-wav`，历史 job 音频可访问。
+- 2026-03-20 - 后端 - 修复 Step5 提取音频时长异常与无声：提取接口在有 `clip_urls` 时强制按当前分镜重新计算 `merge_key`，避免复用旧缓存；合并流程新增“缓存有效性校验（总时长/音轨）+ 自动重建”；并在混合“有声/无声”分镜时先统一补齐音轨后再合并，确保最终合并视频包含正确时长和可提取音轨。
+- 2026-03-20 - 前端 - Step5 提取接口不再携带历史 `mergeKey`，统一按当前选中分镜请求后端合并缓存，避免旧合并键导致错提取。
+- 2026-03-20 - 验证 - 后端执行 `python3 -m py_compile app/api/final.py app/main.py` 通过；前端执行 `npm run lint`（0 error，17 warnings）与 `npm run typecheck` 通过；针对项目 `eccd...` 实测所选 2 段分镜总时长 `18.083s`，重建后合并文件 `18.124s` 且 `has_audio=True`。
+- 2026-03-20 - 后端 - Step5 调整音轨提取流程：点击“一键提取配音”仅提取原始音轨并生成双线区间默认值，不再在提取阶段触发人声分离；“应用分割点”改为立即按区间裁切音频并回填分段数据。
+- 2026-03-20 - 前端 - Step5 波形分割改为固定两根可拖拽分割线（起点/终点）并高亮中间区间；移除“一键生成分段配音”按钮，点击“应用分割点”后自动展示区间分段到下方配音区。
+- 2026-03-20 - 验证 - 后端执行 `python3 -m py_compile app/api/final.py app/main.py` 通过；前端执行 `npm run lint`（0 error，17 warnings）与 `npm run typecheck` 通过。
+- 2026-03-20 - 前端 - Step5 在“提取音轨与分割点”区域新增“播放选中区域”按钮：按当前双线区间实时预览原始音轨，支持再次点击停止播放，并在切换播放对象时自动中止上一段预览。
+- 2026-03-20 - 验证 - 前端执行 `npm run lint`（0 error，17 warnings）与 `npm run typecheck` 通过。
+- 2026-03-20 - 后端 - Step5 分段链路新增“提取人声”接口 `/episodes/audio-pipeline/extract-segment-vocal`：按分段音频调用 ElevenLabs `/v1/audio-isolation` 生成分段人声并回写 `isolated_audio_url`，同时 S2S 改为强制基于分段人声音频执行。
+- 2026-03-20 - 前端 - Step5 分段区新增“提取人声”按钮与状态控制：S2S 按钮在未提取人声前禁用；人声提取后在分段原音下方展示“提取人声”，并在同一行右侧展示可播放的 S2S 结果；批量一键 S2S 仅对已提取人声的分段生效。
+- 2026-03-20 - 验证 - 后端执行 `python3 -m py_compile app/api/final.py` 通过；前端执行 `npm run lint`（0 error，17 warnings）与 `npm run typecheck` 通过。
+- 2026-03-20 - 后端 - 修复 Step5 重复“应用分割点”后分段音频未刷新：分段切片文件名改为携带区间毫秒戳（`segId_start_end.wav`），每次应用区间生成新静态 URL，避免浏览器复用旧缓存导致看似仅首次生效。
+- 2026-03-20 - 前端 - Step5 分段播放器增加基于音频 URL 的重建键，确保分段原音/提取人声/S2S 结果在 URL 变化时立即重建播放器并刷新时长与波形状态。
+- 2026-03-20 - 验证 - 后端执行 `python3 -m py_compile app/api/final.py` 通过；前端执行 `npm run lint`（0 error，17 warnings）与 `npm run typecheck` 通过。
+- 2026-03-20 - 后端 - Step5 调整“应用分割点”为追加模式：每次应用当前双线区间都会新建一条分段记录（递增 `seg-xxx`），不再覆盖已有分段；并保留历史分段的人声提取与 S2S 结果。
+- 2026-03-20 - 后端 - Step5 初次提取配音不再预置默认分段，分段列表仅在用户点击“应用分割点”后开始生成，避免首次即出现占位分段导致后续追加语义不一致。
+- 2026-03-20 - 验证 - 后端执行 `python3 -m py_compile app/api/final.py` 通过；前端执行 `npm run lint`（0 error，17 warnings）与 `npm run typecheck` 通过。
+- 2026-03-20 - 后端 - Step5 分段 S2S 增强 ElevenLabs 套餐错误识别：当返回 `paid_plan_required/payment_required` 时统一转换为可操作提示（Library 音色需升级或切换自有/克隆音色），避免直接透传原始 JSON 报错。
+- 2026-03-20 - 前端 - Step5 分段音色下拉默认优先过滤 `category=library` 的音色列表，优先展示免费账号更可用的自有/克隆音色，减少 S2S 因套餐限制失败。
+- 2026-03-20 - 验证 - 后端执行 `python3 -m py_compile app/api/final.py` 通过；前端执行 `npm run lint`（0 error，17 warnings）与 `npm run typecheck` 通过。
+- 2026-03-20 - 后端 - 修正 Step5 错误映射作用域：仅在分段 S2S 接口应用 ElevenLabs 套餐错误友好提示，避免影响“生成分段配音”等非 S2S 路径的原始错误语义。
+- 2026-03-20 - 验证 - 后端执行 `python3 -m py_compile app/api/final.py` 通过；前端执行 `npm run lint`（0 error，17 warnings）与 `npm run typecheck` 通过。
+- 2026-03-20 - 后端 - Step5 新增原始音轨人声提取接口 `/episodes/audio-pipeline/extract-original-vocal`：调用 ElevenLabs 人声分离并回写 `original_isolated_audio_url`，同时将分段裁切输入切换为该提取人声音轨。
+- 2026-03-20 - 前端 - Step5 音轨区改为“原始音轨提取人声”流程：新增原始音轨“提取人声”按钮，提取成功后在原始音轨下方展示“提取人声音轨”，并将“播放选中区域/应用分割点”迁移到该人声音轨；移除分段区“提取人声”按钮与调用链。
+- 2026-03-20 - 验证 - 后端执行 `python3 -m py_compile backend/app/api/final.py` 通过；前端执行 `npm run lint`（0 error，17 warnings）与 `npm run typecheck` 通过。
+- 2026-03-20 - 后端 - Step5 移除分段人声提取接口与请求模型；分段 S2S 改为直接使用分段 `source_audio_url`（由“提取人声音轨”分割产生），彻底去除分段级“提取人声”依赖。
+- 2026-03-20 - 验证 - 后端执行 `python3 -m py_compile backend/app/api/final.py` 通过；前端执行 `npm run lint`（0 error，17 warnings）与 `npm run typecheck` 通过。
+- 2026-03-20 - 前端 - Step5 分段 S2S 音色选择改为严格仅使用非 `library` 音色；若当前已选音色不可用，自动回退到首个可用自有/克隆音色并继续执行，避免再次触发套餐限制错误。
+- 2026-03-20 - 验证 - 前端执行 `npm run lint`（0 error，17 warnings）与 `npm run typecheck` 通过。
+- 2026-03-20 - 前端 - Step5 分段 S2S 音色下拉改为读取 Step3 角色已配置音色：拉取项目角色音色配置并按角色聚合展示，默认优先匹配分段 `speaker_label` 对应角色音色。
+- 2026-03-20 - 验证 - 前端执行 `npm run lint`（0 error，17 warnings）与 `npm run typecheck` 通过。
+- 2026-03-20 - 前端 - Step5 新增页面级自动保存与恢复：按项目将分集音频流水线结果、分割区间、S2S 音色/模型选择、剧本展开状态与音轨编辑布局持久化到本地存储，刷新或返回后可自动恢复。
+- 2026-03-20 - 验证 - 前端执行 `npm run lint`（0 error，17 warnings）与 `npm run typecheck` 通过。
+- 2026-03-20 - 前后端 - Step3 音色库接入 Library 与官方标签筛选：后端合并 My Voices 与 Shared Voices 并保持分页，新增语言/口音/性别/年龄/质量筛选参数与筛选项回传；前端音色选择弹窗改为按官方标签筛选并展示对应标签信息。
+- 2026-03-20 - 验证 - 后端执行 `python3 -m py_compile backend/app/api/eleven_labs.py backend/app/services/eleven_labs.py` 通过；前端执行 `npm run lint`（0 error，17 warnings）与 `npm run typecheck` 通过。
+- 2026-03-20 - 前端 - Step3 音色筛选交互优化：语言筛选项统一展示中文名称（如“汉语”“英语”）；口音筛选改为先选语言后展示对应口音，未选语言时不平铺口音标签。
+- 2026-03-20 - 验证 - 前端执行 `npm run lint`（0 error，17 warnings）与 `npm run typecheck` 通过。
+- 2026-03-20 - 前后端 - Step3 音色选择进一步优化：语言统一展示为中文（“中文”“英语”等），年龄统一为“青年/中年/老年”；中文口音补齐为官方口音集合并按“先选语言再选口音”联动；后端改为单页拉取 Shared Voices 并回传 has_more，显著降低初次加载时延，同时在列表中显式标识 Library 音色。
+- 2026-03-20 - 验证 - 后端执行 `python3 -m py_compile backend/app/services/eleven_labs.py backend/app/api/eleven_labs.py` 通过；前端执行 `npm run lint`（0 error，17 warnings）与 `npm run typecheck` 通过。
+- 2026-03-20 - 后端 - 修复 Step3 中文音色数量异常：将 Shared Voices 的 language 参数从内部代码值改为官方语义值（如 Chinese/English），避免 `zh` 导致库内中文音色结果被过度收窄仅剩少量条目。
+- 2026-03-20 - 验证 - 后端执行 `python3 -m py_compile backend/app/services/eleven_labs.py backend/app/api/eleven_labs.py` 通过；前端执行 `npm run lint`（0 error，17 warnings）与 `npm run typecheck` 通过。
+- 2026-03-20 - 前端 - Step3 克隆音色上传新增时长识别与风险提示：音频少于 30 秒时允许继续克隆，但在上传区显式提示相似度、稳定性与发音漂移风险。
+- 2026-03-20 - 验证 - 前端执行 `npm run lint`（0 error，17 warnings）与 `npm run typecheck` 通过。
+- 2026-03-21 - 前端 - 修复 Step5 S2S 失败无提示：新增右上角浮层提示，单段与批量 S2S 在失败时立即显示错误信息并自动消失，成功也显示完成提示。
+- 2026-03-21 - 验证 - 前端执行 `npm run lint`（0 error，17 warnings）与 `npm run typecheck` 通过。
+- 2026-03-21 - 后端 - Step5 新增分段音频删除接口，支持按 `job_id + segment_id` 删除 metadata 分段记录并清理对应静态音频文件。
+- 2026-03-21 - 前端 - Step5 分段列表新增“删除”按钮，支持确认后删除分段音频并同步刷新分段状态与提示。
+- 2026-03-21 - 验证 - 后端执行 `python3 -m py_compile backend/app/api/final.py` 通过；前端执行 `npm run lint`（0 error，17 warnings）与 `npm run typecheck` 通过。
+- 2026-03-21 - 前端 - 统一 Step5 全链路错误提示：下载、提取、分割、预览、单段/批量 S2S 均改为错误态消息（红色）+ 右上角浮层；成功态统一绿色提示，处理中保持蓝色提示。
+- 2026-03-21 - 验证 - 前端执行 `npm run lint`（0 error，17 warnings）与 `npm run typecheck` 通过。
+- 2026-03-21 - 前端 - Step5 播放区新增音轨缩放交互：支持触控板双指张开与鼠标滚轮放大/缩小时间轴，拖拽与投放按缩放后刻度对齐。
+- 2026-03-21 - 验证 - 前端执行 `npm run lint`（0 error，17 warnings）与 `npm run typecheck` 通过。
+- 2026-03-21 - 前端 - 修复 Step5 时间轴手势缩放被浏览器页面缩放劫持：改为非被动原生 wheel/gesture 监听并在时间轴区域拦截默认行为，确保双指捏合只缩放音轨区域。
+- 2026-03-21 - 验证 - 前端执行 `npm run lint`（0 error，17 warnings）与 `npm run typecheck` 通过。
+- 2026-03-21 - 前端 - 进一步修复 Step5 双指捏合仍触发整页缩放：新增 document 捕获阶段 wheel/gesture 拦截，仅在时间轴悬停时接管缩放并映射到音轨时间轴。
+- 2026-03-21 - 验证 - 前端执行 `npm run lint`（0 error，17 warnings）与 `npm run typecheck` 通过。
+- 2026-03-21 - 前端 - Step5 时间轴缩放改为按钮优先：保留“放大/缩小”两个按钮并移除手势与滚轮缩放监听，避免与浏览器页面缩放冲突。
+- 2026-03-21 - 验证 - 前端执行 `npm run lint`（0 error，17 warnings）与 `npm run typecheck` 通过。
+- 2026-03-21 - 前端 - 在“提取音轨与分割点”波形区新增可见的“缩小/放大”按钮，并将波形容器改为可横向滚动缩放视图。
+- 2026-03-21 - 验证 - 前端执行 `npm run lint`（0 error，17 warnings）与 `npm run typecheck` 通过。
+- 2026-03-21 - 前端 - 将“播放选中区域/应用分割点/缩小/放大”整理为同一行并将缩放按钮右置，同时将“第X集”与“分镜序号 X-Y”放在一键操作按钮左侧且同一行展示。
+- 2026-03-21 - 验证 - 前端执行 `npm run lint`（0 error，17 warnings）与 `npm run typecheck` 通过。
+- 2026-03-21 - 后端 - Step5 新增“一键合并配音”接口 `/episodes/audio-pipeline/merge-dubbed`：按分段 `start_sec` 将已生成 S2S 音频延迟对齐到原轨时间轴，整体输出时长固定为原提取人声音轨时长，未覆盖区间自动保留静音。
+- 2026-03-21 - 前端 - Step5 在“一键S2S”右侧新增“一键合并配音”按钮并展示合并结果播放器；同一集处于批量 S2S/合并中时互斥禁用，避免并发覆盖状态。
+- 2026-03-21 - 验证 - 后端执行 `python3 -m py_compile backend/app/api/final.py` 通过；前端执行 `npm run lint`（0 error，17 warnings）与 `npm run typecheck` 通过。
+- 2026-03-21 - 前端 - Step5 分段标题时长展示改为秒制小数格式：由区间/播放器时间样式改为 `3.11s`，统一保留两位小数。
+- 2026-03-21 - 验证 - 前端执行 `npm run lint`（0 error，17 warnings）与 `npm run typecheck` 通过。
+- 2026-03-21 - 前端 - 按需求回调 Step5 分段标题展示为起止时间（`mm:ss-mm:ss`）；播放器改为页内自定义控件并将播放器内时间统一改为 `x.xx s` 两位小数格式。
+- 2026-03-21 - 验证 - 前端执行 `npm run lint`（0 error，17 warnings）与 `npm run typecheck` 通过。
+- 2026-03-21 - 前端 - 按需求移除 Step5 视频下方音频编辑区：删除统一时间轴/音轨拖拽/放置入口，仅保留视频播放与进度拖动预览。
+- 2026-03-21 - 验证 - 前端执行 `npm run lint`（0 error，16 warnings）与 `npm run typecheck` 通过。
+- 2026-03-21 - 前端 - 修复 Step5 自动合并长时间卡在“正在自动合并分集视频”：自动合并改为按分集设置独立超时并显示当前分集进度，超时分集自动记为失败后继续后续分集，避免整页长时间无反馈。
+- 2026-03-21 - 前端 - `mergeEpisodeOnServer` 新增可选超时参数，支持自动合并场景按更短时限快速失败并回退手动合并。
+- 2026-03-21 - 验证 - 前端执行 `npm run lint`（0 error，19 warnings）与 `npm run typecheck` 通过。
+- 2026-03-21 - 前端 - Step4 每集头部在“生成分镜”旁新增“合并视频”按钮，按本集分镜顺序收集已生成视频并调用服务端分集合并。
+- 2026-03-21 - 前端 - Step4 在“本集剧本”上方新增合并视频播放器；顶部“下一步”改为直接进入 Step5（不再携带自动合并参数）。
+- 2026-03-21 - 验证 - 前端执行 `npm run lint`（0 error，19 warnings）与 `npm run typecheck` 通过。
+- 2026-03-21 - 前端 - Step4 合并视频结果同步写入 Step5 持久化存储 `video-step-state-{projectId}.mergedVideoUrlMap`，点击“下一步：生成配音”后 Step5 自动带入已合并视频进行后续处理。
+- 2026-03-21 - 前端 - Step4 新增从 Step5 持久化存储回填合并视频映射，确保往返步骤时分集已合并视频可继续展示与复用。
+- 2026-03-21 - 验证 - 前端执行 `npm run lint`（0 error，19 warnings）与 `npm run typecheck` 通过。
+- 2026-03-21 - 前端 - 修复 Step4/Step5 合并视频状态键名不一致：Step4 改为读写 `video-step5-state:{projectId}`，并兼容读取旧键 `video-step-state-{projectId}`，避免 Step5 丢失已合并视频映射。
+- 2026-03-21 - 前端 - Step5 提取配音流程改为优先使用 `mergedVideoUrlMap` 的单个合并视频地址；播放统计与可提取状态同步按合并后来源计算。
+- 2026-03-21 - 验证 - 前端执行 `npm run lint`（0 error，19 warnings）与 `npm run typecheck` 通过。
+- 2026-03-21 - 前端 - 移除 Step5 “一键合并视频”按钮、服务端分集合并调用与自动合并入口，Step5 不再承担合并动作。
+- 2026-03-21 - 前端 - Step5 视频播放与配音提取改为仅使用 `mergedVideoUrlMap`；未在 Step4 合并时本集显示为空并禁用提取。
+- 2026-03-21 - 验证 - 前端执行 `npm run lint`（0 error，19 warnings）与 `npm run typecheck` 通过。
+- 2026-03-21 - 前端 - 调整 Step5 分集卡片布局：将“提取音轨与分割点”完整区域从剧本上方移动到视频播放器下方。
+- 2026-03-21 - 验证 - 前端执行 `npm run lint`（0 error，19 warnings）与 `npm run typecheck` 通过。
+- 2026-03-21 - 前端 - 调整 Step5 音频编辑区文案与按钮布局：标题改为“原始音轨”，移除重复“原始音轨”小标题，并将“提取人声”按钮置于标题行最右侧。
+- 2026-03-21 - 验证 - 前端执行 `npm run lint`（0 error，19 warnings）与 `npm run typecheck` 通过。
+- 2026-03-21 - 前端 - Step5 音频编辑区文案微调：将“提取人声音轨”改为“人声音轨”。
+- 2026-03-21 - 验证 - 前端执行 `npm run lint`（0 error，19 warnings）与 `npm run typecheck` 通过。
+- 2026-03-21 - 前端 - 调整 Step5 分段音频区操作布局：移除“一键S2S”，并将“一键合并配音”按钮及“合并配音结果”固定到分段列表最下方。
+- 2026-03-21 - 验证 - 前端执行 `npm run lint`（0 error，19 warnings）与 `npm run typecheck` 通过。
+- 2026-03-21 - 前端 - 调整 Step5 视频播放区标题行：移除右侧“已选中段数/视频长度”提示文案。
+- 2026-03-21 - 验证 - 前端执行 `npm run lint`（0 error，19 warnings）与 `npm run typecheck` 通过。
+- 2026-03-21 - 前端 - 调整 Step5 该集剧本卡片：移除默认收起时的提示文案。
+- 2026-03-21 - 验证 - 前端执行 `npm run lint`（0 error，19 warnings）与 `npm run typecheck` 通过。
+- 2026-03-21 - 后端 - Step3 素材图生成切换至 OpenRouter `google/gemini-3.1-flash-image-preview`：生成接口改为 `/chat/completions` 返回图片，素材生成接口固定该模型并更新模型列表/默认模型。
+- 2026-03-21 - 验证 - 后端执行 `python3 -m py_compile backend/app/services/linkapi.py backend/app/api/assets.py backend/app/core/config.py backend/app/models/settings.py` 通过。
+- 2026-03-21 - 后端 - 写入 `backend/.env` 的 `OPENROUTER_API_KEY`，供 Step3 图片生成读取 OpenRouter 密钥。
+- 2026-03-21 - 验证 - 核对 `backend/.env` 已包含 `OPENROUTER_API_KEY` 配置项。
+- 2026-03-21 - 前后端 - 对齐 Step3 模型与参数到 Gemini 3.1：前端可选模型固定为 `google/gemini-3.1-flash-image-preview`，生图参数改为 `aspect_ratio`（9:16/3:4/1:1/4:3/16:9）；后端生成接口默认与日志同步切换为 `aspect_ratio`。
+- 2026-03-21 - 验证 - 前端执行 `npm run lint && npm run typecheck` 通过（0 error，17 warnings）；后端执行 `python3 -m py_compile backend/app/api/assets.py backend/app/services/linkapi.py` 通过。
+- 2026-03-21 - 后端 - 按审核版重写 Step3 `style_prompts.json` 的 20 种风格素材提示词：人物改为“同图含三视图全身立绘（含脚部、中性站姿）+ 正面人像特写（头肩构图）”双组结构，道具/场景补齐统一清晰度约束。
+- 2026-03-21 - 后端 - 修正提示词表述合理性：移除人物提示词中的 `8k` 固定分辨率描述，统一采用“超4K级细节呈现”，避免与用户选择画幅参数产生冲突。
+- 2026-03-21 - 验证 - 执行 `python3 -c "import json; json.load(...style_prompts.json...)"`、`python3 -m compileall backend/app`、`npm run lint`（0 error，17 warnings）与 `npm run typecheck` 均通过。
+- 2026-03-21 - 前端 - 修复 Step3 素材生成跨域失败：当 `NEXT_PUBLIC_API_BASE_URL` 为本机跨域绝对地址时，浏览器端请求自动回退到同源 `/api`，避免 `localhost:3000 -> localhost:8000` 的 CORS 拦截导致场景生成失败。
+- 2026-03-21 - 验证 - 前端执行 `npm run lint`（0 error，17 warnings）与 `npm run typecheck` 通过。
+
+2026-03-21 - bugfix - 修复 docker-compose.yml version 警告，修复 backend/app/api/final.py 中视频下载和合并时由于未捕获异常导致的 500 错误
+
+2026-03-22 - 修复 - 修复 Step 4 Kling 视频生成相关逻辑，挂载 static 目录恢复历史视频显示，添加原生 Kling AK/SK JWT 鉴权功能
+- 2026-03-22 - 验证 - 执行 `python3 test_create_video.py`，Kling 返回 `code=0` 且任务已提交（task_id=`864418595248812092`，endpoint=`https://api-beijing.klingai.com/v1/videos/omni-video`）。
+- 2026-03-22 - 验证 - 使用 `query_kling_task_status` 查询上述任务，返回 `COMPLETED` 并拿到视频 URL，确认当前域名与 Key 组合可用。
+- 2026-03-22 - 排查 - 核对 `segment_versions`：`KLING_PROCESSING` 数量为 0，`FAILED` 仅剩历史测试记录 `fake-ver-1`（task_id=`...|fake123`），非真实线上任务。
+- 2026-03-22 - 验证 - 复核 Step4 生成参数链路：前端按“所选分镜行字段 + system_prompt”组装请求并传入 `segments/generate`，后端透传至 `create_video`。
+- 2026-03-22 - 修复 - 修复前端 3001 端口直连登录时报 500：`next.config.ts` 的 `/api` 重写默认后端地址改为“开发环境 localhost:8003，生产环境 backend:8000”，避免容器内误指向 localhost。
+- 2026-03-22 - 验证 - 重建并重启 `frontend` 容器后，`POST http://localhost:3001/api/auth/login` 返回 `400 {"detail":"账号或密码错误"}`，不再出现 500。
+- 2026-03-22 - 验证 - 前端执行 `npm run lint && npm run typecheck` 完成，当前为历史遗留告警/报错（与本次改动文件无关）。
+- 2026-03-22 - 排查 - 复现 Step4 失败并确认 Kling 返回 `code=1201`：`prompt: size must be between 0 and 2500`，根因为分镜行内容与系统提示词拼接后超长。
+- 2026-03-22 - 修复 - 在 `backend/app/services/linkapi.py` 新增 Kling prompt 规整与截断逻辑：提交前移除控制字符并将最终 `prompt` 强制限制为 2500 字符以内，覆盖素材映射追加后的场景。
+- 2026-03-22 - 验证 - 执行 `python3 -m py_compile app/services/linkapi.py` 与长 prompt 提交实测，成功返回 `code=0`（task_id=`864555236391292984`，`task_status=submitted`）。
+- 2026-03-22 - 修复 - 调整 Step4 行级“生成视频”按钮状态判定：提交后按版本状态 `KLING_SUBMITTED/KLING_PROCESSING` 进入“生成中...”并禁用，完成后自动恢复“生成视频”。
+- 2026-03-22 - 修复 - 前端 `SegmentVersion` 类型补充 `task_id` 字段以匹配后端返回，避免行状态映射读取任务标识时报类型错误。
+- 2026-03-22 - 验证 - 前端执行 `npx eslint src/app/projects/[id]/script/storyboard/page.tsx src/lib/api.ts` 与 `npm run typecheck` 通过。
+- 2026-03-22 - 修复 - 扩展 Step4 等待阶段的“生成中”判定，支持 `submitted/processing/pending/queue/running` 等中间状态，避免提交后仅短暂显示“生成中”。
+- 2026-03-22 - 验证 - 前端执行 `npx eslint src/app/projects/[id]/script/storyboard/page.tsx src/app/components/ScriptEditor.tsx` 与 `npm run typecheck` 通过（仅历史警告，无错误）。
+- 2026-03-22 - 修复 - 后端资产绑定解析改为按同名同类型素材组优先使用“当前被选中版本”，避免分镜引用新素材时误回退旧素材图片。
+- 2026-03-22 - 修复 - Step4 待处理状态判定不再依赖段落基础状态 `PENDING`，仅依据任务态与版本态，修复等待阶段按钮状态异常。
+- 2026-03-22 - 修复 - 后端分镜任务轮询扩展为识别 `submitted/processing/pending/queue/running` 等中间态，确保排队等待期间持续查询任务直至完成/失败。
+- 2026-03-22 - 验证 - 前端执行 `npx eslint src/app/projects/[id]/script/storyboard/page.tsx src/app/components/ScriptEditor.tsx` 与 `npm run typecheck`；后端执行 `python3 -m py_compile app/api/segments.py app/services/linkapi.py` 通过。
+- 2026-03-22 - 修复 - Step4 新增行级手动待处理映射：提交成功即强制将当前行标记为“生成中”，并在后端状态转为非处理中后自动解除，修复提示已提交但按钮未切换的问题。
+- 2026-03-22 - 验证 - 前端执行 `npx eslint src/app/projects/[id]/script/storyboard/page.tsx` 与 `npm run typecheck` 通过。
+- 2026-03-22 - 修复 - Step4 视频版本下拉仅展示已完成且有视频地址的版本，过滤生成中/失败版本，避免处理中任务出现在可选列表。
+- 2026-03-23 - 后端 - Step5 音效生成接口改为 ElevenLabs text-to-sound-effects，移除 Kling 视频转音效任务创建/查询/轮询与下载合成链路。
+- 2026-03-23 - 后端 - Step5 音效截取时长范围调整为 0.5-30 秒，并按分段回写 `sfx_segment_results` 音频地址元数据。
+- 2026-03-23 - 后端 - ElevenLabs 服务新增音效生成方法 `text_to_sound_effect`，统一调用 `/v1/text-to-sound-effects/convert`。
+- 2026-03-23 - 前端 - Step5 音效草稿与请求移除 `soundtrackPrompt/asmrMode`，生成音效仅提交背景提示词与分段时长。
+- 2026-03-23 - 前端 - Step5 音效结果展示改为分段“截取视频+音频”同步播放组件，点击“播放第N段”同步播放视频与返回音效。
+- 2026-03-23 - 配置 - `docker-compose.yml` 删除 Kling 音效远程上传相关环境变量，新增 `ELEVENLABS_API_KEY` 后端变量。
+- 2026-03-23 - 验证 - 前端执行 `npm run lint`、`npm run typecheck`；后端执行 `python3 -m compileall app` 均通过。
+- 2026-03-23 - 验证 - 按规范执行 `docker compose up -d --build backend frontend`，健康检查 `http://127.0.0.1:8003/health` 与 `http://127.0.0.1:3001` 均返回 200。
+- 2026-03-22 - 修复 - Step4 切换视频版本改为前端本地乐观更新并后台同步，消除本地项目下拉切换时的可感知延迟。
+- 2026-03-22 - 验证 - 前端执行 `npx eslint src/app/components/ScriptEditor.tsx src/app/projects/[id]/script/storyboard/page.tsx` 与 `npm run typecheck` 通过（0 error）。
+- 2026-03-22 - 修复 - Step4 在“生成中→已完成”状态切换时自动将该行选中版本切换为最新生成完成版本，并同步调用后端版本选择接口保持一致。
+- 2026-03-22 - 验证 - 前端执行 `npx eslint src/app/projects/[id]/script/storyboard/page.tsx` 与 `npm run typecheck` 通过。
+- 2026-03-22 - 修复 - 修正 Step4 行级手动待处理中断问题：提交后记录基线版本集，未出现新版本前持续保持“生成中”并禁用按钮，避免被旧完成态提前覆盖。
+- 2026-03-22 - 修复 - 收紧 Step4 版本下拉过滤条件：仅展示状态为 `COMPLETED/SUCCESS` 且存在视频地址的版本，空状态版本不再进入列表。
+- 2026-03-22 - 验证 - 前端执行 `npx eslint src/app/components/ScriptEditor.tsx src/app/projects/[id]/script/storyboard/page.tsx` 与 `npm run typecheck` 通过（0 error）。
+- 2026-03-22 - 修复 - Step4 素材绑定解析优先使用用户所选 asset_id 的已选/最新图片版本，再回退到同名同类分组，修复误用历史素材问题。
+- 2026-03-22 - 修复 - Step4 单元格名称解析同名素材时按“已选且有图 > 有图 > 版本数”择优，避免同名旧资产 ID 被优先命中。
+- 2026-03-22 - 验证 - 后端执行 `python3 -m py_compile app/services/linkapi.py` 通过；前端执行 `npx eslint src/app/projects/[id]/script/storyboard/page.tsx` 与 `npm run typecheck` 通过（0 error）。
+- 2026-03-22 - 修复 - 排查 Step4 按钮状态“未生效”根因：docker-compose 前后端服务仅重启未重建镜像，导致最新前后端代码未加载。
+- 2026-03-22 - 验证 - 执行 `docker compose up -d --build backend frontend` 重建并重启服务，随后 `curl http://127.0.0.1:8003/health` 与 `curl http://127.0.0.1:3001` 均返回 200。
+- 2026-03-22 - 规则 - 更新 `.trae/rules/project_rules.md`：新增 Docker 重启规范，约束代码改动后必须执行 `docker compose up -d --build backend frontend`，禁止仅 restart。
+- 2026-03-22 - 修复 - 修正 Step4/Step5 版本回退方向：后端按 `created_at desc` 返回时，前端不再回退到数组末尾旧版本，统一改为优先最新完成版本，修复“选新版本却播放旧视频”问题。
+- 2026-03-22 - 修复 - 后端创建新分镜版本时自动取消同分镜旧版本选中并默认选中新版本，避免新任务完成后仍停留在历史选中版本。
+- 2026-03-22 - 验证 - 前端执行 `npx eslint src/app/components/ScriptEditor.tsx src/app/projects/[id]/script/storyboard/page.tsx src/app/projects/[id]/script/video/page.tsx` 与 `npm run typecheck` 通过；后端执行 `python3 -m py_compile app/services/segments.py` 通过；执行 `docker compose up -d --build backend frontend` 后 `http://127.0.0.1:8003/health` 与 `http://127.0.0.1:3001` 返回 200。
+- 2026-03-22 - 修复 - Step4 版本下拉展示顺序调整为时间正序（旧→新），版本编号恢复为“新版本在最下方”，避免新生成版本显示为“版本1”。
+- 2026-03-22 - 修复 - 资产新建版本（含上传图片与重新生成）后自动设为已选中版本，避免可灵请求优先命中历史已选图导致“未参考新上传图片”。
+- 2026-03-22 - 验证 - 前端执行 `npx eslint src/app/components/ScriptEditor.tsx` 与 `npm run typecheck` 通过；后端执行 `python3 -m py_compile app/services/assets.py` 通过；执行 `docker compose up -d --build backend frontend` 后 `http://127.0.0.1:8003/health` 与 `http://127.0.0.1:3001` 返回 200。
+- 2026-03-22 - 修复 - 分镜视频生成接口补充传递 `project_id` 到 `create_video`，使 `asset_bindings` 可正确解析素材并构造 `reference_images`，修复“未引用任何参考图”。
+- 2026-03-22 - 修复 - Kling v1 带参考图时端点从 `image2video` 对齐为官方 `multi-image2video`，避免多图参考参数被忽略。
+- 2026-03-22 - 验证 - 后端执行 `python3 -m py_compile app/api/segments.py app/services/linkapi.py` 通过；前端执行 `npx eslint src/app/components/ScriptEditor.tsx` 与 `npm run typecheck` 通过；执行 `docker compose up -d --build backend frontend` 后 `http://127.0.0.1:8003/health` 与 `http://127.0.0.1:3001` 返回 200。
+- 2026-03-22 - 修复 - Step5 音频提取链路新增本地静态视频地址兼容：`/episodes/audio-pipeline/extract`、`/episodes/merge-store`、`/episodes/merge-download` 允许 `/static/...` 输入，避免一键提取配音因“视频地址格式不合法”返回 400。
+- 2026-03-22 - 修复 - Step5 下载视频阶段支持直接读取后端本地静态视频路径并拷贝到工作目录，避免仅支持 http/https 导致的提取失败。
+- 2026-03-22 - 验证 - 后端执行 `python3 -m py_compile app/api/final.py` 通过；前端执行 `npx eslint 'src/app/projects/[id]/script/video/page.tsx'` 与 `npm run typecheck` 通过；执行 `docker compose up -d --build backend frontend` 后 `http://127.0.0.1:8003/health` 与 `http://127.0.0.1:3001` 返回 200。
+- 2026-03-23 - 前后端 - Step5 音效结果区移除分段视频展示框，改为“音轨条 + 音频播放器”展示 ElevenLabs 音效版本，并保留分段版本递增逻辑。
+- 2026-03-23 - 前后端 - 新增 Step5 音效版本删除能力：后端增加 `delete-sfx-version` 接口清理指定分段版本及静态文件，前端新增“删除版本”按钮并回写流水线状态。
+- 2026-03-23 - 验证 - 后端执行 `python3 -m compileall app` 通过；前端执行 `npm run typecheck` 与 `npx eslint 'src/app/projects/[id]/script/video/page.tsx' src/lib/api.ts` 通过。
+- 2026-03-23 - 验证 - 前端执行 `npm run lint` 存在历史遗留错误：`src/app/page.tsx` 的 `react-hooks/set-state-in-effect`（与本次改动文件无关）；其余为既有 warning。
+- 2026-03-23 - 验证 - 按规范执行 `docker compose up -d --build backend frontend`，健康检查 `http://127.0.0.1:8003/health` 与 `http://127.0.0.1:3001` 均返回 200。
+- 2026-03-22 - 修复 - Step5 音频提取下载逻辑兼容绝对静态地址：当 `clip_urls` 为 `http(s)://.../static/...` 时，后端改为提取路径并直接读取本地静态文件，修复容器内访问 `localhost:3001` 引发 `ConnectError`。
+- 2026-03-22 - 验证 - 后端执行 `python3 -m py_compile app/api/final.py` 通过；前端执行 `npx eslint 'src/app/projects/[id]/script/video/page.tsx'` 与 `npm run typecheck` 通过；执行 `docker compose up -d --build backend frontend` 后 `http://127.0.0.1:8003/health` 与 `http://127.0.0.1:3001` 返回 200。
+- 2026-03-22 - 修复 - Step5 新增音视频合成接口 `/episodes/audio-pipeline/mux-dubbed-video`：将“一键合并配音”产物替换合并视频音轨并输出新视频 `merged_dubbed_video_url`。
+- 2026-03-22 - 修复 - Step5 音频编辑区底部新增“音视频合成”按钮，点击后调用新接口生成替换音轨视频，并在该集卡片最下方展示“音视频合成结果”播放器。
+- 2026-03-22 - 验证 - 后端执行 `python3 -m py_compile app/api/final.py` 通过；前端执行 `npx eslint 'src/app/projects/[id]/script/video/page.tsx' src/lib/api.ts` 与 `npm run typecheck` 通过；执行 `docker compose up -d --build backend frontend` 后 `http://127.0.0.1:8003/health` 与 `http://127.0.0.1:3001` 返回 200。
+- 2026-03-22 - 修复 - Step5 音频编辑区域新增标题“台词生成”，并增加整块内容“收起/展开”交互，支持手动折叠该区域。
+- 2026-03-22 - 验证 - 前端执行 `npx eslint 'src/app/projects/[id]/script/video/page.tsx'` 与 `npm run typecheck` 通过；执行 `docker compose up -d --build backend frontend` 后 `http://127.0.0.1:8003/health` 与 `http://127.0.0.1:3001` 返回 200。
+- 2026-03-22 - 修复 - Step4 分镜编辑改为“单集选择编辑”：新增“编辑集数”下拉框，不再把所有分集直接铺开展示，选择目标集后仅展示并编辑该集内容。
+- 2026-03-22 - 验证 - 前端执行 `npx eslint 'src/app/projects/[id]/script/storyboard/page.tsx'` 与 `npm run typecheck` 通过；执行 `docker compose up -d --build backend frontend` 后 `http://127.0.0.1:8003/health` 与 `http://127.0.0.1:3001` 返回 200。
+- 2026-03-22 - 修复 - Step5 新增音效生成接口 `/episodes/audio-pipeline/generate-sfx`：支持按分集合并视频截取 3-20 秒片段，携带背景音提示词、配乐提示词与 ASMR 开关请求 Kling `video-to-audio`，并保存音效结果回写任务元数据。
+- 2026-03-22 - 修复 - Step5 音频编辑区域在“台词生成”上方新增“音效编辑”模块：支持截取起止秒输入、背景音提示词（必填）、配乐提示词（选填）、ASMR 开关、触发生成按钮，以及截取视频和音效结果展示。
+- 2026-03-22 - 修复 - Step5 音效链路补充 Kling 端点归一化与结果解析：统一拼接 `/v1/audio/video-to-audio`，兼容多种返回结构提取音频 URL，并在任务超时/失败时返回明确错误。
+- 2026-03-22 - 验证 - 前端执行 `npx eslint "src/app/projects/[id]/script/video/page.tsx" src/lib/api.ts` 与 `npm run typecheck` 通过；后端执行 `python3 -m py_compile backend/app/api/final.py` 通过；执行 `docker compose up -d --build backend frontend` 后 `http://127.0.0.1:8003/health` 与 `http://127.0.0.1:3001` 返回 200。
+- 2026-03-22 - 修复 - Step5 音效编辑改为独立可折叠区域：从“台词生成”容器中拆分为单独卡片，并新增“收起/展开”交互，避免两块编辑区混合展示。
+- 2026-03-22 - 修复 - Step5 音效视频截取改为进度条框选：移除起止秒数字输入，改用视频时间轴双滑块选区（与台词区域截取逻辑一致）写回 start/end 区间。
+- 2026-03-22 - 验证 - 前端执行 `npm run lint` 与 `npm run typecheck` 通过（0 error，存在历史 warning）；执行 `docker compose up -d --build backend frontend` 后 `http://127.0.0.1:8003/health` 与 `http://127.0.0.1:3001` 返回 200。
+- 2026-03-22 - 修复 - Step5 新增音效视频独立截取接口 `/episodes/audio-pipeline/clip-sfx-video`：支持按进度条框选区间先执行截取并回写 `sfx_clip_video_url`，无需先发起 Kling 音效生成。
+- 2026-03-22 - 修复 - Step5 音效编辑区新增“截取视频”按钮：点击后按当前框选区间执行截取，生成状态与“生成音效”按钮互斥，截取结果即时展示在“截取视频”播放器。
+- 2026-03-22 - 验证 - 后端执行 `python3 -m py_compile backend/app/api/final.py` 通过；前端执行 `npx eslint "src/app/projects/[id]/script/video/page.tsx" src/lib/api.ts` 与 `npm run typecheck` 通过；执行 `docker compose up -d --build backend frontend` 后 `http://127.0.0.1:8003/health` 与 `http://127.0.0.1:3001` 返回 200。
+- 2026-03-22 - 修复 - Step5 音效截取改为“单点分段”模型：在播放器单条进度条上添加截取点，不再使用双端滑块；点击“截取分段”后按 `0→点1→点2→...→结束` 自动生成多段并支持逐段选择编辑。
+- 2026-03-22 - 验证 - 前端执行 `npx eslint "src/app/projects/[id]/script/video/page.tsx" src/lib/api.ts` 与 `npm run typecheck` 通过；执行 `docker compose up -d --build backend frontend` 后 `http://127.0.0.1:8003/health` 与 `http://127.0.0.1:3001` 返回 200。
+- 2026-03-22 - 修复 - Step5 清理音效编辑中的遗留无效截取点：移除旧版起止点迁移逻辑，避免页面初始出现两个无效蓝色选取点，仅保留用户手动添加的截取点。
+- 2026-03-22 - 验证 - 前端执行 `npx eslint "src/app/projects/[id]/script/video/page.tsx"` 与 `npm run typecheck` 通过；执行 `docker compose up -d --build backend frontend` 后 `http://127.0.0.1:8003/health` 与 `http://127.0.0.1:3001` 返回 200。
+- 2026-03-22 - 修复 - Step5 音效编辑播放器改为与上方分集主视频同源：音效区域播放器直接使用上方当前集视频 URL，并在上方视频变更时阻止旧任务继续截取/生成，提示先重新“一键提取配音”。
+- 2026-03-22 - 验证 - 前端执行 `npx eslint "src/app/projects/[id]/script/video/page.tsx"` 与 `npm run typecheck` 通过；执行 `docker compose up -d --build backend frontend` 后 `http://127.0.0.1:8003/health` 与 `http://127.0.0.1:3001` 返回 200。
+- 2026-03-22 - 修复 - Step5 音效编辑去除分段列表，改为在进度条下方直接按区域显示“第1段/第2段/第3段...”，点击区域即选中分段并在播放时仅播放该分段；同时新增截取点拖动能力。
+- 2026-03-22 - 验证 - 前端执行 `npx eslint "src/app/projects/[id]/script/video/page.tsx"` 与 `npm run typecheck` 通过；执行 `docker compose up -d --build backend frontend` 后 `http://127.0.0.1:8003/health` 与 `http://127.0.0.1:3001` 返回 200。
+- 2026-03-22 - 修复 - Step5 恢复可见视频进度条并保留进度条内截取点选取/拖动；分段仅在设置至少两个截取点后显示在进度条下方，截取/生成前强制要求先选中分段。
+- 2026-03-22 - 验证 - 前端执行 `npx eslint "src/app/projects/[id]/script/video/page.tsx"` 与 `npm run typecheck` 通过；执行 `docker compose up -d --build backend frontend` 后 `http://127.0.0.1:8003/health` 与 `http://127.0.0.1:3001` 返回 200。
+- 2026-03-22 - 修复 - Step5 音效分段时长约束统一为 3-20 秒，并移除音效截取/生成对“先点击一键提取配音”的前置依赖：无任务时自动基于当前上方视频创建音效任务后继续截取或生成。
+- 2026-03-22 - 验证 - 前端执行 `npx eslint "src/app/projects/[id]/script/video/page.tsx"` 与 `npm run typecheck` 通过；执行 `docker compose up -d --build backend frontend` 后 `http://127.0.0.1:8003/health` 与 `http://127.0.0.1:3001` 返回 200。
+- 2026-03-22 - 修复 - Step5 音效分段“第N段”按钮改为按对应截取段位置展示：按钮在各自分段的下方区域居中对齐，不再采用等宽网格排布。
+- 2026-03-22 - 验证 - 前端执行 `npx eslint "src/app/projects/[id]/script/video/page.tsx"` 与 `npm run typecheck` 通过；执行 `docker compose up -d --build backend frontend` 后健康检查 `http://127.0.0.1:8003/health` 与 `http://127.0.0.1:3001` 返回 200。
+- 2026-03-22 - 修复 - Step5 音效生成失败排障增强：后端新增 `KLING_PUBLIC_BASE_URL` 支持并对本地/内网静态地址进行前置校验，Kling 创建失败时透传第三方返回详情，避免仅显示状态码 400。
+- 2026-03-22 - 验证 - 后端执行 `python3 -m py_compile backend/app/api/final.py` 通过；前端执行 `npx eslint "src/app/projects/[id]/script/video/page.tsx"` 与 `npm run typecheck` 通过；执行 `docker compose up -d --build backend frontend` 后 `http://127.0.0.1:8003/health` 与 `http://127.0.0.1:3001` 返回 200。
+- 2026-03-22 - 修复 - Step5 音效区改为仅展示按分段生成的带音效视频：移除“截取视频”按钮与截取视频/音频结果面板，生成音效后按“第N段”展示 Kling 音效合成视频。
+- 2026-03-22 - 修复 - 后端 `generate-sfx` 新增 `segment_index` 入参并产出 `sfx_video_url`、`sfx_segment_results`；对每段执行音效音频与截取视频合成，支持分段结果覆盖更新。
+- 2026-03-22 - 验证 - 后端执行 `python3 -m py_compile backend/app/api/final.py` 通过；前端执行 `npx eslint "src/app/projects/[id]/script/video/page.tsx"` 与 `npm run typecheck` 通过；执行 `docker compose up -d --build backend frontend` 后 `http://127.0.0.1:8003/health` 与 `http://127.0.0.1:3001` 返回 200。
+- 2026-03-22 - 修复 - 音效生成公网地址配置增强：`_public_static_url` 支持 `KLING_PUBLIC_BASE_URL` 与 `PUBLIC_BASE_URL` 双变量，并优先识别 `x-forwarded-host/proto` 反向代理头自动推导公网地址；本地/内网场景错误提示同步更新。
+- 2026-03-22 - 修复 - `docker-compose.yml` 为 backend 增加 `KLING_PUBLIC_BASE_URL` 与 `PUBLIC_BASE_URL` 环境透传，避免宿主机已配置但容器内不可见导致音效任务创建失败。
+- 2026-03-22 - 验证 - 后端执行 `python3 -m py_compile backend/app/api/final.py` 通过；前端执行 `npx eslint "src/app/projects/[id]/script/video/page.tsx"` 与 `npm run typecheck` 通过；执行 `docker compose up -d --build backend frontend` 后 `http://127.0.0.1:8003/health` 与 `http://127.0.0.1:3001` 返回 200。
+- 2026-03-22 - 运维 - 已连接 ECS `39.105.213.147` 并安装 Nginx，新增 `:8081/kling-static/` 静态站点映射目录 `/srv/kling-static`，用于承载音效分段视频公网地址。
+- 2026-03-22 - 修复 - Step5 音效公网文件发布新增远程上传兜底：当 `KLING_PUBLIC_BASE_URL/PUBLIC_BASE_URL` 为本地或内网地址时，后端自动通过 `SFX_REMOTE_UPLOAD_*` 上传静态文件到 ECS 并回传 `SFX_REMOTE_PUBLIC_BASE_URL` 对应公网 URL。
+- 2026-03-22 - 验证 - 后端执行 `python3 -m py_compile backend/app/api/final.py` 通过；执行 `docker compose up -d --build backend frontend` 后健康检查 `http://127.0.0.1:8003/health` 与 `http://127.0.0.1:3001` 返回 200；容器内调用 `_publish_static_to_remote('/static/audio_pipeline/upload_probe.txt')` 成功返回并可访问 `http://39.105.213.147:8081/kling-static/audio_pipeline/upload_probe.txt`（HTTP 200）。
+- 2026-03-22 - 修复 - Step5 音效生成改为“异步可恢复”链路：后端 `generate-sfx` 在 Kling 未出结果时回写 `sfx_status=processing` 与 `sfx_task_id` 并立即返回，后续请求优先复用同一任务轮询结果，避免前端代理长连接被重置导致 500。
+- 2026-03-22 - 修复 - Step5 前端音效按钮新增自动轮询：若后端返回处理中状态则前端按 3 秒间隔自动重试，拿到对应分段 `video_url` 后自动刷新并展示“音效生成完成”。
+- 2026-03-22 - 修复 - 远程静态上传链路增加超时控制：`ssh/scp` 增加连接超时与命令超时，避免网络抖动时请求长时间阻塞触发上游 `socket hang up`。
+- 2026-03-22 - 验证 - 前端执行 `npx eslint "src/app/projects/[id]/script/video/page.tsx"` 与 `npm run typecheck` 通过；后端执行 `python3 -m py_compile backend/app/api/final.py` 通过；执行 `docker compose up -d --build backend frontend` 后健康检查 `http://127.0.0.1:8003/health` 与 `http://127.0.0.1:3001` 返回 200。
+- 2026-03-22 - 运维 - 修复本次 Step5 报错环境缺失：已重新以运行时变量注入 `SFX_REMOTE_UPLOAD_*` 并重建 backend 容器，容器内确认 `SFX_REMOTE_UPLOAD_HOST/PASSWORD/SFX_REMOTE_PUBLIC_BASE_URL` 生效。
+- 2026-03-22 - 验证 - 容器内调用 `_publish_static_to_remote('/static/audio_pipeline/eccd935e-ae54-4857-8939-eec7ffaf2359/merged/3135ea4dd2053652b512.mp4')` 成功返回公网 URL；外部访问 `http://39.105.213.147:8081/kling-static/audio_pipeline/eccd935e-ae54-4857-8939-eec7ffaf2359/merged/3135ea4dd2053652b512.mp4` 返回 200；健康检查 `http://127.0.0.1:8003/health` 与 `http://127.0.0.1:3001` 返回 200。
+- 2026-03-22 - 修复 - Step5 音效任务“长期 processing”根因修复：后端复用逻辑不再依赖 `sfx_clip_video_url` 必须为 `/static/`，避免前端轮询期间每次都新建 Kling 任务导致状态一直处理中。
+- 2026-03-22 - 修复 - Step5 在任务复用场景下增加截取视频兜底：当仅有非本地 `clip_url` 且已拿到音频结果时，后端按当前区间自动重新截取本地片段后再合成，防止因缺少本地 clip 失败。
+- 2026-03-22 - 运维 - 重建后端镜像后重新注入 `SFX_REMOTE_UPLOAD_*` 运行时变量并重启服务，防止变量回空导致公网发布链路失效。
+- 2026-03-22 - 验证 - 后端执行 `python3 -m py_compile backend/app/api/final.py` 通过；前端执行 `npx eslint "src/app/projects/[id]/script/video/page.tsx"` 与 `npm run typecheck` 通过；执行 `docker compose up -d --build backend frontend` 并重新注入远程上传变量后，`http://127.0.0.1:8003/health` 与 `http://127.0.0.1:3001` 返回 200。
+- 2026-03-22 - 修复 - Step5 轮询性能修复：`generate-sfx` 在复用已存在 Kling 任务时改为单次查询并立即返回，避免与前端 3 秒轮询叠加后单次点击阻塞十余分钟。
+- 2026-03-22 - 修复 - Step5 复用条件放宽为“同分段 + processing 状态 + task_id 存在”，移除提示词/ASMR 严格比对，避免因文本细微差异误判为新任务而持续重复创建 Kling 任务。
+- 2026-03-22 - 运维 - 代码重建后再次注入 `SFX_REMOTE_UPLOAD_*` 运行时变量，确认容器内公网上传配置未回空。
+- 2026-03-22 - 验证 - 后端执行 `python3 -m py_compile backend/app/api/final.py` 通过；前端执行 `npm run typecheck` 通过；`npm run lint` 仍存在历史错误 `src/app/page.tsx:16`（与本次 Step5 改动无关）；执行 `docker compose up -d --build backend frontend` 后健康检查 `http://127.0.0.1:8003/health` 与 `http://127.0.0.1:3001` 返回 200。
+- 2026-03-22 - 修复 - Step5 任务复用再次加固：只要存在 `sfx_task_id` 且状态非终态（completed/failed/error/canceled），即优先复用查询，避免自动轮询期间因状态字段抖动触发重复创建任务并命中 Kling 429 并发上限。
+- 2026-03-22 - 运维 - 重建服务后再次注入 `SFX_REMOTE_UPLOAD_*` 运行时变量并确认容器内生效，避免音效链路回退到本地地址。
+- 2026-03-22 - 验证 - 后端执行 `python3 -m py_compile backend/app/api/final.py` 通过；执行 `docker compose up -d --build backend frontend` 与变量注入后健康检查 `http://127.0.0.1:8003/health`、`http://127.0.0.1:3001` 返回 200；前端执行 `npm run typecheck` 通过，`npm run lint` 仍有历史错误 `src/app/page.tsx:16`（非本次改动引入）。
+- 2026-03-22 - 修复 - Step5 音效任务状态识别增强：Kling 查询兼容 `task_status/status` 字段，避免仅靠单一字段导致任务终态误判为长期 processing。
+- 2026-03-22 - 修复 - Step5 增加音效任务超时熔断：记录 `sfx_task_created_at/sfx_task_updated_at`，同一任务连续 processing 超过 10 分钟时自动标记失败并清空 `sfx_task_id`，防止无限轮询卡住。
+- 2026-03-22 - 修复 - Step5 前端轮询增加失败态提示：当返回 `failed/error/canceled` 时立即报错并停止“任务已提交”提示，避免误导为仍在后台处理中。
+- 2026-03-22 - 运维 - 按规范执行 `docker compose up -d --build backend frontend` 后重新注入 `SFX_REMOTE_UPLOAD_*` 变量，并确认容器内变量存在。
+- 2026-03-22 - 验证 - 后端 `python3 -m py_compile backend/app/api/final.py` 通过；前端 `npm run typecheck` 通过；健康检查 `http://127.0.0.1:8003/health` 与 `http://127.0.0.1:3001` 返回 200；`npm run lint` 仍有历史问题（含 `src/app/page.tsx:16`，非本次改动引入）。
+- 2026-03-22 - 修复 - Step5 瞬时返回问题修复：当 Kling 返回 `succeed/success/completed` 但无音频 URL 时，后端不再继续复用旧任务并立即标记失败清空 `sfx_task_id`，避免点击“生成音效”仅闪一下且无法进入真实生成。
+- 2026-03-22 - 修复 - Step5 复用判定修正：任务复用排除成功态与失败态，仅在处理中状态复用，防止 `succeed` 状态被误当 processing 持续短路。
+- 2026-03-22 - 修复 - Step5 前端状态兜底：轮询结束若状态为非处理中且非失败态，显示“任务状态异常”错误，避免继续提示“已提交后台处理中”。
+- 2026-03-22 - 运维 - 代码变更后执行 `docker compose up -d --build backend frontend`，并重新注入 `SFX_REMOTE_UPLOAD_*` 变量。
+- 2026-03-22 - 验证 - 后端 `python3 -m py_compile backend/app/api/final.py` 通过；前端 `npm run typecheck` 通过；`npm run lint` 仍有历史错误 `src/app/page.tsx:16`（非本次改动引入）；健康检查 `http://127.0.0.1:8003/health` 与 `http://127.0.0.1:3001` 返回 200。
+- 2026-03-22 - 修复 - Step5 400 快速失败回归修复：撤销“成功态但无音频 URL 立即报错”的硬失败分支，改回保持 processing 并继续轮询/后续重查，避免按钮点击后瞬时 400。
+- 2026-03-22 - 修复 - Step5 任务状态持久化兜底：当查询状态不在处理中集合时统一回写为 `processing`，防止 `succeed` 等中间态导致前端误判结束。
+- 2026-03-22 - 运维 - 代码变更后按规范执行 `docker compose up -d --build backend frontend`，并重新注入 `SFX_REMOTE_UPLOAD_*` 变量。
+- 2026-03-22 - 验证 - 后端 `python3 -m py_compile backend/app/api/final.py` 通过；前端 `npm run typecheck` 通过；健康检查 `http://127.0.0.1:8003/health` 与 `http://127.0.0.1:3001` 返回 200；`npm run lint` 仍有历史问题（非本次改动引入）。
+- 2026-03-23 - 后端 - 修复 Step5 生成音效 ElevenLabs 端点兼容性：`text_to_sound_effect` 优先调用 `/v1/sound-generation`，并对旧端点 `/v1/text-to-sound-effects/convert` 保留 404 回退，避免点击“生成音效”直接报错 `{"detail":"Not Found"}`。
+- 2026-03-23 - 验证 - 后端执行 `python3 -m py_compile app/services/eleven_labs.py` 通过；并通过 Python 直连验证 `eleven_labs_service.text_to_sound_effect(text='测试风雪声', duration_seconds=1.0)` 成功返回音频内容。
+- 2026-03-23 - 验证 - 按规范执行 `docker compose up -d --build backend frontend`，健康检查 `http://127.0.0.1:8003/health` 与 `http://127.0.0.1:3001` 均返回 200；前端执行 `npm run typecheck` 通过，`npm run lint` 仍存在历史问题（非本次改动引入）。
+- 2026-03-28 - 前端 - 修复 Step4 模型下拉显示与调用认知不一致：下拉默认值与选项从 `gemini-3-pro / Gemini 3 Pro` 调整为 `gemini-3.1-pro / Gemini 3.1 Pro`，并将本地存储旧值自动迁移到 `gemini-3.1-pro`。
+- 2026-03-28 - 前端 - 按反馈二次微调 Step4 表格列宽：时间轴由 `260px` 收窄为 `170px`（保证单行显示），镜头调度与内容融合由 `220px` 扩宽为 `320px`，提升长文案可读性。
+- 2026-03-28 - 后端 - 修复 Step2 素材生成“切页/刷新即中断”：在 `generate_asset` 捕获请求断开触发的 `asyncio.CancelledError` 后，自动 `create_task` 继续执行同一素材生成（复用原参数快照），避免前端页面生命周期影响后端生成流程。
+- 2026-03-28 - 前端 - 修复 Step4 分镜展示问题：新增 `<think>...</think>` 内容清洗（加载分镜、轮询完成、表格解析三处统一过滤），防止分镜脚本展示模型 thinking 文本。
+- 2026-03-28 - 前端 - 优化分镜表格解析与排版：改进“短列/长列”对齐算法（锚定前两列并尾部回填）以降低列错位；同时调整列宽为“时间轴更宽（260px）、镜头调度与内容融合/画面描述更窄（220px）”。
+- 2026-03-28 - 验证 - 本地执行 `python3 -m compileall backend/app/api/assets.py`、前端 `npm run lint && npm run typecheck` 通过（0 error，保留历史 warning）；腾讯云已重建 `backend/frontend/nginx`，Step4 页面改动已上线。
+- 2026-03-28 - 后端 - 按用户要求禁用 grsai 回退：删除 `create_chat_completion/create_image` 内部所有 `api.wuyinkeji.com` 自动回退逻辑，文本与图片调用强制仅走 grsai 通道。
+- 2026-03-28 - 运维 - 腾讯云已替换 `GRSAI_API_KEY` 为用户提供的新 key，并保留 `GRSAI_TEXT_ENDPOINT=https://grsai.dakka.com.cn/v1/chat/completions`、`GRSAI_DRAW_ENDPOINT=https://grsai.dakka.com.cn/v1/draw/nano-banana`、`GRSAI_DRAW_RESULT_ENDPOINT=https://grsai.dakka.com.cn/v1/draw/result`。
+- 2026-03-28 - 验证 - 本地执行 `python3 -m compileall backend/app/services/linkapi.py` 与前端 `npm run lint && npm run typecheck` 通过（0 error，保留历史 warning）；腾讯云分镜任务 `c60c7690-a742-4487-9868-33da9af1f62e` 返回 `completed`，并确认后端日志仅出现 `grsai.dakka.com.cn` 调用，无 `api.wuyinkeji.com` 回退请求。
+- 2026-03-28 - 验证 - 腾讯云首帧链路在禁用回退后持续轮询 `POST /v1/draw/result`，并产出新文件 `35b22908-f64e-409a-8b7f-80f7ded0f259_first_frame_73024246.png`（`/opt/video-gen/backend/static/assets`，14:20）。
+- 2026-03-28 - 后端 - 按 grsai 文档完成模型通道迁移：文本模型默认改为 `gemini-3.1-pro`，图片模型默认改为 `nano-banana-2-4k-cl`，并将文本/绘图主通道改为 `https://grsai.dakka.com.cn`（`/v1/chat/completions`、`/v1/draw/nano-banana`、`/v1/draw/result`）。
+- 2026-03-28 - 后端 - 增加 grsai 兼容策略：当 grsai 返回 `apikey error` 时，文本与绘图自动回退旧通道（`api.wuyinkeji.com`）保障线上可用；同时补齐旧绘图结果轮询的 GET 方式，修复误用 POST 导致的 405。
+- 2026-03-28 - 运维 - 腾讯云 `backend/.env` 新增并生效 `GRSAI_API_KEY / GRSAI_TEXT_ENDPOINT / GRSAI_DRAW_ENDPOINT / GRSAI_DRAW_RESULT_ENDPOINT`，并重建 backend 容器。
+- 2026-03-28 - 验证 - 本地执行 `python3 -m compileall backend/app/services/linkapi.py ...` 与前端 `npm run lint && npm run typecheck` 通过（0 error，保留历史 warning）；腾讯云回归 `POST /script/storyboard-tasks/start` 任务 `b2732782-aeb3-4419-bae9-a2ea1acecf12` 成功 `completed`，`POST /segments/frame-images/generate` 返回 200 并产出 `/static/assets/*_first_frame_*.png`。
+- 2026-03-28 - 后端 - 修复分镜失败 `Gemini3Pro 未返回可用内容`：`_extract_suchuang_text` 新增 OpenAI 样式 `choices[].message.content / choices[].delta.content / choices[].text` 解析，兼容速创接口 `data.choices.message.content` 结构。
+- 2026-03-28 - 验证 - 腾讯云重建 `backend` 后回归 `POST /script/storyboard-tasks/start` + 轮询 `/script/storyboard-tasks/{task_id}`：任务 `0255eb62-2a85-4ae3-8f4b-d54db843f936` 成功 `completed`，生成内容长度 5731，未再出现“未返回可用内容”。
+- 2026-03-28 - 验证 - 本地执行 `python3 -m compileall backend/app/services/linkapi.py` 与前端 `npm run lint && npm run typecheck` 通过（0 error，保留历史 warning）。
+- 2026-03-28 - 前端 - 修复 Step4 分镜任务“静默结束”体验：自动保存不再覆盖任务消息（移除 `setMessage('已自动保存')`），并在分集卡片头部持久展示 `storyboardTaskError`，避免任务失败后被误判为“没报错”。
+- 2026-03-28 - 后端 - 提升分镜生成抗超时能力：`create_chat_completion` 增加 `SUCHUANG_TIMEOUT_SECONDS`（默认 900 秒）、连接超时提升到 15 秒，并对读/连超时自动重试 1 次，超时错误统一返回可读提示。
+- 2026-03-28 - 验证 - 本地执行 `python3 -m compileall backend/app/services/linkapi.py` 与 `npm run lint && npm run typecheck` 通过（0 error，保留历史 warning）；腾讯云重建 `backend/frontend/nginx` 后公网 `http://82.156.124.215/`、`/api/health`、`/script/storyboard-tasks/start`、`/script/storyboard-tasks/{task_id}` 均返回 200。
+- 2026-03-28 - 前端 - 修复“关闭自定义首尾帧弹窗影响生成”问题：`generateFrameImage/submitFrameEdit` 改为在请求发起时固化 `rowIndex/editTarget/prompt/references`，后续仅使用固化上下文更新结果，不再依赖弹窗当前状态。
+- 2026-03-28 - 前端 - 增强并发安全：新增 `frameModalRowIndexRef` 跟踪实时弹窗行，仅在当前行仍打开时更新错误提示与编辑面板状态，避免关窗后异步回调误覆盖 UI。
+- 2026-03-28 - 验证 - 本地执行 `npm run lint && npm run typecheck` 通过（0 error，保留历史 warning）；腾讯云重建 `frontend` 并保持 `nginx(80/8088)` 发布，公网 `http://82.156.124.215/` 与 `http://82.156.124.215/api/health` 返回 200。
+- 2026-03-28 - 前端 - 修复 Step4 首帧“请求超时”误报：新增 `FRAME_GENERATE_TIMEOUT_MS=900000`（15 分钟），`generateSegmentFrameImage` 改为使用专属超时，不再复用 7 分钟视频超时。
+- 2026-03-28 - 运维 - 腾讯云同步并重建前端后恢复 Nginx 80 端口发布（使用 `docker-compose.tencent.yml` 覆盖），避免仅暴露 8088 导致线上访问异常。
+- 2026-03-28 - 验证 - 本地执行 `npm run lint && npm run typecheck` 通过（0 error，保留历史 warning）；腾讯云 `http://82.156.124.215/` 与 `http://82.156.124.215/api/health` 返回 200，首帧回归 `POST /segments/frame-images/generate`（max-time 180s）返回 200 并产出 `/static/assets/*_first_frame_*.png`。
+- 2026-03-28 - 运维 - 修复腾讯云 Step4 首尾帧“立即报错本地/static地址不可访问”：为后端容器注入 `PUBLIC_BASE_URL` 与 `KLING_PUBLIC_BASE_URL`（指向 `http://82.156.124.215`），使图生图参考图可自动转换为公网 URL。
+- 2026-03-28 - 验证 - 腾讯云执行 `docker compose up -d --force-recreate backend` 后环境变量生效；健康检查 `127.0.0.1:8003/health` 与 `127.0.0.1:3001` 返回 200；首帧接口回归 `POST /segments/frame-images/generate`（`/static/...` 参考图）返回 200 并产出 `/static/assets/*_first_frame_*.png`。
+- 2026-03-28 - 后端 - 修复 Step4 素材选择链路：`GET /assets` 在版本裁剪时保证“已选中版本”不会被截断（即使不在最近 30 条内也强制保留），避免分镜页依赖 `is_selected` 的素材解析失效。
+- 2026-03-28 - 前端 - 修复 Step4 “选择素材无反应”：`ScriptEditor/TableCell` 选择器由“仅选中版本有图才可选”改为“选中或最新有图即可选”，并允许在无素材时仍打开弹窗显示“暂无可选素材”。
+- 2026-03-28 - 前端 - 修复 Step4 首尾帧素材预览：表格内素材标签预览改为复用统一 `resolveAssetImageUrl`，不再强依赖 `is_selected`，避免已有图片但不显示的问题。
+- 2026-03-28 - 验证 - 本地 `python3 -m compileall backend/app/api/assets.py` 与 `npm run lint && npm run typecheck` 通过（0 error，保留历史 warning）；腾讯云 `docker compose up -d --build backend frontend && docker compose restart nginx` 后容器均 Up，公网 `GET /api/projects/35b22908-f64e-409a-8b7f-80f7ded0f259/assets` 在 20 秒内稳定返回 200（约 59KB）。
+- 2026-03-28 - 后端 - 修复 Step3 “尚未提取素材”误判：`GET /assets` 在返回前自动将历史 `data:image` 版本落盘为 `/static/assets/*`，并限制单素材返回版本数为最近 30 条，避免超大响应导致前端请求超时或容器内存抖动。
+- 2026-03-28 - 前端 - 优化 Step3 空态文案：当素材请求失败且列表为空时显示“素材加载失败，请稍后重试”，避免与“尚未提取素材”语义混淆。
+- 2026-03-28 - 验证 - 本地执行 `python3 -m compileall backend/app/api/assets.py`、前端执行 `npm run lint && npm run typecheck` 通过（0 error，保留历史 warning）；腾讯云执行 `docker compose up -d --build backend frontend` 后 `127.0.0.1:8003/health` 与 `127.0.0.1:3001` 返回 200。
+- 2026-03-28 - 验证 - 腾讯云回归：`http://127.0.0.1:8003/api/projects/35b22908-f64e-409a-8b7f-80f7ded0f259/assets` 返回 200，响应体由约 25MB 降至约 61KB，且 `has_data_url=False`；重启 `nginx` 后公网 `http://82.156.124.215/api/projects/35b22908-f64e-409a-8b7f-80f7ded0f259/assets` 在 20 秒内稳定返回 200。
+- 2026-03-27 - 运维 - 部署目标切换为腾讯云 `82.156.124.215`：使用密钥登录并在服务器安装 `docker-ce / docker compose plugin`，完成 `/opt/video-gen` 部署目录初始化与代码同步。
+- 2026-03-27 - 运维 - 为腾讯云部署新增 `docker-compose.tencent.yml` 覆盖配置，将 Nginx 暴露端口扩展为 `80:80`（保留 `8088:80`），匹配腾讯云安全组已放行 80 端口的访问路径。
+- 2026-03-27 - 后端 - 优化腾讯云镜像构建稳定性：`backend/Dockerfile` 将 Debian 源替换为清华镜像并增加 `apt-get` 重试参数，避免海外源下载慢导致构建长时间卡住。
+- 2026-03-27 - 验证 - 腾讯云执行 `docker compose up -d --build backend frontend nginx` 成功，容器 `duanju-backend-1/duanju-frontend-1/duanju-nginx-1` 均为 Up；对外访问 `http://82.156.124.215/` 返回 200，服务器内健康检查 `http://127.0.0.1:8003/health` 返回 200。
+- 2026-03-27 - 后端 - Step4 首帧/尾帧多图参考图公网化增强：`linkapi._resolve_image_url` 新增 data:image 落盘与静态路径远程发布能力；优先使用 `PUBLIC_BASE_URL/KLING_PUBLIC_BASE_URL`，未配置时自动走 `SFX_REMOTE_UPLOAD_*` 上传到阿里云并返回公网 URL。
+- 2026-03-27 - 后端 - 新增远程发布工具函数：在 `linkapi.py` 内补齐静态目录解析、远程 mkdir/scp 执行与错误可读化，支持图生图参考图在调用上游前统一转为公网可访问地址。
+- 2026-03-27 - 前端 - Step4 首帧参考图选择策略优化：`ScriptEditor.resolveAssetImageUrl` 改为优先“已选中远程URL”与“最新远程URL”，降低把本地/static 地址塞入多图生图请求的概率。
+- 2026-03-27 - 验证 - 后端 `python3 -m compileall backend/app` 通过；前端 `npm run lint && npm run typecheck` 通过（0 error，保留历史 warning）；按规范执行 `docker compose up -d --build backend frontend` 后健康检查 `http://127.0.0.1:8003/health` 与 `http://127.0.0.1:3001` 返回 200；接口回归显示 `/segments/frame-images/generate` 在 `data:image + 远程URL` 混合参考图场景不再立即 400，进入正常任务轮询。
+- 2026-03-27 - 后端 - 修复 Step4 首帧/尾帧多图生图直接报错：`create_image` 在处理 `image_urls` 时改为“逐张容错解析”，当多图里包含不可用本地/data 引用时忽略该张并继续使用可用远程图，避免整单直接失败。
+- 2026-03-27 - 后端 - 新增图生图参考图失败兜底：若用户传了参考图但最终无任何可用远程引用，返回明确错误（保留原始失败原因），避免无参考图静默降级为纯文生图。
+- 2026-03-27 - 验证 - 后端执行 `python3 -m compileall backend/app/services/linkapi.py` 通过；按规范执行 `docker compose up -d --build backend frontend`，健康检查 `http://127.0.0.1:8003/health` 与 `http://127.0.0.1:3001` 返回 200；接口回归：`/segments/frame-images/generate` 在“data:image + 远程URL”混合参考图场景不再立即 400（进入正常生成轮询），仅全量不可用参考图时返回 400 友好错误。
+- 2026-03-27 - 验证 - 前端执行 `npm run lint && npm run typecheck` 通过（0 error，保留历史 warning）。
+- 2026-03-27 - 后端 - 修复 Step3 图生图参考图兜底：`generate_asset` 新增“本地/static 或 data:image 引用自动切换为同素材远程 URL 版本”逻辑；若无可用远程版本则返回明确 400 提示，避免第三方 500。
+- 2026-03-27 - 后端 - 修复 Step3 图生图返回 URL 选择：速创回包解析新增“优先选择 http(s) 远程 URL”，避免优先落盘本地 data:image 导致后续 AI 修改继续失败。
+- 2026-03-27 - 前端 - 修复 Step3 AI 修改参考图选择：当待修改图为 data:image 或本地/static 地址时，自动回退到该素材最新远程 URL 版本；若不存在远程版本则前端直接阻断并提示先生成远程版本。
+- 2026-03-27 - 验证 - 后端 `python3 -m compileall backend/app` 通过；前端 `npm run lint && npm run typecheck` 通过（0 error，保留历史 warning）；按规范执行 `docker compose up -d --build backend frontend` 后健康检查 `http://127.0.0.1:8003/health` 与 `http://127.0.0.1:3001` 返回 200；接口回归：本地/data:image 参考图返回 400 友好提示，远程 URL 图生图返回 200 `{\"status\":\"ready\"}`。
+- 2026-03-27 - 后端 - 修复 Step3 生图落库策略：当上游返回 HTTP/HTTPS 图片地址时，版本记录优先保留远程 URL，下载本地失败不再导致版本写入失败，避免图生图引用只能拿到本地静态地址。
+- 2026-03-27 - 后端 - 修复图片下载工具对 `data:image;base64` 的处理：新增 Data URI 解码落盘逻辑，非 HTTP 且非 `/static/` 地址改为显式报错，避免把非法地址直接写入版本导致白图/链路中断。
+- 2026-03-27 - 后端 - 调整图生图本地静态图兜底提示：当参考图是 `/static/...` 且未配置 `PUBLIC_BASE_URL/KLING_PUBLIC_BASE_URL` 时，返回明确可执行错误信息，指导先使用远程 URL 版本再执行 AI 修改。
+- 2026-03-27 - 前端 - Step3 素材页图片渲染改为 `unoptimized`，兼容第三方图床域名被 Next Image 优化器拦截（私网 IP）场景，确保远程 URL 版本可正常预览与点击 AI 修改。
+- 2026-03-27 - 验证 - 后端执行 `python3 -m compileall backend/app` 通过；前端执行 `npm run lint && npm run typecheck` 通过（0 error，存在历史 warning）；按规范执行 `docker compose up -d --build backend frontend` 后健康检查 `http://127.0.0.1:8003/health` 与 `http://127.0.0.1:3001` 均返回 200。
+- 2026-03-27 - 验证 - 使用真实接口回归：图生图在 `ref_image_url=https://openpt.wuyinkeji.com/e7e976e9c91f44408e71d9049c2cc769.png` 条件下请求 `POST /api/projects/35b22908-f64e-409a-8b7f-80f7ded0f259/assets/2c9f859f-36d0-4ee2-9548-a11ede6ebc8c/generate` 返回 `200 {"status":"ready"}`。
+- 2026-03-27 - 修复 - 定位 Step3 素材生成“未到超时即 500”根因为 Next.js `/api` 反向代理到 `backend:8000` 时发生 `socket hang up (ECONNRESET)`；调整前端 `resolveApiBaseUrl` 在本地 `localhost:3000/3001` 环境直连 `http://{hostname}:8003/api`，绕过长请求代理断连。
+- 2026-03-27 - 验证 - 复现对比：同一生成请求直连后端 `http://127.0.0.1:8003/.../generate` 返回 200，而走前端代理 `http://127.0.0.1:3001/api/.../generate` 返回 500 并记录 `socket hang up`，修复后前端将不再走该代理链路。
+- 2026-03-27 - 验证 - 前端执行 `npm run lint && npm run typecheck` 通过（0 error，存在历史 warning）；按规范执行 `docker compose up -d --build backend frontend` 后健康检查 `http://127.0.0.1:8003/health` 与 `http://127.0.0.1:3001` 均返回 200。
+- 2026-03-27 - 后端 - 修复 Step3 素材生成落库链路：`/assets/{asset_id}/generate` 改为始终保存本地化后的 `local_url`，避免将短时效远程 URL 直接落库导致前端显示白图/占位图。
+- 2026-03-27 - 后端 - 强化图片下载容错：`download_image_as_local_file` 对空地址、非图片内容、空响应与非 200 响应统一抛出异常，不再静默回退原始 URL，避免“未超时先失败但状态不清晰”。
+- 2026-03-27 - 后端 - 为素材与分镜落地下载失败补充 502 错误透传，前端可直接看到“图片下载失败/落地失败”而非通用 500。
+- 2026-03-27 - 前端 - 更新 Next 图片白名单，新增 `openpt.wuyinkeji.com` 兼容历史远程素材展示。
+- 2026-03-27 - 验证 - 前端执行 `npm run lint`（0 error，存在历史 warning）与 `npm run typecheck` 通过；后端执行 `python3 -m py_compile backend/app/services/assets.py backend/app/api/assets.py backend/app/api/segments.py` 通过。
+- 2026-03-27 - 验证 - 按规范执行 `docker compose up -d --build backend frontend`，健康检查 `http://127.0.0.1:8003/health` 与 `http://127.0.0.1:3001` 均返回 200；并在容器内验证图片下载成功路径与 404 失败路径均符合预期。
+- 2026-03-27 - 后端 - 修复 Step3 素材生成落库链路：`/assets/{asset_id}/generate` 改为始终保存本地化后的 `local_url`，避免将短时效远程 URL 直接落库导致前端显示白图/占位图。
+- 2026-03-27 - 后端 - 强化图片下载容错：`download_image_as_local_file` 对空地址、非图片内容、空响应与非 200 响应统一抛出异常，不再静默回退原始 URL，避免“未超时先失败但状态不清晰”。
+- 2026-03-27 - 后端 - 为素材与分镜落地下载失败补充 502 错误透传，前端可直接看到“图片下载失败/落地失败”而非通用 500。
+- 2026-03-27 - 前端 - 更新 Next 图片白名单，新增 `openpt.wuyinkeji.com` 兼容历史远程素材展示。
+- 2026-03-27 - 验证 - 前端执行 `npm run lint`（0 error，存在历史 warning）与 `npm run typecheck` 通过；后端执行 `python3 -m py_compile backend/app/services/assets.py backend/app/api/assets.py backend/app/api/segments.py` 通过。
+- 2026-03-27 - 验证 - 按规范执行 `docker compose up -d --build backend frontend`，健康检查 `http://127.0.0.1:8003/health` 与 `http://127.0.0.1:3001` 均返回 200；并在容器内验证图片下载成功路径与 404 失败路径均符合预期。
+- 2026-03-27 - 后端 - 修复 Step3 文生图偶发超时：速创 NanoBanana2 结果轮询次数由固定 `90` 调整为环境变量 `SUCHUANG_POLL_MAX_ATTEMPTS`（默认 `240`），降低“任务稍慢即超时失败”概率。
+- 2026-03-27 - 前端 - 放宽 Step3 生成请求超时阈值：`ASSET_GENERATE_TIMEOUT_MS` 从 `180000` 提升到 `600000`，避免上游任务已完成但前端先超时中断。
+- 2026-03-27 - 验证 - 执行 `python3 -m compileall backend/app`、`npm run typecheck` 通过；`npm run lint` 仅存在历史 warning 无新增 error；按规范执行 `docker compose up -d --build backend frontend` 后健康检查 `http://127.0.0.1:8003/health` 与 `http://127.0.0.1:3001` 均返回 200。
+- 2026-03-27 - 后端 - 修复 Step3 文生图偶发超时：速创 NanoBanana2 结果轮询次数由固定 `90` 调整为环境变量 `SUCHUANG_POLL_MAX_ATTEMPTS`（默认 `240`），降低“任务稍慢即超时失败”概率。
+- 2026-03-27 - 前端 - 放宽 Step3 生成请求超时阈值：`ASSET_GENERATE_TIMEOUT_MS` 从 `180000` 提升到 `600000`，避免上游任务已完成但前端先超时中断。
+- 2026-03-27 - 验证 - 执行 `python3 -m compileall backend/app`、`npm run typecheck` 通过；`npm run lint` 仅存在历史 warning 无新增 error；按规范执行 `docker compose up -d --build backend frontend` 后健康检查 `http://127.0.0.1:8003/health` 与 `http://127.0.0.1:3001` 均返回 200。
+- 2026-03-27 - 后端 - 修复 Step3 图生图链路：移除图生图失败时自动回退文生图逻辑，改为直接透出 AI 修改失败错误，避免“自动退回”掩盖真实问题。
+- 2026-03-27 - 后端 - 修复 NanoBanana2 参考图传参：`/static` 与本地域名地址不再转 base64（速创侧会 500），统一改为可公网访问 URL；若仅有本地静态地址且未配置 `PUBLIC_BASE_URL/KLING_PUBLIC_BASE_URL`，返回明确配置错误。
+- 2026-03-27 - 后端 - 调整素材版本落库策略：当生成结果为远程 URL 时优先保存远程 URL（不再强制落盘后仅存本地 `/static`），确保后续 AI 修改可继续作为速创参考图。
+- 2026-03-27 - 验证 - 执行 `python3 -m compileall backend/app`、`npm run typecheck` 通过；`npm run lint` 仅存在历史 warning 无新增 error；按规范执行 `docker compose up -d --build backend frontend` 后健康检查 `http://127.0.0.1:8003/health` 与 `http://127.0.0.1:3001` 均返回 200。
+- 2026-03-27 - 后端 - 修复 Step3 图生图链路：移除图生图失败时自动回退文生图逻辑，改为直接透出 AI 修改失败错误，避免“自动退回”掩盖真实问题。
+- 2026-03-27 - 后端 - 修复 NanoBanana2 参考图传参：`/static` 与本地域名地址不再转 base64（速创侧会 500），统一改为可公网访问 URL；若仅有本地静态地址且未配置 `PUBLIC_BASE_URL/KLING_PUBLIC_BASE_URL`，返回明确配置错误。
+- 2026-03-27 - 后端 - 调整素材版本落库策略：当生成结果为远程 URL 时优先保存远程 URL（不再强制落盘后仅存本地 `/static`），确保后续 AI 修改可继续作为速创参考图。
+- 2026-03-27 - 验证 - 执行 `python3 -m compileall backend/app`、`npm run typecheck` 通过；`npm run lint` 仅存在历史 warning 无新增 error；按规范执行 `docker compose up -d --build backend frontend` 后健康检查 `http://127.0.0.1:8003/health` 与 `http://127.0.0.1:3001` 均返回 200。
+- 2026-03-27 - 后端 - 修复 Step3「AI修改」失败：`app/api/assets.py` 在 `create_image_edit` 遇到速创上游“转发请求失败/目标服务器500”时，自动回退到文本生图并补充“保持主体身份与构图一致”约束，避免直接失败。
+- 2026-03-27 - 后端 - 稳定性增强：`app/api/assets.py` 补充 `image_url` 默认值，规避异常返回结构下未赋值导致的 500。
+- 2026-03-27 - 验证 - 后端执行 `python3 -m py_compile backend/app/api/assets.py` 通过；前端执行 `npm run typecheck && npm run lint -- --quiet` 通过。
+- 2026-03-27 - 运维 - 按规范执行 `docker compose up -d --build backend frontend`，健康检查 `http://127.0.0.1:8003/health` 与 `http://127.0.0.1:3001` 返回 200。
+- 2026-03-27 - 后端 - `app/services/linkapi.py` 文本模型调用改为速创 `Gemini3Pro`（`/api/chat/index`），统一使用 `SUCHUANG_API_KEY` 鉴权并兼容现有 OpenAI 风格响应结构。
+- 2026-03-27 - 后端 - `app/services/linkapi.py` 图片模型调用改为速创 `NanoBanana2`（`/api/async/image_nanoBanana2`），新增任务轮询与结果 URL 解析，返回结构保持 `{"data":[{"url":...}]}`。
+- 2026-03-27 - 前端 - 设置页与脚本流程默认模型更新为 `gemini-3-pro` / `nanoBanana2`，并同步下拉文案与占位提示。
+- 2026-03-27 - 配置 - 后端 `.env` 将 `OPENROUTER_API_KEY` 切换为 `SUCHUANG_API_KEY`，使用用户提供的新密钥。
+- 2026-03-27 - 验证 - 后端执行 `python3 -m py_compile backend/app/services/linkapi.py backend/app/core/config.py backend/app/models/settings.py backend/app/api/script.py backend/app/api/assets.py backend/app/api/segments.py backend/app/services/assets.py` 通过；前端执行 `npm run typecheck && npm run lint -- --quiet` 通过。
+- 2026-03-27 - 验证 - 直连速创接口验证：`POST /api/chat/index` 返回 `{"code":400,"msg":"请求失败，账户余额不足或没有权限"}`，请求链路可达但当前账号余额/权限不足。
+- 2026-03-27 - 运维 - 按规范执行 `docker compose up -d --build backend frontend` 重建容器；健康检查 `http://127.0.0.1:8003/health` 与 `http://127.0.0.1:3001` 均返回 200。
+- 2026-03-27 - 后端/前端 - 模型统一切换：图片生成统一改为 OpenRouter `openai/gpt-5-image`，语言模型统一改为 OpenRouter `openai/gpt-5.4`；同步更新后端默认模型常量、设置默认值、Step2/Step3/Step4 前端默认模型与下拉选项，并将现有 `user_settings` 默认模型批量更新为新值。
+- 2026-03-27 - 验证 - 后端执行 `python3 -m py_compile backend/app/services/linkapi.py backend/app/models/settings.py backend/app/api/script.py backend/app/api/assets.py backend/app/api/segments.py backend/app/services/assets.py` 通过；前端执行 `npm run typecheck && npm run lint -- --quiet` 通过；按规范执行 `docker compose up -d --build backend frontend` 后健康检查 `http://127.0.0.1:8003/health` 与 `http://127.0.0.1:3001` 返回 200；直连 OpenRouter 验证 `openai/gpt-5.4` 与 `openai/gpt-5-image` 当前均返回 `403 Author openai is banned`。
+- 2026-03-27 - 配置 - 按用户提供的新凭证更新 `backend/.env` 中 `OPENROUTER_API_KEY`，并重建 `backend/frontend` 容器使新环境变量生效。
+- 2026-03-27 - 验证 - 执行 `docker compose up -d --build backend frontend` 后健康检查 `http://127.0.0.1:8003/health` 与 `http://127.0.0.1:3001` 返回 200；前端执行 `npm run typecheck && npm run lint -- --quiet` 通过；后端执行 `python3 -m py_compile backend/app/api/segments.py backend/app/api/assets.py backend/app/services/linkapi.py` 通过；直连 OpenRouter 验证同模型仍返回 `403 Author google is banned`。
+- 2026-03-26 - 后端 - 语言模型调用统一切换到 OpenRouter：`create_chat_completion/create_chat_completion_stream` 改为 `https://openrouter.ai/api/v1/chat/completions`，文本模型统一映射 `google/gemini-3.1-pro-preview`，并统一从 `OPENROUTER_API_KEY`/用户设置读取密钥。
+- 2026-03-26 - 后端 - Step1/Step2/Step4 等文本链路默认模型统一为 `google/gemini-3.1-pro-preview`：更新 `script.py` 模型归一化与固定模型分支、`assets.py` 提取素材调用模型、`models/settings.py` 默认文本模型。
+- 2026-03-26 - 前端 - Step1/Step2/Step4 页面模型默认值与可选项统一为 `google/gemini-3.1-pro-preview`，设置页默认文本模型占位同步更新。
+- 2026-03-26 - 验证 - 后端执行 `python3 -m py_compile backend/app/services/linkapi.py backend/app/api/script.py backend/app/services/assets.py backend/app/models/settings.py` 通过；前端执行 `npm run typecheck && npm run lint -- --quiet` 通过；按规范执行 `docker compose up -d --build backend frontend` 后健康检查 `http://127.0.0.1:8003/health` 与 `http://127.0.0.1:3001` 返回 200。
+- 2026-03-26 - 后端 - Step4 `GET /projects/{id}/segments` 增加兜底异常捕获与安全整数转换，异常时返回可读错误详情并记录结构化日志，降低历史异常数据导致的随机 500。
+- 2026-03-26 - 后端 - Step4 `POST /projects/{id}/segments/generate` 增加外层异常兜底日志与错误透传，避免未覆盖分支抛出泛化 Internal Server Error。
+- 2026-03-26 - 验证 - 后端执行 `python3 -m py_compile backend/app/api/segments.py` 通过；前端执行 `npm run typecheck && npm run lint -- --quiet` 通过；按规范执行 `docker compose up -d --build backend frontend` 后健康检查 `http://127.0.0.1:8003/health` 与 `http://127.0.0.1:3001` 返回 200。
+- 2026-03-25 - 前端 - 修复 Step4 分镜表格字段错位：`ScriptEditor` 表格解析新增“超列回收”与全角分隔符兼容，优先固定右侧列（角色形象/道具/场景/备注）并把多余 `|` 回并到内容列，避免台词/表情串列。
+- 2026-03-25 - 前端 - 修复 Step4 表格二次保存致错位：序列化时对单元格内 `|` 转义为 `\|`，避免自动保存后再次解析出现列漂移。
+- 2026-03-25 - 验证 - 前端执行 `npm run typecheck && npm run lint -- --quiet` 通过；按规范执行 `docker compose up -d --build backend frontend` 后健康检查 `http://127.0.0.1:8003/health` 与 `http://127.0.0.1:3001` 返回 200。
+- 2026-03-25 - 配置 - 已将用户提供的 Freesound 凭据写入 `backend/.env` 的 `FREESOUND_API_TOKEN`，用于 Step5 特效 Tab 的 Freesound 标签与搜索接口鉴权。
+- 2026-03-25 - 验证 - 使用本地 token 直连 `https://freesound.org/apiv2/search/text/`（Bearer/Token/query 三种方式）均返回 401，当前凭据在 Freesound 侧不可用或类型不匹配。
+- 2026-03-25 - 验证 - 按规范执行 `docker compose up -d --build backend frontend`，健康检查 `http://127.0.0.1:8003/health` 与 `http://127.0.0.1:3001` 返回 200。
+- 2026-03-27 - 后端 - 修复 Step2 资源提取静默失败：`/projects/{id}/script/generate` 的 SSE 透传新增对上游字典型 `error` 字段识别与抛出，避免 OpenRouter 返回错误事件时前端仅“按钮闪一下”且无明确报错。
+- 2026-03-27 - 验证 - 后端执行 `python3 -m py_compile backend/app/api/script.py` 通过；前端执行 `npm run typecheck && npm run lint -- --quiet` 通过；按规范执行 `docker compose up -d --build backend frontend` 后健康检查 `http://127.0.0.1:8003/health` 与 `http://127.0.0.1:3001` 返回 200。
+- 2026-03-25 - 后端 - 修复 Step5 特效 Tab 的 Freesound 搜索错误处理：`/freesound-search` 在 token 缺失或上游失败时不再返回 400，统一返回 200 与空结果并附带 `warning`，避免前端请求直接报错中断交互。
+- 2026-03-25 - 前端 - 修复特效 Tab 自动加载重试风暴：Freesound 标签/搜索失败时写入空结果占位，避免反复触发 400 请求；同时支持显示后端返回的 `warning` 提示。
+- 2026-03-25 - 验证 - 后端 `python3 -m py_compile backend/app/api/final.py` 通过；前端 `npm run typecheck && npm run lint -- --quiet` 通过；按规范执行 `docker compose up -d --build backend frontend` 后健康检查 `http://127.0.0.1:8003/health` 与 `http://127.0.0.1:3001` 返回 200。
+- 2026-03-27 - 后端 - Step4 新增首尾帧图片生成接口 `POST /projects/{project_id}/segments/frame-images/generate`：支持携带提示词+参考素材图走 OpenRouter `google/gemini-3.1-flash-image-preview` 生成图片并落盘到本地静态资源。
+- 2026-03-27 - 后端 - Step4 视频生成链路支持自定义首尾帧透传：`create_video` 新增 `custom_first_frame_url/custom_last_frame_url`，自动组装 Kling `reference_images` 的 `first_frame/last_frame` 类型并与既有“上一条分镜尾帧”逻辑兼容。
+- 2026-03-27 - 前端 - Step4 视频生成列新增“自定义首尾帧”弹窗：支持角色形象/道具/场景 Tab 切换、素材引用（蓝色标签展示）、一键生成首帧/尾帧、多候选图展示与逐图“应用”、行内首帧/尾帧预览按钮。
+- 2026-03-27 - 前端 - Step4 生成视频请求接入已应用首尾帧：调用行级生成时自动透传 `custom_first_frame_url/custom_last_frame_url`，使视频生成使用用户选定收尾帧。
+- 2026-03-27 - 验证 - 后端执行 `python3 -m py_compile backend/app/api/segments.py backend/app/schemas/segments.py backend/app/services/linkapi.py` 通过；前端执行 `npm run typecheck && npm run lint -- --quiet` 通过；按规范执行 `docker compose up -d --build backend frontend` 后健康检查 `http://127.0.0.1:8003/health` 与 `http://127.0.0.1:3001` 返回 200。
+- 2026-03-27 - 前端 - Step4 自定义首尾帧弹窗按钮文案调整：`一键生成首帧/一键生成尾帧` 改为 `生成首帧/生成尾帧`。
+- 2026-03-27 - 前端 - Step4 自定义首尾帧输入区改为富文本输入：点击素材后引用名称以蓝色特殊文本内嵌到输入框中，可与用户自然语言在同一输入区连续编辑与组合。
+- 2026-03-27 - 验证 - 前端执行 `npm run typecheck && npm run lint -- --quiet` 通过。
+- 2026-03-27 - 验证 - 按规范执行 `docker compose up -d --build backend frontend`，健康检查 `http://127.0.0.1:8003/health` 与 `http://127.0.0.1:3001` 返回 200。
+- 2026-03-27 - 前端 - 修复 Step2 提取资源“按钮闪一下即结束且无明显报错”：`generateScript` 改为在流式返回空内容时主动抛出错误，`generateScriptStream` 统一使用已归一化 API Base，避免流式接口命中错误地址后静默结束；Step2 页面消息提示上移到标题下方确保可见。
+- 2026-03-27 - 验证 - 前端执行 `npm run typecheck && npm run lint -- --quiet` 通过；按规范执行 `docker compose up -d --build backend frontend` 后健康检查 `http://127.0.0.1:8003/health` 与 `http://127.0.0.1:3001` 返回 200。
+- 2026-03-27 - 前端 - Step4 自定义首尾帧弹窗交互调整：在输入区上方新增“首帧/尾帧”切换 Tab，并将输入区下方生成按钮改为按当前 Tab 显示对应的“生成首帧”或“生成尾帧”。
+- 2026-03-27 - 验证 - 前端执行 `npm run typecheck && npm run lint -- --quiet` 通过；按规范执行 `docker compose up -d --build backend frontend` 后健康检查 `http://127.0.0.1:8003/health` 与 `http://127.0.0.1:3001` 返回 200。
+- 2026-03-27 - 前端 - Step4 自定义首尾帧状态持久化：新增基于项目维度的本地存储，自动保存并恢复首帧候选列表、尾帧候选列表与已应用首尾帧，刷新页面后可继续查看与使用历史生成结果。
+- 2026-03-27 - 验证 - 前端执行 `npm run typecheck && npm run lint -- --quiet` 通过；按规范执行 `docker compose up -d --build backend frontend` 后健康检查 `http://127.0.0.1:8003/health` 与 `http://127.0.0.1:3001` 返回 200。
+- 2026-03-27 - 后端 - Step4 首尾帧“修改图片”失败修复：增强 OpenRouter 图片结果解析，支持从返回体 `data[].url` 与 `b64_json/base64` 提取图片，避免仅识别旧字段导致“未获取到图片地址 / 502 Bad Gateway”。
+- 2026-03-27 - 前端 - Step4 自定义首尾帧应用交互优化：移除“一键应用”；点击候选图“应用”按钮即应用对应首/尾帧，再次点击“已应用”可取消应用并切回“应用”；修改意见区新增“取消”按钮并在点击后收起输入框。
+- 2026-03-27 - 验证 - 前端执行 `npm run typecheck && npm run lint -- --quiet` 通过；后端执行 `python3 -m py_compile backend/app/services/linkapi.py` 通过；按规范执行 `docker compose up -d --build backend frontend` 后健康检查 `http://127.0.0.1:8003/health` 与 `http://127.0.0.1:3001` 返回 200。
+- 2026-03-27 - 前端 - Step4 预览层级修复：将首尾帧图片预览弹层 z-index 提升到高于“自定义首尾帧”弹窗，确保在不关闭当前弹窗时可直接看到预览大图。
+- 2026-03-27 - 验证 - 前端执行 `npm run typecheck && npm run lint -- --quiet` 通过；按规范执行 `docker compose up -d --build backend frontend` 后健康检查 `http://127.0.0.1:8003/health` 与 `http://127.0.0.1:3001` 返回 200。
+- 2026-03-27 - 后端 - Step4 首尾帧生成容错增强：针对 OpenRouter 返回“Author google is banned”场景，为 `/segments/frame-images/generate` 增加图片模型回退链（默认模型失败后自动切换 `openai/gpt-image-1`），避免“输入修改意见/生成首尾帧”因模型禁用直接失败。
+- 2026-03-27 - 验证 - 前端执行 `npm run typecheck && npm run lint -- --quiet` 通过；后端执行 `python3 -m py_compile backend/app/api/segments.py backend/app/services/linkapi.py` 通过；按规范执行 `docker compose up -d --build backend frontend` 后健康检查 `http://127.0.0.1:8003/health` 与 `http://127.0.0.1:3001` 返回 200。
+- 2026-03-27 - 后端 - Step4 回退策略回滚：按需求移除首尾帧生成对 `openai/gpt-image-1` 的自动降级，恢复仅使用 `google/gemini-3.1-flash-image-preview`；同时增强错误透传，若 OpenRouter 返回 `error.message/error.code` 则直接返回明确失败原因，避免前端仅看到“未获取到图片地址”。
+- 2026-03-27 - 验证 - 前端执行 `npm run typecheck && npm run lint -- --quiet` 通过；后端执行 `python3 -m py_compile backend/app/api/segments.py backend/app/services/linkapi.py` 通过；按规范执行 `docker compose up -d --build backend frontend` 后健康检查 `http://127.0.0.1:8003/health` 与 `http://127.0.0.1:3001` 返回 200。
+- 2026-03-27 - 前端 - Step4 自定义首尾帧展示区交互增强：点击首帧/尾帧候选图可放大预览；在“应用”按钮右侧增加“输入修改意见”按钮，支持展开意见输入框并对指定图片执行重绘修改。
+- 2026-03-27 - 前端 - Step4 自定义首尾帧新增“修改图片”流程：以当前选中候选图 + 用户修改意见 + 已引用素材图调用生成接口，生成新图追加到对应首帧/尾帧展示区，生成成功后自动收起修改输入框。
+- 2026-03-27 - 验证 - 前端执行 `npm run typecheck && npm run lint -- --quiet` 通过；按规范执行 `docker compose up -d --build backend frontend` 后健康检查 `http://127.0.0.1:8003/health` 与 `http://127.0.0.1:3001` 返回 200。
+- 2026-03-27 - 前端 - Step4 自定义首尾帧引用逻辑优化：同一素材支持重复点击并重复内嵌引用，不再因二次点击触发取消；输入区文本提取改为包含蓝色引用名，确保提示词与引用名一起传给生成接口。
+- 2026-03-27 - 前端 - Step4 首尾帧生成请求引用图列表改为按输入区引用去重后传递，确保模型稳定接收用户输入 prompt 与对应参考图片。
+- 2026-03-27 - 验证 - 前端执行 `npm run typecheck && npm run lint -- --quiet` 通过。
+- 2026-03-27 - 验证 - 按规范执行 `docker compose up -d --build backend frontend`，健康检查 `http://127.0.0.1:8003/health` 与 `http://127.0.0.1:3001` 返回 200。
+- 2026-03-25 - 后端 - Step5 特效 Tab 接入 Freesound：新增标签接口 `/projects/{project_id}/episodes/audio-pipeline/freesound-tags` 与搜索接口 `/projects/{project_id}/episodes/audio-pipeline/freesound-search`，统一通过 `FREESOUND_API_TOKEN` 鉴权并返回可试听预览链接。
+- 2026-03-25 - 前端 - Step5 特效 Tab 新增 Freesound 分类标签筛选、关键词搜索、试听列表与“拖拽到视频下方音轨条任意时间点”能力，并将特效摆放结果持久化到本地状态 `fxDraftMap`。
+- 2026-03-25 - 验证 - 后端 `python3 -m py_compile backend/app/api/final.py` 通过；前端 `npm run typecheck && npm run lint -- --quiet` 通过；按规范执行 `docker compose up -d --build backend frontend` 后健康检查 `http://127.0.0.1:8003/health` 与 `http://127.0.0.1:3001` 返回 200。
+- 2026-03-24 - 后端 - Step5 新增 BGM 上传接口 `/projects/{project_id}/episodes/audio-pipeline/upload-bgm`，支持把上传音频按所选分段写入 `bgm_segment_results` 并记录版本、起止时间、状态。
+- 2026-03-24 - 前端 - Step5 的 BGM Tab 接入分段选择与上传应用：展示分段音轨、支持上传音频并应用到当前选中分段、展示当前段与全段概览。
+- 2026-03-24 - 验证 - 后端 `python3 -m py_compile backend/app/api/final.py` 通过；前端 `npm run typecheck && npm run lint -- --quiet` 通过；按规范执行 `docker compose up -d --build backend frontend`，健康检查 `http://127.0.0.1:8003/health` 与 `http://127.0.0.1:3001` 返回 200。
+- 2026-03-24 - 后端 - Step5 音效请求策略调整：保留官方 `convert` 首选；当 `convert` 返回 404 时，切换到 `/v1/sound-generation` 并附加严格非人声指令（sound effect only / no speech / no vocals），降低回退端点生成人声对白概率。
+- 2026-03-24 - 后端 - Step5 音效重试策略增强：`/v1/sound-generation` 支持多提示词候选（严格提示、严格简化提示、原始提示）与可观测 `prompt_index` 日志，便于定位“变人声”问题。
+- 2026-03-24 - 验证 - 后端 `python3 -m py_compile app/services/eleven_labs.py` 通过；直连调用日志显示 `convert=404` 后自动切换 `sound-generation=200` 且返回 `audio/mpeg`；按规范执行 `docker compose up -d --build backend frontend` 后健康检查 `http://127.0.0.1:8003/health` 与 `http://127.0.0.1:3001` 返回 200；前端 `npm run typecheck && npm run lint -- --quiet` 通过。
+- 2026-03-24 - 后端 - Step5 音效接口容错增强：`text_to_sound_effect` 改为优先请求 `/v1/text-to-sound-effects/convert`，当该端点返回 404 时自动切换到 `/v1/sound-generation`；全程仅使用 ElevenLabs 音效接口，不回退任何配音接口。
+- 2026-03-24 - 验证 - 后端执行 `python3 -m py_compile app/services/eleven_labs.py` 通过；本地直连调用日志显示 convert 返回 404 后已切换 sound-generation 并成功返回 `audio/mpeg`（114982 bytes）。
+- 2026-03-25 - 前端 - 修复 Step4 分镜表格再次错位：表格分列改为“方括号内容保护分列”，`[台词: ... | ...]` 内部竖线不再被当作列分隔，避免把台词切进角色形象/道具/场景列。
+- 2026-03-25 - 前端 - 调整 Step4 分镜行分列策略：移除对整行全角竖线强制替换，降低正文符号误判为列分隔符导致的串列风险。
+- 2026-03-25 - 验证 - 前端执行 `npm run typecheck && npm run lint -- --quiet` 通过；按规范执行 `docker compose up -d --build backend frontend` 后健康检查 `http://127.0.0.1:8003/health` 与 `http://127.0.0.1:3001` 返回 200。
+- 2026-03-24 - 验证 - 按规范执行 `docker compose up -d --build backend frontend`，随后健康检查 `http://127.0.0.1:8003/health` 与 `http://127.0.0.1:3001` 返回 200；前端 `npm run typecheck && npm run lint -- --quiet` 通过。
+- 2026-03-24 - 前端 - 修复首页 `react-hooks/set-state-in-effect`：移除 `useEffect` 内同步 `setState` 模式，改为基于 `getToken()` 初始化 `loading` 并仅在有 token 时拉取项目列表。
+- 2026-03-24 - 验证 - 前端执行 `npm run typecheck && npm run lint -- --quiet` 通过（历史 `src/app/page.tsx:16` 错误已消除）。
+- 2026-03-24 - 验证 - 按规范执行 `docker compose up -d --build backend frontend` 后健康检查 `http://127.0.0.1:8003/health` 与 `http://127.0.0.1:3001` 返回 200。
+- 2026-03-24 - 后端 - Step5 音效可观测性增强：为 `text_to_sound_effect` 增加 convert 请求/响应日志，记录 endpoint、query、payload、状态码、响应头、响应体与成功返回字节数；请求异常追加堆栈日志。
+- 2026-03-24 - 后端 - Step5 接口可观测性增强：`generate-sfx` 增加入口请求日志（项目、任务、分段、时间窗、提示词）与下游返回日志（字节数、内容类型），并在 400/500 分支记录错误日志。
+- 2026-03-24 - 验证 - 后端 `python3 -m py_compile app/services/eleven_labs.py app/api/final.py` 通过；本地直连 `text_to_sound_effect('Wind whistling through trees, followed by leaves rustling', 7.13)` 已输出完整请求与404响应日志；按规范执行 `docker compose up -d --build backend frontend` 后健康检查 `http://127.0.0.1:8003/health` 与 `http://127.0.0.1:3001` 返回 200；前端 `npm run typecheck` 通过，`npm run lint -- --quiet` 仍有历史错误 `src/app/page.tsx:16`（非本次改动引入）。
+- 2026-03-24 - 后端 - Step5 音效失败策略细化：官方 `convert` 端点返回 404 时，错误文案固定为“直接失败且不回退到任何配音/其他音频接口”，避免再触发人声对白链路。
+- 2026-03-24 - 验证 - 后端 `python3 -m py_compile app/services/eleven_labs.py app/api/final.py` 通过；直连 `text_to_sound_effect('Wind whistling through trees, followed by leaves rustling', 7.13)` 返回新错误文案（404 直接失败，不回退）。
+- 2026-03-24 - 验证 - 全仓检索 `/v1/sound-generation` 无命中，仅保留 `/v1/text-to-sound-effects/convert`；按规范执行 `docker compose up -d --build backend frontend` 后健康检查 `http://127.0.0.1:8003/health` 与 `http://127.0.0.1:3001` 返回 200；前端 `npm run typecheck` 通过，`npm run lint -- --quiet` 仍有历史错误 `src/app/page.tsx:16`（非本次改动引入）。
+- 2026-03-24 - 后端 - Step5 音效链路对齐官方文档：`text_to_sound_effect` 改为仅调用 `POST /v1/text-to-sound-effects/convert`，并携带 `output_format=mp3_44100_128`；不再调用 `/v1/sound-generation`，避免再次出现“返回人声读词”。
+- 2026-03-24 - 后端 - Step5 音效提示词处理收敛：移除自动追加“无人声”后缀，恢复请求体仅透传用户原始 `text`，同时将 `prompt_influence` 默认与接口调用统一为 `0.3`（官方默认）。
+- 2026-03-24 - 验证 - 后端 `python3 -m py_compile app/services/eleven_labs.py app/api/final.py` 通过；直连 `text_to_sound_effect('Wind whistling through trees, followed by leaves rustling', 7.13)` 当前返回 `404 {"detail":"Not Found"}`（命中官方 convert 端点）；按规范执行 `docker compose up -d --build backend frontend` 后健康检查 200/200；前端 `npm run typecheck` 通过，`npm run lint -- --quiet` 仍有历史错误 `src/app/page.tsx:16`（非本次改动引入）。
+- 2026-03-27 - 后端 - 修复 Step3 图片生成 500：`app/services/linkapi.py` 的 NanoBanana2 任务查询由错误的 `/api/async/result|get|status|getResult` 改为官方 `GET /api/async/detail?id=task_id`，消除轮询阶段持续 404 导致的失败。
+- 2026-03-27 - 验证 - 直连速创 `GET /api/async/detail?id=image_43a322ae-ef2e-4611-ab15-c83e6d8a0811` 返回 200 且含 `data.result` 图片 URL，确认查询接口可用。
+- 2026-03-27 - 验证 - 后端执行 `python3 -m py_compile backend/app/services/linkapi.py` 通过；前端执行 `npm run typecheck && npm run lint -- --quiet` 通过。
+- 2026-03-27 - 运维 - 按规范执行 `docker compose up -d --build backend frontend`，健康检查 `http://127.0.0.1:8003/health` 与 `http://127.0.0.1:3001` 返回 200。
+- 2026-03-24 - 后端 - Step5 音效相关性修复：移除会稀释语义的长英文前缀，改为“优先透传原始提示词，仅在未显式声明无人声时追加简短无人声约束后缀”，并将 `prompt_influence` 默认与调用值提升为 `0.85`，增强生成结果与输入提示词一致性。
+- 2026-03-24 - 验证 - 后端 `python3 -m py_compile app/services/eleven_labs.py app/api/final.py` 通过；直连 `text_to_sound_effect('风吹过树梢，发出呼啸声，随后是树叶沙沙作响', 7.13, prompt_influence=0.85)` 成功返回 `audio/mpeg`（114982 bytes），且 `model_id='eleven_v3'` 仍被强校验拒绝。
+- 2026-03-24 - 验证 - 按规范执行 `docker compose up -d --build backend frontend` 后健康检查 `http://127.0.0.1:8003/health` 与 `http://127.0.0.1:3001` 返回 200；前端 `npm run typecheck` 通过，`npm run lint -- --quiet` 仍有历史错误 `src/app/page.tsx:16`（非本次改动引入）。
+- 2026-03-24 - 后端 - Step5 音效生成移除中文提示词规整：`text_to_sound_effect` 恢复直接透传原始 `text` 到 `/v1/sound-generation`，不再做中文转英文 token 重写。
+- 2026-03-24 - 后端 - Step5 音效生成移除中文影响系数收敛：删除中文场景 `prompt_influence<=0.2` 逻辑，统一使用调用侧传入值（仍做 0~1 合法区间约束）。
+- 2026-03-24 - 后端 - Step5 音效模型约束保留：仅在音效生成链路强制 `model_id=eleven_text_to_sound_v2`，其它语音链路不受影响。
+- 2026-03-24 - 验证 - 后端 `python3 -m py_compile app/services/eleven_labs.py app/api/final.py` 通过；按规范执行 `docker compose up -d --build backend frontend` 后健康检查 `http://127.0.0.1:8003/health` 与 `http://127.0.0.1:3001` 均返回 200。
+- 2026-03-24 - 验证 - 前端 `npm run typecheck` 通过；`npm run lint -- --quiet` 仍有历史 error `src/app/page.tsx:16`（非本次改动引入）。
+- 2026-03-24 - 后端 - Step5 音效模型强校验：`text_to_sound_effect` 仅允许 `eleven_text_to_sound_v2`，传入其它模型直接报错，避免误用语音模型导致“读 prompt”。
+- 2026-03-26 - 后端 - 调整 Step4 分镜系统 Prompt：在“镜头调度与内容融合”的`过程`规则中新增“必须逐段描述镜头位置与运镜变化（若不变需明确写保持不变）”以及“必须逐段描述主要人物位置与动作变化（若不变需明确写保持不变）”约束。
+- 2026-03-26 - 后端 - 调整 Step4 分镜系统 Prompt：新增“过程补充示例写法”，包含“角色A从取号机前移动到办事窗口、镜头保持约2米跟随并轻微抖动”的结构化表达，便于模型稳定执行。
+- 2026-03-26 - 验证 - 后端执行 `python3 -m py_compile backend/app/core/script_prompts.py` 通过；按规范执行 `docker compose up -d --build backend frontend` 后健康检查 `http://127.0.0.1:8003/health` 与 `http://127.0.0.1:3001` 返回 200。
+- 2026-03-24 - 后端 - Step5 中文提示词规整：中文输入自动转为英文音效 token 组合（非对白、环境/拟音导向），并在中文场景将 `prompt_influence` 上限收敛至 `0.2`，降低朗读倾向。
+- 2026-03-24 - 验证 - 直连 `POST /v1/sound-generation` 使用 `model_id=eleven_text_to_sound_v2` 返回 200；同请求改为 `invalid_model_for_probe` 返回 400 且提示仅接受 `eleven_text_to_sound_v2`。
+- 2026-03-24 - 验证 - 后端直连 `text_to_sound_effect('风吹过树梢，发出呼啸声，随后是树叶沙沙作响', 7.13)` 成功返回 `audio/mpeg`（114982 bytes）；`bad_model` 调用按预期被拦截。
+- 2026-03-24 - 验证 - 后端 `python3 -m py_compile app/services/eleven_labs.py app/api/final.py` 通过；按规范执行 `docker compose up -d --build backend frontend` 后健康检查 `http://127.0.0.1:8003/health` 与 `http://127.0.0.1:3001` 均返回 200；前端 `npm run typecheck` 通过，`npm run lint -- --quiet` 仍有历史 error `src/app/page.tsx:16`（非本次改动引入）。
+- 2026-03-24 - 后端 - Step5 音效模型强校验：`text_to_sound_effect` 仅允许 `eleven_text_to_sound_v2`，传入其它模型直接报错，避免误用语音模型导致“读 prompt”。
+- 2026-03-24 - 后端 - Step5 中文提示词规整：中文输入自动转为英文音效 token 组合（非对白、环境/拟音导向），并在中文场景将 `prompt_influence` 上限收敛至 `0.2`，降低朗读倾向。
+- 2026-03-24 - 验证 - 直连 `POST /v1/sound-generation` 使用 `model_id=eleven_text_to_sound_v2` 返回 200；同请求改为 `invalid_model_for_probe` 返回 400 且提示仅接受 `eleven_text_to_sound_v2`。
+- 2026-03-24 - 验证 - 后端直连 `text_to_sound_effect('风吹过树梢，发出呼啸声，随后是树叶沙沙作响', 7.13)` 成功返回 `audio/mpeg`（114982 bytes）；`bad_model` 调用按预期被拦截。
+- 2026-03-24 - 验证 - 后端 `python3 -m py_compile app/services/eleven_labs.py app/api/final.py` 通过；按规范执行 `docker compose up -d --build backend frontend` 后健康检查 `http://127.0.0.1:8003/health` 与 `http://127.0.0.1:3001` 均返回 200；前端 `npm run typecheck` 通过，`npm run lint -- --quiet` 仍有历史 error `src/app/page.tsx:16`（非本次改动引入）。
+- 2026-03-24 - 后端 - Step5 音效模型强校验：`text_to_sound_effect` 仅允许 `eleven_text_to_sound_v2`，传入其它模型直接报错，避免误用语音模型导致“读 prompt”。
+- 2026-03-24 - 后端 - Step5 中文提示词规整：中文输入自动转为英文音效 token 组合（非对白、环境/拟音导向），并在中文场景将 `prompt_influence` 上限收敛至 `0.2`，降低朗读倾向。
+- 2026-03-24 - 验证 - 直连 `POST /v1/sound-generation` 使用 `model_id=eleven_text_to_sound_v2` 返回 200；同请求改为 `invalid_model_for_probe` 返回 400 且提示仅接受 `eleven_text_to_sound_v2`。
+- 2026-03-24 - 验证 - 后端直连 `text_to_sound_effect('风吹过树梢，发出呼啸声，随后是树叶沙沙作响', 7.13)` 成功返回 `audio/mpeg`（114982 bytes）；`bad_model` 调用按预期被拦截。
+- 2026-03-24 - 验证 - 后端 `python3 -m py_compile app/services/eleven_labs.py app/api/final.py` 通过；按规范执行 `docker compose up -d --build backend frontend` 后健康检查 `http://127.0.0.1:8003/health` 与 `http://127.0.0.1:3001` 均返回 200；前端 `npm run typecheck` 通过，`npm run lint -- --quiet` 仍有历史 error `src/app/page.tsx:16`（非本次改动引入）。
+- 2026-03-24 - 后端 - Step5 音效请求进一步对齐官方示例：`/v1/sound-generation` 请求体使用原始 `text`，移除附加“禁止人声”长前缀，并将 `prompt_influence` 默认与调用值统一为 `0.3`。
+- 2026-03-24 - 验证 - 后端直连验证官方示例提示词 `风吹过树梢，发出呼啸声，随后是树叶沙沙作响` 成功返回 `audio/mpeg`（114982 bytes）。
+- 2026-03-24 - 验证 - 后端 `python3 -m py_compile app/services/eleven_labs.py app/api/final.py` 通过；按规范执行 `docker compose up -d --build backend frontend` 后健康检查 `http://127.0.0.1:8003/health` 与 `http://127.0.0.1:3001` 均返回 200；前端 `npm run typecheck` 通过，`npm run lint -- --quiet` 仍有历史 error `src/app/page.tsx:16`（非本次改动引入）。
+- 2026-03-23 - 后端 - Step5 音效生成修复“直接报错”：`text_to_sound_effect` 改为仅调用 `/v1/sound-generation`，移除当前环境不可用的 convert 端点调用，保持单路径执行且不做降级分支。
+- 2026-03-23 - 验证 - 本地后端直连验证：`text_to_sound_effect('暴风雪环境音，风声夹杂远处雷声，无人声', 4)` 成功返回 `audio/mpeg` 与有效字节；同环境下 convert 端点仍返回 `404 {"detail":"Not Found"}`。
+- 2026-03-23 - 验证 - 后端 `python3 -m py_compile app/services/eleven_labs.py app/api/final.py` 通过；按规范执行 `docker compose up -d --build backend frontend` 后健康检查 `http://127.0.0.1:8003/health` 与 `http://127.0.0.1:3001` 均返回 200；前端 `npm run typecheck` 通过，`npm run lint -- --quiet` 仍为历史问题 `src/app/page.tsx:16`（非本次改动引入）。
+- 2026-03-23 - 后端 - Step5 音效链路根因修复：移除 `/v1/sound-generation` 调用与 404 回退，`text_to_sound_effect` 固定仅调用 ElevenLabs 官方 `POST /v1/text-to-sound-effects/convert`，避免误走非专用音效路径返回人声。
+- 2026-03-26 - 前端 - 修复 Step5 从“音效编辑”切换到“特效”时的报错体验：Freesound 标签与搜索接口调用增加前端兜底返回，后端/网络异常时自动回落为空结果，避免 Promise 直接抛错中断交互。
+- 2026-03-26 - 前端 - 优化 Step5 特效页自动加载策略：切换到“特效”Tab 的自动标签加载与自动搜索改为静默失败，不再弹出错误提示；手动点击“搜索音效/刷新标签”仍保留错误提示能力。
+- 2026-03-26 - 验证 - 前端执行 `npm run typecheck && npm run lint -- --quiet` 通过；按规范执行 `docker compose up -d --build backend frontend` 后健康检查 `http://127.0.0.1:8003/health` 与 `http://127.0.0.1:3001` 返回 200。
+- 2026-03-23 - 验证 - 容器内直连验证显示官方 convert 端点当前返回 `404 {"detail":"Not Found"}`，确认此前出现“能生成但偏人声”的直接原因是实际命中 `/v1/sound-generation`；现已按需求改为 convert 失败即直接报错，不再降级。
+- 2026-03-23 - 验证 - 后端 `python3 -m py_compile app/services/eleven_labs.py app/api/final.py` 通过；按规范执行 `docker compose up -d --build backend frontend` 后健康检查 `http://127.0.0.1:8003/health` 与 `http://127.0.0.1:3001` 均返回 200；前端 `npm run typecheck` 通过，`npm run lint -- --quiet` 仍有历史 error `src/app/page.tsx:16`（非本次改动引入）。
+- 2026-03-23 - 后端 - 按需求将 Step5 音效生成从 Kling 回切到 ElevenLabs `text-to-sound-effects/convert` 能力链路，直接调用 `eleven_labs_service.text_to_sound_effect` 产出音效文件并回写音效元数据。
+- 2026-03-23 - 前后端 - Step5 音效时长约束回调为 ElevenLabs 范围：后端截取/分段校验恢复为 0.5-30 秒，前端分段校验同步恢复为 0.5-30 秒。
+- 2026-03-23 - 验证 - 执行 `python3 -m py_compile backend/app/api/final.py backend/app/services/eleven_labs.py` 通过；按规范执行 `docker compose up -d --build backend frontend` 后健康检查 `http://127.0.0.1:8003/health` 与 `http://127.0.0.1:3001` 返回 200；前端 `npm run typecheck` 通过，`npm run lint -- --quiet` 仍有历史遗留 error（`src/app/page.tsx:16`，非本次改动引入）。
+- 2026-03-23 - 后端 - Step5 音效生成强化防人声策略：扩展中英文人声关键词拦截（如人声/男声/女声/旁白/speaking/voiceover 等），命中后直接报错并提示改为纯环境/特效音描述。
+- 2026-03-23 - 后端 - ElevenLabs 音效接口改为仅调用官方 `POST /v1/text-to-sound-effects/convert`，移除 `/v1/sound-generation` 回退，避免落入非纯音效生成路径导致人声输出。
+- 2026-03-23 - 验证 - 后端执行 `python3 -m py_compile backend/app/services/eleven_labs.py backend/app/api/final.py` 通过；本地快速验证“女声旁白介绍产品”被规则拦截并返回人声意图错误；按规范执行 `docker compose up -d --build backend frontend` 后健康检查 `http://127.0.0.1:8003/health` 与 `http://127.0.0.1:3001` 均返回 200；前端 `npm run typecheck` 通过，`npm run lint -- --quiet` 仍为历史遗留 error（`src/app/page.tsx:16`，非本次改动引入）。
+- 2026-03-23 - 后端 - Step5 音效生成改为可灵文生音效 `POST /v1/audio/text-to-audio`：按提示词与分段时长创建任务并轮询 `GET /v1/audio/text-to-audio/{task_id}`，产出后下载音频落盘回写 `sfx_segment_results`。
+- 2026-03-23 - 后端 - Step5 音效链路移除生成降级路径：仅走文生音效任务，创建/查询/下载任一环节失败均直接返回错误，不再回退到其他生成接口。
+- 2026-03-23 - 前后端 - Step5 音效时长约束统一调整为 3-10 秒（前端分段校验与后端截取/应用截取点校验同步更新），与可灵文生音效接口约束对齐。
+- 2026-03-23 - 验证 - 后端执行 `python3 -m py_compile backend/app/api/final.py backend/app/services/eleven_labs.py` 通过；按规范执行 `docker compose up -d --build backend frontend` 后健康检查 `http://127.0.0.1:8003/health` 与 `http://127.0.0.1:3001` 均返回 200；前端执行 `npm run typecheck` 通过，`npm run lint -- --quiet` 仍有历史遗留 error（`src/app/page.tsx:16`，非本次改动引入）。
+- 2026-03-23 - 验证 - 二次回归：后端 `python3 -m py_compile backend/app/api/final.py` 通过；重新执行 `docker compose up -d --build backend frontend` 且健康检查均为 200；前端 `npm run typecheck` 通过，`npm run lint -- --quiet` 仍为同一历史遗留报错（`src/app/page.tsx:16`）。
+- 2026-03-26 - 后端 - 修复 Step4 分镜视频删除失败：新增接口 `DELETE /projects/{project_id}/segments/{segment_id}/versions/{version_id}`，打通前端删除版本调用链。
+- 2026-03-26 - 后端 - 新增分镜版本删除服务：删除目标版本后自动重置剩余版本选中态（被删版本为当前选中时自动切到最新版本），并清理对应本地 `/static/` 视频文件。
+- 2026-03-26 - 验证 - 后端执行 `python3 -m py_compile backend/app/api/segments.py backend/app/services/segments.py` 通过；前端执行 `npm run typecheck && npm run lint -- --quiet` 通过；按规范执行 `docker compose up -d --build backend frontend` 后健康检查 `http://127.0.0.1:8003/health` 与 `http://127.0.0.1:3001` 返回 200。
+- 2026-03-23 - 后端 - Step5 音效生成新增防人声校验：提示词命中对白/台词/旁白/speech/voice 等关键词时直接阻断并提示改为纯环境或特效音描述。
+- 2026-03-23 - 后端 - Step5 音效生成保留“官方 convert 优先 + 404 回退 sound-generation”策略，并固定 `model_id=eleven_text_to_sound_v2`、`prompt_influence=1.0` 与非语言约束前缀。
+- 2026-03-23 - 验证 - 按规范执行 `docker compose up -d --build backend frontend`，健康检查 `http://127.0.0.1:8003/health` 与 `http://127.0.0.1:3001` 均返回 200；容器内验证“女人大喊：快跑”被防人声规则拦截，`风吹树叶沙沙声，远处雷声，无人声` 返回 `audio/mpeg` 音频字节。
+- 2026-03-23 - 验证 - 后端执行 `python3 -m py_compile backend/app/services/eleven_labs.py backend/app/api/final.py` 通过；前端执行 `npm run typecheck` 通过，`npm run lint -- --quiet` 仍有历史遗留 error（`src/app/page.tsx:16`，非本次改动引入）。
+- 2026-03-23 - 后端 - Step5 音效生成进一步对齐 ElevenLabs 官方 convert 接口：固定使用 `model_id=eleven_text_to_sound_v2`，并补充 `loop` 与 `prompt_influence` 参数。
+- 2026-03-23 - 后端 - Step5 音效提示词增加强约束前缀（仅非语言音效、禁止对话/旁白/歌词），降低模型输出人声内容的概率。
+- 2026-03-23 - 验证 - 按规范执行 `docker compose up -d --build backend frontend`，健康检查 `http://127.0.0.1:8003/health` 与 `http://127.0.0.1:3001` 均返回 200；容器内调用 `text_to_sound_effect('女人大喊：快跑！', 1.5)` 成功返回 `audio/mpeg` 与音频字节。
+- 2026-03-23 - 验证 - 后端执行 `python3 -m py_compile backend/app/services/eleven_labs.py backend/app/api/final.py` 通过；前端执行 `npm run typecheck` 通过，`npm run lint` 仍为历史遗留 error（`src/app/page.tsx:16`，非本次改动引入）。
+- 2026-03-23 - 后端 - 修复 Step5 音效失败根因：官方 `text-to-sound-effects/convert` 在当前账号返回 404 时恢复仅 404 场景回退 `/v1/sound-generation`，避免前端点击“生成音效”直接 400。
+- 2026-03-23 - 后端 - 修复防人声误拦截：新增“无人声/no voice/no speech/no dialogue”等否定短语白名单预处理，避免包含“无人声”时被 `人声/voice/speech` 关键词误判。
+- 2026-03-23 - 验证 - 后端执行 `python3 -m py_compile backend/app/services/eleven_labs.py backend/app/api/final.py` 通过；本地验证“女声旁白介绍产品”被拦截且“雪地环境风声…无人声”成功返回 `audio/mpeg`；按规范执行 `docker compose up -d --build backend frontend` 后健康检查 `http://127.0.0.1:8003/health` 与 `http://127.0.0.1:3001` 均返回 200；前端 `npm run typecheck` 通过，`npm run lint -- --quiet` 仍为历史遗留 error（`src/app/page.tsx:16`，非本次改动引入）。
+- 2026-03-23 - 后端 - Step5 音效接口改回严格使用 ElevenLabs 官方 Sound Effects API：仅请求 `POST /v1/text-to-sound-effects/convert`，不再回退到其他接口，避免混用非音效专用链路。
+- 2026-03-23 - 后端 - 补充 convert 端点 404 专用错误信息：明确提示当前账号或区域可能未开通 Sound Effects 服务，便于定位权限与开通问题。
+- 2026-03-23 - 验证 - 后端执行 `python3 -m py_compile backend/app/services/eleven_labs.py backend/app/api/final.py` 通过；本地调用 `text_to_sound_effect('snow wind ambience, footsteps on snow, no speech', 3.0)` 返回 convert 404 开通提示（符合预期）；按规范执行 `docker compose up -d --build backend frontend` 后健康检查 `http://127.0.0.1:8003/health` 与 `http://127.0.0.1:3001` 均返回 200；前端 `npm run typecheck` 通过，`npm run lint -- --quiet` 仍为历史遗留 error（`src/app/page.tsx:16`，非本次改动引入）。
+- 2026-03-23 - 后端 - Step5 音效生成进一步对齐 ElevenLabs 官方 convert 接口：固定使用 `model_id=eleven_text_to_sound_v2`，并补充 `loop` 与 `prompt_influence` 参数。
+- 2026-03-23 - 后端 - Step5 音效提示词增加强约束前缀（仅非语言音效、禁止对话/旁白/歌词），降低模型输出人声内容的概率。
+- 2026-03-23 - 验证 - 按规范执行 `docker compose up -d --build backend frontend`，健康检查 `http://127.0.0.1:8003/health` 与 `http://127.0.0.1:3001` 均返回 200；容器内调用 `text_to_sound_effect('女人大喊：快跑！', 1.5)` 成功返回 `audio/mpeg` 与音频字节。
+- 2026-03-23 - 验证 - 后端执行 `python3 -m py_compile backend/app/services/eleven_labs.py backend/app/api/final.py` 通过；前端执行 `npm run typecheck` 通过，`npm run lint` 仍为历史遗留 error（`src/app/page.tsx:16`，非本次改动引入）。
+- 2026-03-23 - 后端 - Step5 音效生成接口调整为优先官方 `POST /v1/text-to-sound-effects/convert`，仅在返回 404 时回退 `/v1/sound-generation`，避免误命中语音型生成路径。
+- 2026-03-23 - 后端 - Step5 音效请求参数补齐：`duration_seconds` 强制钳制到 0.5~30，空提示词直接报错，并在 convert 端点显式传 `output_format=mp3_44100_128`。
+- 2026-03-24 - 后端 - Step5 音效链路修正：在保留“仅 `eleven_text_to_sound_v2`”约束前提下，不做中文提示词规整与影响系数收敛，同时恢复固定“非人声音效”英文约束前缀，抑制返回配音人声。
+- 2026-03-26 - 后端 - 修复 Step3 中文音色过少：`/eleven-labs/voices` 在中文筛选场景不再仅依赖官方 `language=Chinese` 单一路径，改为多关键字（`chinese/mandarin/cantonese/putonghua`）聚合拉取并去重后再分页返回。
+- 2026-03-26 - 后端 - 增强中文语言匹配：语言筛选新增对口音、标签、标题与描述中的中文线索识别（如 `mandarin/putonghua/cantonese/yue/普通话/粤语`），提升可见中文可用音色覆盖率。
+- 2026-03-26 - 验证 - 后端执行 `python3 -m py_compile backend/app/services/eleven_labs.py backend/app/api/eleven_labs.py` 通过；前端执行 `npm run typecheck && npm run lint -- --quiet` 通过；按规范执行 `docker compose up -d --build backend frontend` 后健康检查 `http://127.0.0.1:8003/health` 与 `http://127.0.0.1:3001` 返回 200。
+- 2026-03-26 - 前端 - 修复 Step4 分镜脚本偶发“消失”：页面初始化时为分集补齐缺失的 `episode.storyboard`（从已保存的总分镜按 `### 分集标题` 拆分回填），避免分集为空覆盖总分镜。
+- 2026-03-26 - 前端 - 调整 Step4 分镜同步策略：仅在分集中存在有效分镜内容时才回写总 `storyboard`，并跳过首屏加载水合阶段，防止空值联动覆盖。
+- 2026-03-26 - 验证 - 前端执行 `npm run typecheck && npm run lint -- --quiet` 通过；按规范执行 `docker compose up -d --build backend frontend` 后健康检查 `http://127.0.0.1:8003/health` 与 `http://127.0.0.1:3001` 返回 200。
+- 2026-03-24 - 验证 - 全链路核查确认“音效编辑 tab -> `/projects/{id}/episodes/audio-pipeline/generate-sfx` -> `text_to_sound_effect` -> `POST /v1/sound-generation`”，且音效调用固定 `model_id=eleven_text_to_sound_v2`；传入 `eleven_v3` 会被后端直接拒绝。
+- 2026-03-24 - 验证 - 后端直连 `text_to_sound_effect('风吹过树梢，发出呼啸声，随后是树叶沙沙作响', 7.13)` 成功返回 `audio/mpeg`（114982 bytes）；后端 `python3 -m py_compile app/services/eleven_labs.py app/api/final.py` 通过；按规范执行 `docker compose up -d --build backend frontend` 后健康检查 200/200；前端 `npm run typecheck` 通过，`npm run lint -- --quiet` 仍是历史错误 `src/app/page.tsx:16`（非本次改动引入）。
+- 2026-03-23 - 验证 - 按规范执行 `docker compose up -d --build backend frontend`；健康检查 `http://127.0.0.1:8003/health` 与 `http://127.0.0.1:3001` 返回 200；容器内调用 `text_to_sound_effect('whoosh wind ambience no voice', 1.2)` 成功返回 `audio/mpeg` 与音频字节。
+- 2026-03-23 - 验证 - 前端执行 `npm run typecheck` 通过；`npm run lint` 仍有历史遗留 error（`src/app/page.tsx:16`，非本次改动引入）。
+- 2026-03-23 - 后端 - 针对已开通 Key 的实际联调结果调整 Step5 音效端点策略：优先调用 `POST /v1/sound-generation`，并在 404 时回退 `POST /v1/text-to-sound-effects/convert`，两者均为 ElevenLabs 音效服务链路。
+- 2026-03-23 - 验证 - 直连校验同一把 Key：`GET /v1/user` 返回 200（订阅 tier=starter），`POST /v1/text-to-sound-effects/convert` 返回 404 `{\"detail\":\"Not Found\"}`，`POST /v1/sound-generation` 返回 200 且 `audio/mpeg`。
+- 2026-03-23 - 验证 - 后端执行 `python3 -m py_compile backend/app/services/eleven_labs.py backend/app/api/final.py` 通过；本地调用 `text_to_sound_effect('snow wind ambience, footsteps on snow, distant thunder, no speech', 3.0)` 成功返回 `audio/mpeg`，人声提示词仍被阻断；按规范执行 `docker compose up -d --build backend frontend` 后健康检查 `http://127.0.0.1:8003/health` 与 `http://127.0.0.1:3001` 均返回 200；前端 `npm run typecheck` 通过，`npm run lint -- --quiet` 仍为历史遗留 error（`src/app/page.tsx:16`，非本次改动引入）。
+- 2026-03-23 - 后端 - Step5 音效生成接口调整为优先官方 `POST /v1/text-to-sound-effects/convert`，仅在返回 404 时回退 `/v1/sound-generation`，避免误命中语音型生成路径。
+- 2026-03-23 - 后端 - Step5 音效请求参数补齐：`duration_seconds` 强制钳制到 0.5~30，空提示词直接报错，并在 convert 端点显式传 `output_format=mp3_44100_128`。
+- 2026-03-23 - 验证 - 按规范执行 `docker compose up -d --build backend frontend`；健康检查 `http://127.0.0.1:8003/health` 与 `http://127.0.0.1:3001` 返回 200；容器内调用 `text_to_sound_effect('whoosh wind ambience no voice', 1.2)` 成功返回 `audio/mpeg` 与音频字节。
+- 2026-03-23 - 验证 - 前端执行 `npm run typecheck` 通过；`npm run lint` 仍有历史遗留 error（`src/app/page.tsx:16`，非本次改动引入）。
+- 2026-03-23 - 运维 - 修复 `docker-compose.yml` 后端环境注入冲突：为 backend 增加 `env_file: ./backend/.env`，并移除 `ELEVENLABS_API_KEY=${ELEVENLABS_API_KEY:-}` 覆盖项，避免容器内 ElevenLabs Key 被空值覆盖导致“生成音效”直接 400。
+- 2026-03-26 - 前端 - Step1「AI辅助修改」区域文案与布局调整：标题改为“基础设定”，并将模式按钮移动到标题行最右侧，按钮文案改为“用户付费型”“流量爆款型”。
+- 2026-03-26 - 前端 - Step1 交互提示文案同步：未选择模式时提示改为“请先在基础设定中选择用户付费型或流量爆款型”。
+- 2026-03-26 - 验证 - 前端执行 `npm run typecheck && npm run lint -- --quiet` 通过；按规范执行 `docker compose up -d --build backend frontend` 后健康检查 `http://127.0.0.1:8003/health` 与 `http://127.0.0.1:3001` 返回 200。
+- 2026-03-23 - 验证 - 执行 `docker compose up -d --build backend frontend` 后，容器内 `settings.elevenlabs_api_key` 已正确加载（len=51），并验证 `eleven_labs_service.text_to_sound_effect(text='test wind', duration_seconds=1.0)` 成功返回音频；健康检查 `http://127.0.0.1:8003/health` 与 `http://127.0.0.1:3001` 返回 200；前端 `npm run typecheck` 通过，`npm run lint` 仅剩历史遗留 error（非本次改动引入）。
+- 2026-03-23 - 运维 - 修复 `docker-compose.yml` 后端环境注入冲突：为 backend 增加 `env_file: ./backend/.env`，并移除 `ELEVENLABS_API_KEY=${ELEVENLABS_API_KEY:-}` 覆盖项，避免容器内 ElevenLabs Key 被空值覆盖导致“生成音效”直接 400。
+- 2026-03-23 - 验证 - 执行 `docker compose up -d --build backend frontend` 后，容器内 `settings.elevenlabs_api_key` 已正确加载（len=51），并验证 `eleven_labs_service.text_to_sound_effect(text='test wind', duration_seconds=1.0)` 成功返回音频；健康检查 `http://127.0.0.1:8003/health` 与 `http://127.0.0.1:3001` 返回 200；前端 `npm run typecheck` 通过，`npm run lint` 仅剩历史遗留 error（非本次改动引入）。
+- 2026-03-23 - 后端 - 修复 Step5 生成音效 ElevenLabs 端点兼容性：`text_to_sound_effect` 优先调用 `/v1/sound-generation`，并对旧端点 `/v1/text-to-sound-effects/convert` 保留 404 回退，避免点击“生成音效”直接报错 `{"detail":"Not Found"}`。
+- 2026-03-23 - 验证 - 后端执行 `python3 -m py_compile app/services/eleven_labs.py` 通过；并通过 Python 直连验证 `eleven_labs_service.text_to_sound_effect(text='测试风雪声', duration_seconds=1.0)` 成功返回音频内容。
+- 2026-03-23 - 验证 - 按规范执行 `docker compose up -d --build backend frontend`，健康检查 `http://127.0.0.1:8003/health` 与 `http://127.0.0.1:3001` 均返回 200；前端执行 `npm run typecheck` 通过，`npm run lint` 仍存在历史问题（非本次改动引入）。
+- 2026-03-23 - 前端 - Step5 移除音效编辑上方播放器，仅保留“该集剧本（来源 Step1）”区域与下方编辑区。
+- 2026-03-23 - 前端 - Step5 音效编辑区新增四标签切换：环境音效/特效/台词/BGM；环境音效复用现有音效编辑能力，特效与BGM先以占位空白区呈现。
+- 2026-03-23 - 前端 - Step5 将“台词生成”整块功能迁入“台词”标签下，视频播放器交互保持不变，仅切换下方编辑区内容。
+- 2026-03-23 - 验证 - 前端执行 `npx eslint "src/app/projects/[id]/script/video/page.tsx"` 与 `npm run typecheck` 通过。
+- 2026-03-23 - 验证 - 按规范执行 `docker compose up -d --build backend frontend` 后健康检查 `http://127.0.0.1:8003/health` 与 `http://127.0.0.1:3001` 返回 200。
+- 2026-03-23 - 前端 - Step5 音效版本支持按段选中并接入“播放第N段”同步播放逻辑，播放时优先使用该段已选中版本而非固定最新版本。
+- 2026-03-23 - 前端 - Step5 音效版本策略完善：生成新版本后自动选中新版本；删除版本后自动回退到该段剩余最新版本，无剩余版本则清空该段选中态。
+- 2026-03-23 - 验证 - 前端执行 `npx eslint "src/app/projects/[id]/script/video/page.tsx"` 与 `npm run typecheck` 通过；全量 `npm run lint` 仍有 1 个历史 error（非本次改动引入）与若干历史 warning；按规范执行 `docker compose up -d --build backend frontend` 后健康检查 `http://127.0.0.1:8003/health` 与 `http://127.0.0.1:3001` 返回 200。
+- 2026-03-23 - 前端 - Step5 音效展示改为紧邻截取进度条的“分段音轨条”样式，移除独立音频控制器与单独进度条，保留版本删除入口。
+- 2026-03-23 - 前端 - Step5 “播放第N段”改为统一驱动视频与当前段最新音效版本同步播放，按分段起点建立时间映射并在播放过程中做漂移校正。
+- 2026-03-23 - 验证 - 前端执行 `npm run typecheck` 与 `npx eslint 'src/app/projects/[id]/script/video/page.tsx'` 通过；`npm run lint -- --quiet` 仍有历史遗留错误 `src/app/page.tsx:16 react-hooks/set-state-in-effect`（非本次改动引入）。
+- 2026-03-23 - 验证 - 按规范执行 `docker compose up -d --build backend frontend`，并健康检查 `http://127.0.0.1:8003/health` 与 `http://127.0.0.1:3001` 均返回 200。
+- 2026-03-23 - 前端 - Step5 音效版本音轨按分段区域渲染：第1段版本仅显示在第1段下方，第2段版本仅显示在第2段下方，不再集中堆叠在单一分段区域。
+- 2026-03-23 - 验证 - 前端执行 `npm run typecheck` 与 `npx eslint 'src/app/projects/[id]/script/video/page.tsx'` 通过；`npm run lint -- --quiet` 仍有历史遗留错误 `src/app/page.tsx:16 react-hooks/set-state-in-effect`（非本次改动引入）。
+- 2026-03-23 - 验证 - 按规范执行 `docker compose up -d --build backend frontend`，健康检查 `http://127.0.0.1:8003/health` 与 `http://127.0.0.1:3001` 均返回 200。
+- 2026-03-23 - 后端 - Step5 生成音效新增“公网地址失败复用兜底”：当构建 `video_url` 因远程上传配置缺失失败时，优先复用同分段同提示词同 ASMR 的历史 `sfx_segment_results`，避免二次点击直接 400。
+- 2026-03-23 - 前端 - Step5 移除“已应用截取点上传 · 第N段”视频展示区，仅保留音效版本展示与应用按钮。
+- 2026-03-26 - 后端 - Step4 分镜新增可恢复异步任务接口：`/projects/{id}/script/storyboard-tasks/start` 与 `/projects/{id}/script/storyboard-tasks/{task_id}`，支持切页/刷新后继续查询生成状态。
+- 2026-03-26 - 后端 - Step4 分镜任务完成后自动写回对应分集 `storyboard`，并同步更新 `episodes[].storyboardTaskStatus/storyboardTaskId/storyboardTaskError`，失败状态同样持久化。
+- 2026-03-26 - 前端 - Step4 分镜生成改为任务模式：点击“生成分镜”后启动后端任务并轮询状态，离开页面、刷新、切换集数后返回仍可看到“生成中/已完成/失败”并自动回填结果。
+- 2026-03-26 - 验证 - 前端执行 `npm run typecheck && npm run lint -- --quiet` 通过；后端执行 `python3 -m py_compile backend/app/api/script.py backend/app/schemas/script.py` 通过；按规范执行 `docker compose up -d --build backend frontend` 后健康检查 `http://127.0.0.1:8003/health` 与 `http://127.0.0.1:3001` 返回 200。
+- 2026-03-23 - 验证 - 后端 `python3 -m py_compile backend/app/api/final.py` 通过；前端 `npx eslint "src/app/projects/[id]/script/video/page.tsx" src/lib/api.ts` 与 `npm run typecheck` 通过。
+- 2026-03-23 - 前端 - Step5 音效编辑区改为“同一视频预览 + 下方标签内容切换”：环境音效/特效/台词/bgm 共用同一个上方视频，不随标签切换重置。
+- 2026-03-23 - 验证 - 前端执行 `npx eslint "src/app/projects/[id]/script/video/page.tsx"` 与 `npm run typecheck` 通过；按规范执行 `docker compose up -d --build backend frontend` 后健康检查 `http://127.0.0.1:8003/health` 与 `http://127.0.0.1:3001` 返回 200。
+- 2026-03-23 - 前端 - Step5 环境音效截取交互修复：新增/拖动截取点改为实时更新分段数量与分段位置，不再在编辑阶段拦截非法时长，时长约束改为“应用截取点/生成音效”阶段校验。
+- 2026-03-23 - 前端 - 清理 `VideoPointSelector` 中未使用的 `onInvalidChange` 参数，保持组件接口与实际逻辑一致。
+- 2026-03-23 - 验证 - 前端执行 `npx eslint "src/app/projects/[id]/script/video/page.tsx"` 与 `npm run typecheck` 通过；按规范执行 `docker compose up -d --build backend frontend` 后健康检查 `http://127.0.0.1:8003/health` 与 `http://127.0.0.1:3001` 返回 200。
+- 2026-03-23 - 前端 - Step5 标签切换行为调整：仅保留上方视频区域固定不变；从截取进度条开始至下方功能随标签切换显示，避免非“环境音效”标签继续展示截取编辑逻辑。
+- 2026-03-23 - 验证 - 前端执行 `npx eslint "src/app/projects/[id]/script/video/page.tsx"` 与 `npm run typecheck` 通过；按规范执行 `docker compose up -d --build backend frontend` 后健康检查 `http://127.0.0.1:8003/health` 与 `http://127.0.0.1:3001` 返回 200。
+- 2026-03-23 - 验证 - 按规范执行 `docker compose up -d --build backend frontend` 后健康检查 `http://127.0.0.1:8003/health` 与 `http://127.0.0.1:3001` 返回 200。
+- 2026-03-23 - 修复 - Step5 二次生成复用判定放宽：区间比较容差调整为 0.2 秒，且已完成任务在同分段同提示词下允许直接复用，避免前端显示相同参数但后端误判为新任务。
+- 2026-03-26 - 后端 - Step4 分镜后台任务执行改为流式聚合生成，避免长文本场景下一次性非流式请求超时导致任务中断无结果。
+- 2026-03-26 - 后端 - Step4 分镜任务状态查询增加持久化兜底：内存任务不存在时回查 `episodes[].storyboardTaskId` 并返回 `running/completed/failed`，减少刷新或进程重启后的“任务丢失”。
+- 2026-03-26 - 前端 - Step4 集标题栏按钮状态与任务状态绑定：`storyboardTaskStatus=running` 时持续显示“生成中...”；失败时在按钮旁展示失败原因，避免无提示回落到“生成分镜”。
+- 2026-03-26 - 验证 - 前端执行 `npm run typecheck && npm run lint -- --quiet` 通过；后端执行 `python3 -m py_compile backend/app/api/script.py backend/app/schemas/script.py` 通过；按规范执行 `docker compose up -d --build backend frontend` 后健康检查 `http://127.0.0.1:8003/health` 与 `http://127.0.0.1:3001` 返回 200。
+- 2026-03-23 - 修复 - Step5 生成音效新增公网地址失败兜底：当 `generate-sfx` 创建新任务前无法得到公网 `video_url` 且存在同分段同提示词历史任务时，优先回查历史 `task_id` 并复用结果，避免抛出“缺少 SFX_REMOTE_UPLOAD_PASSWORD”。
+- 2026-03-23 - 验证 - 后端 `python3 -m py_compile backend/app/api/final.py` 通过；前端 `npx eslint "src/app/projects/[id]/script/video/page.tsx" src/lib/api.ts` 与 `npm run typecheck` 通过。
+- 2026-03-23 - 验证 - 按规范执行 `docker compose up -d --build backend frontend` 后健康检查 `http://127.0.0.1:8003/health` 与 `http://127.0.0.1:3001` 返回 200。
+- 2026-03-23 - 修复 - Step5 同参数二次“生成音效”复用策略增强：当分段/提示词/ASMR/区间与上次一致且已有 `sfx_task_id` 时，允许在 `completed` 状态继续复用任务查询，避免二次点击强制走新建任务路径触发公网地址配置报错。
+- 2026-03-23 - 修复 - Step5 任务超时判定收敛为仅处理 `processing/pending/running/queued/waiting` 状态，避免已完成任务因历史时间戳被误判超时。
+- 2026-03-23 - 修复 - Step5 复用已完成任务但暂未取到媒体地址时，后端回写 `completed` 并直接返回，避免同参数重复点击报 400。
+- 2026-03-23 - 验证 - 后端 `python3 -m py_compile backend/app/api/final.py` 通过；前端 `npx eslint "src/app/projects/[id]/script/video/page.tsx" src/lib/api.ts` 与 `npm run typecheck` 通过。
+- 2026-03-23 - 验证 - 按规范执行 `docker compose up -d --build backend frontend` 后健康检查 `http://127.0.0.1:8003/health` 与 `http://127.0.0.1:3001` 返回 200。
+- 2026-03-23 - 后端 - Step5 新增接口 `/episodes/audio-pipeline/apply-sfx-segments`：按截取点切分当前集视频并上传到服务器，使用固定分段文件名实现同集重复应用时覆盖远端分段视频。
+- 2026-03-23 - 前端 - Step5 “应用截取点”改为纯本地生效：不再调用服务端切分/上传接口，仅标记截取点并在本地计算分段与时长。
+- 2026-03-23 - 前端 - Step5 本地应用截取点后自动校正当前选中段索引，保证增删截取点后段位与展示一致。
+- 2026-03-23 - 验证 - 前端执行 `npx eslint "src/app/projects/[id]/script/video/page.tsx"` 与 `npm run typecheck` 通过；按规范执行 `docker compose up -d --build backend frontend` 后健康检查 `http://127.0.0.1:8003/health` 与 `http://127.0.0.1:3001` 返回 200。
+- 2026-03-23 - 前端 - Step5 在“清空截取点”同一行最右侧新增“应用截取点”按钮，接入新接口并增加应用中状态提示与分段时长校验。
+- 2026-03-23 - 前端 - Step5 音效编辑区新增“已应用截取点上传”结果展示，支持回看每段已上传视频地址对应的播放器。
+- 2026-03-26 - 前端 - Step4 集标题栏移除“生成分镜”按钮旁自动失败文案展示，避免未点击生成时因历史失败状态直接显示红字报错；失败信息仅保留在消息提示流中。
+- 2026-03-26 - 验证 - 前端执行 `npm run typecheck && npm run lint -- --quiet` 通过；按规范执行 `docker compose up -d --build backend frontend` 后健康检查 `http://127.0.0.1:8003/health` 与 `http://127.0.0.1:3001` 返回 200。
+- 2026-03-23 - 验证 - 后端 `python3 -m py_compile backend/app/api/final.py` 通过；前端 `npx eslint "src/app/projects/[id]/script/video/page.tsx" src/lib/api.ts` 与 `npm run typecheck` 通过；按规范执行 `docker compose up -d --build backend frontend` 后健康检查 `http://127.0.0.1:8003/health` 与 `http://127.0.0.1:3001` 返回 200；全量 `npm run lint` 仍显示历史问题（非本次改动引入）。
+- 2026-03-23 - 修复 - Step5 音效公网发布链路增加强校验：当检测到 `SFX_REMOTE_UPLOAD_*` 仅部分配置时，后端直接返回缺失项清单，避免点击“生成音效”仅出现笼统报错。
+- 2026-03-23 - 运维 - `docker-compose.yml` 为 backend 增加远程上传默认公网目标（`SFX_REMOTE_UPLOAD_HOST=39.105.213.147`、`SFX_REMOTE_PUBLIC_BASE_URL=http://39.105.213.147:8081/kling-static`），减少容器重建后配置回空导致的 Step5 失败。
+- 2026-03-23 - 验证 - 后端 `python3 -m py_compile backend/app/api/final.py` 通过；前端 `npm run typecheck` 通过；`npm run lint` 仍有历史 error `src/app/page.tsx:16 react-hooks/set-state-in-effect`（非本次改动引入）；按规范执行 `docker compose up -d --build backend frontend` 后健康检查 `http://127.0.0.1:8003/health` 与 `http://127.0.0.1:3001` 返回 200；容器内 `_publish_static_to_remote('/static/audio_pipeline/upload_probe.txt')` 返回“缺少 SFX_REMOTE_UPLOAD_PASSWORD”，定位当前阻塞为远程上传密码未注入。
+- 2026-03-23 - 后端 - Step5 音效生成容错增强：当历史 `sfx_clip_video_url` 对应文件丢失时，不再直接报错，自动回退为重新截取区间视频并继续合成，避免“任务完成但无可播视频”。
+- 2026-03-23 - 后端 - Step5 历史版本回填新增文件存在性校验：仅在历史 `sfx_video_url` 可解析且文件存在时迁移到 `sfx_segment_results`，避免展示不可播放的空壳版本卡。
+- 2026-03-23 - 验证 - 后端 `python3 -m py_compile backend/app/api/final.py` 通过；前端 `npm run typecheck` 通过；`npm run lint` 仍有历史 error `src/app/page.tsx:16 react-hooks/set-state-in-effect`（非本次改动引入）；按规范执行 `docker compose up -d --build backend frontend` 后健康检查 `http://127.0.0.1:8003/health` 与 `http://127.0.0.1:3001` 返回 200。
+- 2026-03-23 - 前端 - Step5 截取点新增容错：当当前时间与已有截取点重合时，自动回退到最长分段中点添加，避免“点击添加无变化”。
+- 2026-03-23 - 前端 - Step5 环境音效草稿状态更新改为基于 `prev` 合并，修复 `onSelectSegment/onChange/提示词输入` 对新截取点的覆盖回滚问题。
+- 2026-03-23 - 验证 - 前端执行 `npx eslint "src/app/projects/[id]/script/video/page.tsx"` 与 `npm run typecheck` 通过；按规范执行 `docker compose up -d --build backend frontend` 后健康检查 `http://127.0.0.1:8003/health` 与 `http://127.0.0.1:3001` 返回 200。
+- 2026-03-23 - 前端 - Step3 素材版本卡移除“＋/－”按钮，仅保留右上角删除与右下角选中操作。
+- 2026-03-23 - 后端 - Step5 音效版本兼容旧数据：`extract` 初始化补齐 `sfx_video_url/sfx_segment_results`，`generate-sfx` 自动将历史顶层 `sfx_video_url` 迁移进版本列表，避免旧版第1段音效视频在版本视图丢失。
+- 2026-03-26 - 后端 - Step4 `GET /projects/{id}/segments` 响应构建增加空值容错：对 `segment/status/video_url/task_id/prompt` 统一做安全转换，避免历史脏数据触发响应模型校验异常导致 500。
+- 2026-03-26 - 后端 - Step4 `POST /projects/{id}/segments/generate` 解析上游返回增强健壮性：`data` 为数组时先校验元素类型再读取 `url`，避免非字典元素触发服务端异常。
+- 2026-03-26 - 后端 - Step4 Kling 任务轮询异常由 `print` 改为结构化日志，便于定位“视频生成失败”原因并避免控制台噪音。
+- 2026-03-26 - 验证 - 前端执行 `npm run typecheck && npm run lint -- --quiet` 通过；后端执行 `python3 -m py_compile backend/app/api/segments.py backend/app/api/script.py backend/app/schemas/segments.py` 通过；按规范执行 `docker compose up -d --build backend frontend` 后健康检查 `http://127.0.0.1:8003/health` 与 `http://127.0.0.1:3001` 返回 200。
+- 2026-03-23 - 前端 - Step5 音效版本展示新增旧字段回填：当 `sfx_segment_results` 未包含历史结果时，自动回填 `sfx_video_url` 为“版本1”显示。
+- 2026-03-23 - 验证 - 后端 `python3 -m py_compile backend/app/api/final.py` 通过；前端 `npm run typecheck` 通过；`npm run lint` 仍有历史 error `src/app/page.tsx:16 react-hooks/set-state-in-effect`（非本次改动引入）；按规范执行 `docker compose up -d --build backend frontend` 后健康检查 `http://127.0.0.1:8003/health` 与 `http://127.0.0.1:3001` 返回 200。
+- 2026-03-23 - 前端 - Step3 素材版本卡新增右上角“＋/－/删除”操作与右下角“选中”按钮，支持按版本选中、快速新增版本与删除版本。
+- 2026-03-23 - 前端 - Step4 素材选择弹窗改为仅展示“已选中且有图”的素材版本，避免未选中素材进入分镜素材列表。
+- 2026-03-23 - 前端 - 角色形象生成链路改为强制使用对应角色“已选中”素材图进行图生图，未选中时阻断并提示先选图。
+- 2026-03-23 - 验证 - 前端执行 `npm run typecheck` 通过；`npm run lint` 结果为 1 个历史 error（`src/app/page.tsx:16 react-hooks/set-state-in-effect`，非本次改动引入）+ 若干历史 warning；按规范执行 `docker compose up -d --build backend frontend` 后健康检查 `http://127.0.0.1:8003/health` 与 `http://127.0.0.1:3001` 均返回 200。
+- 2026-03-22 - 验证 - 前端 `npx eslint src/app/projects/[id]/script/assets/page.tsx src/app/projects/[id]/script/video/page.tsx src/lib/api.ts` 无 error（仅历史 warning）；全量 `npm run lint` 仍存在历史 error `src/app/page.tsx:16 react-hooks/set-state-in-effect`（非本次改动引入）；按规范重建 `docker compose up -d --build backend frontend` 后健康检查 `http://127.0.0.1:8003/health` 与 `http://127.0.0.1:3001` 均返回 200。
+- 2026-03-22 - 修复 - Step5 同分段音效生成改为版本累积：后端停止删除同分段历史结果与历史文件，新增 `version` 字段并按分段递增；新生成文件名追加时间戳避免覆盖旧版本。
+- 2026-03-22 - 修复 - Step5 前端音效结果展示支持同分段多版本，卡片标题显示“第N段音效视频 · 版本M”，并按分段+版本稳定排序。
+- 2026-03-22 - 修复 - Step5 前端完成态判断增加处理中状态拦截，避免新任务刚提交时被旧版本命中导致“直接显示成功”。
+- 2026-03-22 - 修复 - Step3 素材区改为展示全量版本，不再仅显示最新图；每张图显示“版本N”，并保留逐版本 AI 修改入口。
+- 2026-03-22 - 修复 - Step5 Kling 响应解析增强：`task_result.audios[]` 兼容 `url_mp3/url_wav/mp3_url/wav_url`，避免仅识别 `url/audio_url` 导致已完成任务被误判无可用媒体。
+- 2026-03-22 - 修复 - Step5 媒体回退增强：当音频字段缺失时，补充兼容 `task_result.videos[].url/video_url` 作为可下载媒体地址，避免接口返回视频结果时流程中断。
+- 2026-03-23 - 后端 - Step5 应用截取点链路调整为“先本机落盘再可选公网发布”：`apply-sfx-segments` 不再强依赖 `SFX_REMOTE_UPLOAD_PASSWORD`，默认直接使用本机 `/static` 分段地址作为返回结果，避免本地环境被远程上传配置拦截。
+- 2026-03-23 - 后端 - Step5 应用截取点结果新增 `public_video_url` 字段：当公网地址可解析时返回公网可访问地址，否则自动回退为本机静态地址。
+- 2026-03-23 - 验证 - 后端 `python3 -m py_compile backend/app/api/final.py` 通过；前端 `npx eslint "src/app/projects/[id]/script/video/page.tsx" src/lib/api.ts` 与 `npm run typecheck` 通过。
+- 2026-03-23 - 验证 - 按规范执行 `docker compose up -d --build backend frontend` 后健康检查 `http://127.0.0.1:8003/health` 与 `http://127.0.0.1:3001` 返回 200。
+- 2026-03-22 - 运维 - 代码变更后按规范执行 `docker compose up -d --build backend frontend`，并重新注入 `SFX_REMOTE_UPLOAD_*` 变量。
+- 2026-03-22 - 验证 - 后端 `python3 -m py_compile backend/app/api/final.py` 通过；前端 `npm run typecheck` 通过；健康检查 `http://127.0.0.1:8003/health` 与 `http://127.0.0.1:3001` 返回 200；`npm run lint` 仍有历史问题（非本次改动引入）。
+- 2026-03-23 - 后端 - 修复 Step5 生成音效 ElevenLabs 端点兼容性：`text_to_sound_effect` 优先调用 `/v1/sound-generation`，并对旧端点 `/v1/text-to-sound-effects/convert` 保留 404 回退，避免点击“生成音效”直接报错 `{"detail":"Not Found"}`。
+- 2026-03-23 - 验证 - 后端执行 `python3 -m py_compile app/services/eleven_labs.py` 通过；并通过 Python 直连验证 `eleven_labs_service.text_to_sound_effect(text='测试风雪声', duration_seconds=1.0)` 成功返回音频内容。
+- 2026-03-23 - 验证 - 按规范执行 `docker compose up -d --build backend frontend`，健康检查 `http://127.0.0.1:8003/health` 与 `http://127.0.0.1:3001` 均返回 200；前端执行 `npm run typecheck` 通过，`npm run lint` 仍存在历史问题（非本次改动引入）。
+- 2026-03-28 - 后端 - 修复 Step5 ElevenLabs 语音转文字：`speech_to_text` 多部分表单字段由 `audio` 改为官方要求的 `file`，解决 `Must provide either file or a URL parameter`。
+- 2026-03-28 - 后端 - 放宽 Step3 Nano Banana / GRSAI 生图超时：`GRSAI_DRAW_TIMEOUT_SECONDS` 默认由 300s 提升至 900s，连接超时 30s；`GRSAI_POLL_MAX_ATTEMPTS` 默认由 240 提升至 450（约 15 分钟轮询窗口），降低长耗时生图被误判超时概率。
+- 2026-03-28 - 验证 - 本地执行 `python3 -m py_compile backend/app/services/eleven_labs.py backend/app/services/linkapi.py` 通过。
+- 2026-03-28 - 后端 - Step3 AI 修改参考图解析：`assets.generate_asset` 中 `_resolve_remote_reference_url` 在无历史「纯外链」版本时回退保留原 ref（含 `/static/`、`data:image`），交由 `linkapi._resolve_image_url` 与 `PUBLIC_BASE_URL`/`KLING_PUBLIC_BASE_URL` 拼接或上传，避免误报「请先生成素材」。
+- 2026-03-28 - 前端 - Step3 AI 修改：本地/内嵌参考图在无历史外链版本时仍提交生成请求，与后端新逻辑一致。
+- 2026-03-28 - 验证 - 后端 `python3 -m compileall backend/app/api/assets.py` 通过；前端 `npm run typecheck` 通过；按规范执行 `docker compose up -d --build backend frontend` 后健康检查 `http://127.0.0.1:8003/health` 与 `http://127.0.0.1:3001` 返回 200。
+- 2026-03-28 - 后端 - 可选接入腾讯云 COS：`cos-python-sdk-v5`、`app/services/media_storage.py`；`Settings` 增加 `TENCENT_COS_*` 环境变量；启用后 Step3 素材/上传、分镜图与分镜视频（含 Kling 外链镜像）、TTS 音频、保存剧本快照、Step5 合并与音轨管线产出文件均上传 COS 并在元数据中记录公网 URL；未配置时行为与原先仅 `/static` 一致。
+- 2026-03-28 - 后端 - `final.py` 支持 `https` 音视频地址参与 ffprobe/ffmpeg 与 `load_media_bytes` 转写；`next.config.ts` 增加 `**.myqcloud.com` 图片域名。
+- 2026-03-28 - 验证 - 后端 Docker 构建安装 `cos-python-sdk-v5` 成功；`docker compose up -d --build backend frontend` 后健康检查 `http://127.0.0.1:8003/health` 与 `http://127.0.0.1:3001` 返回 200。
+- 2026-03-28 - 后端 - Nano Banana / GRSAI 生图：`create_image` 对上游 `timeout`/`gemini`/5xx/429 等可重试错误增加可配置整单重试（`GRSAI_IMAGE_MAX_RETRIES`、`GRSAI_IMAGE_RETRY_DELAY_SECONDS`）；轮询默认上限由 450 调至 600 次（可用 `GRSAI_POLL_MAX_ATTEMPTS` 覆盖），缓解线上「google gemini timeout」类偶发失败。
+- 2026-03-28 - 配置 - 本地 `backend/.env`（gitignore）补充腾讯云 COS 与 `PUBLIC_BASE_URL`、上述 GRSAI 生图重试/超时变量示例；线上需同步同套环境变量并重建后端容器。
+- 2026-03-28 - 运维 - 通过 rsync 将最新代码部署到线上 `82.156.124.215:/opt/video-gen`，追加 COS 密钥与 GRSAI 重试变量到服务器 `backend/.env`；`docker compose up -d --build backend frontend` 成功，线上后端/前端/Nginx 均 200；COS SDK 验证 `list_buckets` OK，`duanju0328-1416866589` 桶存在；实际上传 `duanju/deploy-test/` 健康检查文件并公网读取成功；`cos_enabled()` 返回 `True`；`PUBLIC_BASE_URL` 线上机器配置为 `http://82.156.124.215`（无端口 → 默认 80，由 Nginx 托管）。
+- 2026-03-28 - 运维 - `nginx.conf`：为根路径增加 `resolver 127.0.0.11` + 变量 `proxy_pass` 到 `frontend:3000`，避免仅重建 frontend/backend 后 Nginx 仍解析到旧容器 IP 导致 502；`client_max_body_size 50m` 缓解 ElevenLabs 克隆等上传触发 413；`/api/` 使用 `rewrite` 剥前缀 + `set $backend_pass http://backend:8000$uri...` 整段变量 `proxy_pass`（避免「变量 + 带路径的 proxy_pass」不剥 `/api` 及 `rewrite break` 后拆 `$host` 为空）；已同步至线上并 `nginx -s reload`，在服务器上验证 `http://127.0.0.1:8088/` 与 `http://127.0.0.1:8088/api/health` 返回 200 与 `{"status":"ok"}`。
+- 2026-03-28 - 运维 - `docker-compose.yml`：Nginx 服务增加宿主机 `80:80` 映射（保留 `8088:80`），解决浏览器访问 `http://<公网IP>/` 默认走 80 端口却无监听导致的 `ERR_CONNECTION_REFUSED`；线上已 `docker compose up -d nginx` 并验证本机 `http://127.0.0.1:80/` 首页 200。
+- 2026-03-28 - 运维 - `nginx.conf`：`/api/` 改回 `proxy_pass http://backend:8000/;`（剥 `/api` 前缀）。此前 `rewrite break` 后 `set $backend_pass` + 变量 `proxy_pass` 在线上出现 `invalid URL prefix in ""` 导致 `/api/*` 全 500；重载后本机 `http://127.0.0.1:80/api/health` 与 `:8088` 均正常。**注意**：若仅重建 `backend` 容器而未重建/重启 `nginx`，可能出现连旧 backend IP 的 502，此时执行 `docker compose restart nginx` 即可。
+- 2026-03-28 - 后端 - GRSAI Nano Banana 结果轮询增加墙上时钟上限 `GRSAI_POLL_MAX_WALL_SECONDS`（默认 600s），与 `GRSAI_POLL_MAX_ATTEMPTS` 双保险，避免上游长期不返回终态时前端一直卡在「生成中」。
+- 2026-03-28 - 前端 - Step3 素材页：`sessionStorage` 持久化进行中的生成任务（按项目 + 素材 `sourceAssetId` + 版本 id 快照），`loadAssets` 与每 3s 轮询根据新版本自动清除；生成状态键改为 `getAssetIdentityKey`，与合并展示一致；请求超时保留待恢复任务并提示自动刷新；`loadAssets` 支持 `preserveError` 避免轮询清掉用户错误提示；素材生成 HTTP 超时调至 660000ms 与后端墙上时限对齐。
+- 2026-03-28 - 验证 - `python3 -m py_compile backend/app/services/linkapi.py` 通过；前端 `npm run typecheck` 通过；按规范执行 `docker compose up -d --build backend frontend` 后 `http://127.0.0.1:8003/health` 与 `http://127.0.0.1:3001` 返回 200。
+- 2026-03-28 - 前端 - Step3 生成中状态：pending 记录改为合并卡片下全部 `sourceAssetIds` 的版本 id 并集快照，`reconcile` 任一同组素材出现新版本即清除；`generate` HTTP 成功返回后立即按 `uiKey` 移除 pending（避免接口已成功但 `loadAssets`/对账异常导致永久「生成中」）；`removePending`/`push` 按 `uiKey` 去重；sessionStorage 键升级为 `duanju-asset-gen-pending-v2` 并兼容读取旧单 `sourceAssetId` 字段。
+- 2026-03-28 - 验证 - 前端 `npm run typecheck` 通过。
+- 2026-03-28 - 运维 - 域名 `zichang.fun` HTTPS 配置：`nginx.conf` 增加 `server` 监听 `443 ssl`（挂载 `zichang.fun.pem` + `zichang.fun.key`）；`docker-compose.yml` 增加 `443:443` 端口映射和证书文件卷挂载；`80` 对 `zichang.fun/www.zichang.fun` 返回 `301 -> https://$host` 重定向，`80` 对 `localhost/127.0.0.1` 保持原有 HTTP 直连逻辑并设为 `default_server`；证书与 `nginx.conf` 已同步至线上，HTTPS 验证 `https://zichang.fun/api/health` 返回 `{"status":"ok"}`。
+- 2026-03-28 - 验证 - 线上 `https://zichang.fun/api/health` → 200；`localhost:80` → 200；`localhost:8088` → 200；`http://zichang.fun/` → 301。
+- 2026-03-28 - 后端 - GRSAI 绘画请求对齐文档：`nano-banana-2-4k-cl` / `nano-banana-pro-4k-vip` 强制 `imageSize=4K`（此前默认 1K 违反文档「只支持 4k」易导致任务久不结束）；`nano-banana-2-cl` / `nano-banana-pro-vip` 限制为 1K/2K；`create_image` 使用 `payload.model` 并经 `_normalize_grsai_draw_model` 映射（如 `nanoBanana2`→`nano-banana-2-4k-cl`，含 `gemini`+`image` 或 `google/`+`flash` 的展示名→`nano-banana-fast`）；`assets.generate` 透传前端 `payload.model`。
+- 2026-03-28 - 验证 - `python3 -m py_compile backend/app/services/linkapi.py backend/app/api/assets.py` 通过。
+- 2026-03-28 - 修复 - `assets.generate_asset` 日志仍引用已删除的局部变量 `model`，触发 `NameError` 导致素材生成接口立即 500；改为使用 `request_payload.get("model")` 记录日志。
+- 2026-03-28 - 验证 - `python3 -m py_compile backend/app/api/assets.py` 通过。
+- 2026-03-28 - 后端 - 图生图：`create_image` 在存在 `urls` 时默认将 http(s) 参考图在后端下载并内联为 `data:image/...;base64,...`（`GRSAI_I2I_INLINE_REFS` 默认开启，可用环境变量关闭/调 `GRSAI_I2I_REF_FETCH_TIMEOUT_SECONDS`、`GRSAI_I2I_INLINE_MAX_BYTES`），避免 GRSAI 侧拉 COS/自建域名过慢导致整单超时；有参考图时 `httpx` 读超时下限由 `GRSAI_DRAW_TIMEOUT_I2I_FLOOR_SECONDS`（默认 1200s）抬高。
+- 2026-03-28 - 前端 - `generateAsset` 在带 `ref_image_url` 时使用 960000ms 超时，与图生图耗时对齐。
+- 2026-03-28 - 修复 - 素材页 `runGenerate`：超时（Abort）时原先不执行 `removePendingAssetGenJob`，导致 sessionStorage 里 pending 残留、`reconcilePendingJobs` 永久把按钮标为「生成中」；改为 `finally` 始终移除 pending 并依赖 `loadAssets` 对账；超时同时 `setStatus(null)`。
+- 2026-03-28 - 后端 - GRSAI 轮询：若 `status=running` 且 `progress` 连续约 30 次轮询（默认 60s）不变则立即失败并返回明确文案（参考图/COS/队列）；`create_image` 日志增加 `user_id` 与 `ref_preview` 便于区分用户与参考图 URL。
+- 2026-03-28 - 验证 - `python3 -m py_compile backend/app/services/linkapi.py` 通过；前端 `npm run typecheck` 通过。
+- 2026-03-28 - 修复 - 图生图：删除上次错误添加的 Base64 内联逻辑（`_try_inline_single_ref_for_grsai`/`_inline_refs_for_grsai_if_enabled`），GRSAI 文档明确支持 http(s) URL 作为 urls，Base64 data URL 可能导致任务卡在 running 状态；直接透传经 `_resolve_image_url` 处理过的 COS 公网 URL；httpx 读超时默认改为 180s（上限 300s）；前端图生图超时改为 180000ms（3 分钟）；POST 和轮询均加详细日志打印原始响应；轮询最大时长上限改为 200s；失败不重试，直接抛出错误详情。
+- 2026-03-28 - 增强日志 - 图生图：POST `/v1/draw/nano-banana` 返回后立即打印 `status + body`（最多 2000 字符）；轮询 `/v1/draw/result` 每次都打印 `attempt + status + body`（最多 1000 字符）；确保 GRSAI 真实失败原因（error/failure_reason）能透传到前端。
+- 2026-03-28 - 验证 - `python3 -m py_compile backend/app/services/linkapi.py` 通过；前端 `npm run typecheck` 通过；`docker compose up -d --build backend frontend` + `nginx restart` 成功；`https://zichang.fun/api/health` → `{"status":"ok"}`。
+- 2026-03-28 - 修复 - GRSAI 轮询：`data.error` 非空（如 `google gemini timeout...`）即立即抛出，不再等 60s 停滞检测；`data.failure_reason` 非空也立即抛出；`status=failed/error` 时优先用 `failure_reason`；代码已部署，服务器内 httpx 直测确认旧失败任务 `status=failed error=google gemini timeout...`。
+- 2026-03-28 - 根因确认 - 163 账号文生图/图生图均失败：GRSAI 返回 `"error":"google gemini timeout..."`（底层 Gemini 超时），与我们代码无关，是 GRSAI 服务端问题，需联系 GRSAI 官方排查 Key 的 Gemini 调用配额/超时配置；同一 GRSAI Key 你的账号能成功可能因时区/队列位置差异。
+- 2026-03-28 - 待确认 - 4K 图片存储后约 1.x MB：`media_storage.mirror_http_url_to_cos` 直接用 `resp.content` 上传，无二次压缩；可能是 `nano-banana-2-4k-cl` 模型返回的 JPEG 格式本身文件体积小，需向 GRSAI 官方确认该模型实际输出分辨率与文件格式。
+
+- 2026-03-29 - 后端 - `/linkapi/models`：`fetch_models` 返回 GRSAI 文档所列 10 个绘画 `model`（`nano-banana-2` / `nano-banana-2-cl` / `nano-banana-2-4k-cl` / `nano-banana-fast` / `nano-banana` / `nano-banana-pro` / `nano-banana-pro-vt` / `nano-banana-pro-cl` / `nano-banana-pro-vip` / `nano-banana-pro-4k-vip`），条目带 `kind: draw`；文本模型带 `kind: chat`。
+- 2026-03-29 - 后端 - `_normalize_grsai_draw_model` 显式支持文档中的 `nano-banana`（无前缀 `-` 的 id）；`status=failed/error` 时失败详情优先取 `data.error`。
+- 2026-03-29 - 后端 - GRSAI 轮询停滞报错文案补充「Gemini 超时、换 fast 模型、以 result.error 为准」。
+- 2026-03-29 - 前端 - Step3 素材页：`loadConfig` 调用 `getModels` + `extractDrawModels` 填充模型 `datalist`（保留 `nanoBanana2` 别名）；`models.ts` 新增 `extractDrawModels`，`filterModels(..., image)` 识别 `nano-banana`。
+- 2026-03-29 - 根因排查 - GRSAI 所有 key 均返回 `apikey error`：旧服务端 key（`SUCHUANG_API_KEY=GzCZM44e...`）是速创/SuCuang key，不适用于 GRSAI；数据库里用户保存的 AK/SK JSON 格式 key（`{"ak":"...","sk":"..."}`）同样不适配 GRSAI；1123 账号文生图「几乎每次 20s 内成功」与 GRSAI API 无关，可能是旧版 OpenRouter 端点或其他模型；163 账号失败原因相同——服务端从未配置有效 GRSAI Key。
+- 2026-03-29 - 配置修复 - 用户提供真实 GRSAI Key `sk-102198ae546047a89f2f177365b1d159`（测试通过），写入 `backend/.env` `GRSAI_API_KEY`；腾讯云 COS bucket 设为公有读（`put_bucket_acl ACL=public-read`），图生图参考图现在可被 GRSAI 外网拉取。
+- 2026-03-29 - 模型实测（真实 Key，GRSAI 直测）：
+  - 文生图：10 个模型中 **8 个成功**，失败 2 个（`nano-banana-2-4k-cl` 超时约 130s 无终态；`nano-banana-pro-vt` 报 `google gemini timeout...`）。
+  - 图生图（参考图用 COS 公有读 URL）：5 个模型中 **2 个成功**（`nano-banana-2` 76s、`nano-banana-pro` 37s），其余 3 个均 `google gemini timeout...` 或超时不返图片 URL。
+  - 核心问题：GRSAI 底层 Google Gemini 存在偶发性超时，尤其是图生图（含参考图下载）更容易触发，**与模型数量/账号无关**；文生图成功率更高（8/10）。
+- 2026-03-29 - 验证 - `python3 -m py_compile backend/app/services/linkapi.py` 与 `npm run typecheck` 通过；`docker compose up -d --build backend` 后 `http://127.0.0.1:8003/health` 与 `http://127.0.0.1:3001` 返回 200；`GRSAI_API_KEY` 已写入本地 `backend/.env`（线上需同步）。
+- 2026-03-29 - 修复 - `_coerce_grsai_draw_image_size` 将 `nano-banana-2` 加入 1K/2K 限制分支（此前只有 `nano-banana-2-cl` 和 `nano-banana-pro-vip`，`nano-banana-2` 落入无约束分支，若前端选 4K 会透传给只支持 1K/2K 的模型导致任务卡住）；`docker compose up -d --build backend` + 健康检查 200。
+- 2026-03-29 - 修复 - 素材生成 `nano-banana-2` + 4K：后端 `assets.py` 停止 `pop("size")`，改为 `setdefault("size", "4K")` 透传给 linkapi；前端 `assets/page.tsx` 两处 `generateAsset` options 均加入 `size: "4K"`；`docker compose up -d --build backend frontend` + 健康检查 200。
+- 2026-03-29 - 前端 - Step3 素材页绘画模型由 `<input list>` + `<datalist>` 改为原生 `<select>`：datalist 在 Safari/部分环境下单击不弹出列表，表现为「点了没反应」；选项来自 `/linkapi/models` 的绘画模型列表，当前素材已保存且不在列表中的 model 会作为首项展示；`npm run typecheck` 通过；`docker compose up -d --build frontend` + `http://127.0.0.1:3001` 200。
+- 2026-03-29 - 后端 - GRSAI 绘画模型与产品约定对齐：`nano-banana-2-4k-cl` / `nano-banana-2-4k` 别名一律映射为 `nano-banana-2`，并在映射时 `payload.setdefault("size","4K")`，实际请求为 `model=nano-banana-2` + `imageSize=4K`，不再向 GRSAI 提交 `nano-banana-2-4k-cl`；`_coerce_grsai_draw_image_size` 中「仅 4K」分支去掉已不使用的 `nano-banana-2-4k-cl`；`segments` 首帧图默认改为 `nano-banana-2` + `size=4K`；`Settings.default_model_image` 默认改为 `nano-banana-2`；`docker compose up -d --build backend` + `/health` 200。
+- 2026-03-29 - 后端 - 强化禁止 `nano-banana-2-4k-cl`：`lower.startswith("nano-banana-2-4k")` 覆盖一切变体（避免未命中 `in {...}` 时落入 `startswith("nano-banana-")` 原样透传）；新增 `_outgoing_grsai_draw_model_must_be_nano_banana_2` 在组 HTTP 体前最后一道改写；日志增加 `raw_model` / `outgoing_model`；`/linkapi/models` 绘画列表移除 `nano-banana-2-4k-cl` 条目以免再次手选。
+
+
+- 2026-03-29 - 规范 - 新增 CodeBuddy 项目规则入口 `.codebuddy/rules/project_rules.md`（always 生效），保留 `.trae/rules/project_rules.md` 不变；同步更新 `RULES.md` 入口与三处规则语义一致约定。

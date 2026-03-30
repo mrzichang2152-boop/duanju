@@ -6,9 +6,8 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_current_user_id
-from app.core.db import get_db, SessionLocal
+from app.core.db import get_db
 from app.schemas.common import StatusResponse
-from app.schemas.script import AsyncTaskStatusResponse
 from app.schemas.segments import (
     SegmentFrameGenerateRequest,
     SegmentFrameGenerateResponse,
@@ -32,19 +31,10 @@ from app.services.segments import (
 )
 from app.services.settings import get_or_create_settings
 from app.services.kling_query import query_kling_task_status
-from app.services.async_tasks import (
-    create_async_task,
-    get_async_task,
-    mark_async_task_running,
-    mark_async_task_completed,
-    mark_async_task_failed,
-    parse_task_result,
-)
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
 OPENROUTER_IMAGE_MODEL = "nano-banana-2"
-_FRAME_TASK_TYPE = "FRAME_GENERATE"
 
 
 def _safe_int(value: object, default: int = 0) -> int:
@@ -226,7 +216,8 @@ async def generate_segments(
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"提交视频任务失败: {exc}") from exc
 
 
-async def _generate_segment_frame_image_sync(
+@router.post("/{project_id}/segments/frame-images/generate", response_model=SegmentFrameGenerateResponse)
+async def generate_segment_frame_image(
     project_id: str,
     payload: SegmentFrameGenerateRequest,
     user_id: str = Depends(get_current_user_id),
@@ -280,88 +271,6 @@ async def _generate_segment_frame_image_sync(
         abs_path = os.path.join(media_storage.backend_static_dir(), rel)
         local_url = await media_storage.publish_local_file_under_static(project_id, abs_path)
     return SegmentFrameGenerateResponse(image_url=local_url)
-
-
-async def _run_frame_generate_task(task_id: str) -> None:
-    async with SessionLocal() as db:
-        task = await get_async_task(db, task_id=task_id)
-        if not task:
-            return
-        try:
-            await mark_async_task_running(db, task)
-            payload_data: dict[str, object] = {}
-            if task.payload_json:
-                payload_data = json.loads(task.payload_json)
-            req_payload = SegmentFrameGenerateRequest(**(payload_data.get("payload") or {}))
-            result = await _generate_segment_frame_image_sync(
-                project_id=str(task.project_id),
-                payload=req_payload,
-                user_id=str(task.user_id),
-                db=db,
-            )
-            await mark_async_task_completed(db, task, {"image_url": result.image_url})
-        except Exception as exc:
-            await mark_async_task_failed(db, task, str(exc))
-
-
-@router.post("/{project_id}/segments/frame-images/generate", response_model=AsyncTaskStatusResponse)
-async def generate_segment_frame_image(
-    project_id: str,
-    payload: SegmentFrameGenerateRequest,
-    user_id: str = Depends(get_current_user_id),
-    db: AsyncSession = Depends(get_db),
-) -> AsyncTaskStatusResponse:
-    project = await get_project(db, user_id, project_id)
-    if not project:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="项目不存在")
-    prompt = str(payload.prompt or "").strip()
-    if not prompt:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="提示词不能为空")
-    task = await create_async_task(
-        db,
-        project_id=project_id,
-        user_id=user_id,
-        task_type=_FRAME_TASK_TYPE,
-        payload={"payload": payload.model_dump() if hasattr(payload, "model_dump") else payload.dict()},
-    )
-    asyncio.create_task(_run_frame_generate_task(task.id))
-    return AsyncTaskStatusResponse(
-        task_id=task.id,
-        project_id=project_id,
-        task_type=_FRAME_TASK_TYPE,
-        status="RUNNING",
-        result=None,
-        error=None,
-    )
-
-
-@router.get("/{project_id}/segments/frame-images/tasks/{task_id}", response_model=AsyncTaskStatusResponse)
-async def get_segment_frame_image_task_status(
-    project_id: str,
-    task_id: str,
-    user_id: str = Depends(get_current_user_id),
-    db: AsyncSession = Depends(get_db),
-) -> AsyncTaskStatusResponse:
-    project = await get_project(db, user_id, project_id)
-    if not project:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="项目不存在")
-    task = await get_async_task(
-        db,
-        task_id=task_id,
-        project_id=project_id,
-        user_id=user_id,
-        task_type=_FRAME_TASK_TYPE,
-    )
-    if not task:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="任务不存在")
-    return AsyncTaskStatusResponse(
-        task_id=task.id,
-        project_id=project_id,
-        task_type=task.task_type,
-        status=str(task.status or "PENDING").upper(),
-        result=parse_task_result(task),
-        error=(str(task.error or "").strip() or None),
-    )
 
 
 @router.put("/{project_id}/segments/{segment_id}/select", response_model=StatusResponse)

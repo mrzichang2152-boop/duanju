@@ -7,7 +7,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 import os
 
-from app.api import assets, auth, eleven_labs, final, fish_audio, health, linkapi, projects, script, segments, settings as settings_api, templates, voices
+from app.api import assets, auth, eleven_labs, final, health, linkapi, projects, script, segments, settings as settings_api, templates, voices
 from app.core.config import settings as app_settings
 from app.core.db import engine
 from app.models import Base
@@ -42,7 +42,6 @@ api_router.include_router(settings_api.router, prefix="/settings", tags=["settin
 api_router.include_router(linkapi.router, prefix="/linkapi", tags=["linkapi"])
 api_router.include_router(templates.router, prefix="/projects", tags=["templates"])
 api_router.include_router(eleven_labs.router, prefix="/eleven-labs", tags=["eleven-labs"])
-api_router.include_router(fish_audio.router, prefix="/fish-audio", tags=["fish-audio"])
 api_router.include_router(voices.router, prefix="/projects", tags=["voices"])
 
 app.include_router(api_router, prefix="/api")
