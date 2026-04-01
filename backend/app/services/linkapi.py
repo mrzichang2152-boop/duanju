@@ -1725,6 +1725,7 @@ async def _get_or_create_character_subject_id(
     project_id: str,
     item: dict[str, Any],
     force_create: bool = False,
+    allow_voice_fallback: bool = True,
 ) -> str:
     asset_id = str(item.get("asset_id", "")).strip()
     if not asset_id:
@@ -2047,11 +2048,27 @@ async def create_video(
     first_frame_asset_id = str(payload.get("first_frame_asset_id", "")).strip()
     custom_first_frame_url = str(payload.get("custom_first_frame_url") or "").strip()
     custom_last_frame_url = str(payload.get("custom_last_frame_url") or "").strip()
-    previous_segment_video_url = str(payload.get("previous_segment_video_url") or payload.get("reference_video_url") or "").strip()
+    previous_segment_video_url = str(payload.get("previous_segment_video_url") or "").strip()
+    reference_video_url = str(payload.get("reference_video_url") or payload.get("base_video_url") or "").strip()
+    reference_video_refer_type = str(payload.get("refer_type") or "base").strip().lower() or "base"
+    reference_video_keep_original_sound = str(payload.get("keep_original_sound") or "yes").strip().lower() or "yes"
+    raw_video_list = payload.get("video_list")
+    if isinstance(raw_video_list, list) and raw_video_list:
+        first_video_item = raw_video_list[0] if isinstance(raw_video_list[0], dict) else {}
+        if isinstance(first_video_item, dict):
+            if not reference_video_url:
+                reference_video_url = str(first_video_item.get("video_url") or "").strip()
+            if "refer_type" in first_video_item:
+                reference_video_refer_type = str(first_video_item.get("refer_type") or reference_video_refer_type).strip().lower() or "base"
+            if "keep_original_sound" in first_video_item:
+                reference_video_keep_original_sound = str(first_video_item.get("keep_original_sound") or reference_video_keep_original_sound).strip().lower() or "yes"
+    if not previous_segment_video_url and reference_video_refer_type == "feature":
+        previous_segment_video_url = reference_video_url
     model_text = str(model or "").strip()
     model_text_lower = model_text.lower()
     is_kling_model = model_text_lower.startswith("kling")
     is_kling_o1_model = model_text_lower == "kling-video-o1"
+    is_video_edit_mode = bool(reference_video_url)
     system_prompt = str(payload.get("system_prompt", "") or "").strip()
     raw_sound = str(payload.get("sound") or "").strip().lower()
     with_audio_requested = bool(payload.get("with_audio", False))
@@ -2140,6 +2157,35 @@ async def create_video(
             resolved_image_url = await _resolve_image_url(str(image_url))
             if resolved_image_url:
                 image_url = _normalize_kling_image_value(resolved_image_url)
+        raw_reference_images = payload.get("reference_images")
+        direct_reference_images: list[dict[str, Any]] = []
+        if isinstance(raw_reference_images, list):
+            for item in raw_reference_images:
+                if isinstance(item, str):
+                    resolved_ref_url = await _resolve_image_url(item)
+                    normalized_ref_url = _normalize_kling_image_value(str(resolved_ref_url or ""))
+                    if normalized_ref_url:
+                        direct_reference_images.append({"image_url": normalized_ref_url})
+                elif isinstance(item, dict):
+                    ref_url = str(item.get("image_url") or "").strip()
+                    if not ref_url:
+                        continue
+                    resolved_ref_url = await _resolve_image_url(ref_url)
+                    normalized_ref_url = _normalize_kling_image_value(str(resolved_ref_url or ""))
+                    if not normalized_ref_url:
+                        continue
+                    ref_obj: dict[str, Any] = {"image_url": normalized_ref_url}
+                    ref_type = str(item.get("type") or "").strip().lower()
+                    if ref_type in {"first_frame", "last_frame", "end_frame"}:
+                        ref_obj["type"] = "last_frame" if ref_type in {"last_frame", "end_frame"} else "first_frame"
+                    direct_reference_images.append(ref_obj)
+        if direct_reference_images:
+            data["reference_images"] = direct_reference_images
+            data["image_list"] = direct_reference_images
+            prompt_lines = ["【参考图片映射】"]
+            for index, _ in enumerate(direct_reference_images, start=1):
+                prompt_lines.append(f"参考图{index}：<<<image_{index}>>>")
+            data["prompt"] = f"{str(data.get('prompt', '')).strip()}\n" + "\n".join(prompt_lines)
 
     resolved_assets: list[dict[str, Any]] = []
     if is_kling_model and project_id and asset_bindings:
@@ -2275,11 +2321,6 @@ async def create_video(
             data["shot_type"] = payload.get("shot_type")
         if payload.get("multi_prompt"):
             data["multi_prompt"] = payload.get("multi_prompt")
-        data.pop("reference_video", None)
-        data.pop("reference_video_url", None)
-        data.pop("refer_type", None)
-        data.pop("keep_original_sound", None)
-
         existing_refs = data.get("reference_images")
         if isinstance(existing_refs, list):
             existing_refs = [item for item in existing_refs if isinstance(item, dict)]
@@ -2312,6 +2353,23 @@ async def create_video(
             existing_refs = [item for item in existing_refs if str(item.get("type", "")).strip().lower() != "first_frame"]
             existing_refs.insert(0, tail_frame_ref)
             image_url = tail_frame_b64
+
+        if is_video_edit_mode:
+            resolved_video_url = await _resolve_image_url(reference_video_url)
+            if not resolved_video_url:
+                raise RuntimeError("视频修改失败：当前分镜视频地址无效")
+            data["video_list"] = [
+                {
+                    "video_url": str(resolved_video_url).strip(),
+                    "refer_type": reference_video_refer_type if reference_video_refer_type in {"base", "feature"} else "base",
+                    "keep_original_sound": "yes" if reference_video_keep_original_sound == "yes" else "no",
+                }
+            ]
+            data["sound"] = "off"
+            data.pop("duration", None)
+            existing_refs = [item for item in existing_refs if str(item.get("type", "")).strip().lower() not in {"first_frame", "last_frame"}]
+            if "<<<video_1>>>" not in str(data.get("prompt", "")):
+                data["prompt"] = f"{str(data.get('prompt', '')).strip()}\n待编辑视频引用：<<<video_1>>>".strip()
         if existing_refs:
             data["reference_images"] = existing_refs
             data["image_list"] = existing_refs

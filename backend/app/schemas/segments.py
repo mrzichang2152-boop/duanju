@@ -9,6 +9,7 @@ class SegmentVersionResponse(BaseModel):
     prompt: Optional[str]
     status: str
     task_id: Optional[str] = None
+    task_status_msg: Optional[str] = None
     is_selected: bool
 
 
@@ -38,6 +39,7 @@ class SegmentFrameGenerateRequest(BaseModel):
     references: Optional[list[str]] = None
     frame_type: Optional[str] = "first"
     aspect_ratio: Optional[str] = "16:9"
+    model: Optional[str] = None
 
 
 class SegmentFrameGenerateResponse(BaseModel):

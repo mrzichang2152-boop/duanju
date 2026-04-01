@@ -1072,3 +1072,25 @@
 - 2026-04-01 - 前端 - 顶部右上角头像下拉菜单在“设置”下新增“退出登录”按钮，点击后清理 `shortplay_token` 与 `shortplay_email` 并跳转 `/login`。
 - 2026-04-01 - 数据 - 测试账号已更新为无序且好记的 10 个邮箱（`red@apple.fun` 等），统一密码 `123456`；线上实例 `82.156.124.215` 也已同步。
 - 2026-04-01 - 部署 - 已将本次前后端改动同步到 `82.156.124.215:/root/video-gen` 并执行 `docker compose up -d --build backend frontend nginx`，前端 `http://82.156.124.215/login` 返回 200，后端实例内健康检查 `http://127.0.0.1:8003/health` 返回 `{"status":"ok"}`。
+- 2026-04-01 - 前端 - 修复本地 Step3 创建主体 CORS 失败：`resolveApiBaseUrl` 在 `raw="/api"` 时不再强制转到 `http://localhost:8003/api`，统一走同源 `/api`（由 Next rewrites 代理后端）。
+- 2026-04-01 - 验证 - `read_lints frontend/src/lib/api.ts` 0 错误；`npm run dev` 启动成功（Local: http://localhost:3000, Ready）。
+- 2026-04-01 - 后端 - 修复 Step3 创建主体 500：`_get_or_create_character_subject_id` 补齐参数 `allow_voice_fallback`，与 `assets.py` 调用对齐，消除 `TypeError: unexpected keyword argument`。
+- 2026-04-01 - 验证 - 本地与线上后端均已重建：`docker compose up -d --build backend`；健康检查 `http://127.0.0.1:8003/health` 返回 `{"status":"ok"}`。
+- 2026-04-01 - Step4 - 在分镜表“视频生成”列新增“修改当前视频”功能：点击后弹窗展示当前视频（可播放），下方素材区按“角色/道具/场景”分Tab，输入框支持自然语言+素材引用（与首尾帧引用交互一致），可提交视频修改任务。
+- 2026-04-01 - 后端 - 扩展 Kling 视频参数：支持 `reference_video_url/base_video_url + video_list + refer_type + keep_original_sound`，并支持前端直传 `reference_images`；视频修改模式自动走 `video_list(refer_type=base)`，强制关闭生成音频，避免与首尾帧约束冲突。
+- 2026-04-01 - 验证 - `read_lints`(ScriptEditor.tsx/storyboard/page.tsx/linkapi.py) 0 错误；`python3 -m py_compile` 通过；本地 `npm run dev` 启动成功（Local: http://localhost:3000, Ready）；本地后端重建并健康检查 `http://127.0.0.1:8003/health` 返回 `{"status":"ok"}`。
+- 2026-04-01 - 部署 - 已同步并重建线上 `82.156.124.215:/root/video-gen`（`docker compose up -d --build backend frontend nginx`），线上 `/projects` 返回 200，实例内健康检查返回 `{"status":"ok"}`。
+- 2026-04-01 - Step4 - “修改当前视频”弹窗新增“保留原声”开关（默认开启）；提交修改时按开关传递 `keep_original_sound=yes/no`。
+- 2026-04-01 - 验证 - `read_lints` 检查 `ScriptEditor.tsx` 与 `storyboard/page.tsx` 均 0 错误；`npm run dev` 启动成功（Local: http://localhost:3000, Ready）。
+- 2026-04-01 - Step4 - 新增视频修改时长校验：点击“修改当前视频”时先读取视频 metadata，时长仅允许 3-10s，超出范围或读取失败会直接弹窗提示并阻止打开修改弹窗。
+- 2026-04-01 - 验证 - `read_lints frontend/src/app/components/ScriptEditor.tsx` 0 错误；`npm run dev` 启动成功（Local: http://localhost:3000, Ready）。
+- 2026-04-01 - Step4 - 在 `测试文件/step4 分镜脚本系统prompt` 新增 `PROMPT_STORYBOARD_V2` 测试版（未入系统），强化质量感/惯性、光影动态关联、眼睑微表情、运镜呼吸感，并压缩提示词长度。
+- 2026-04-01 - 验证 - 进行3轮规则覆盖测试：5项关键能力（质量感反作用/光影动态/眼睑微表情/运镜呼吸感/逻辑防乱序）均命中 5/5；新提示词长度较旧版减少约83.22%。
+- 2026-04-01 - Step4 - 在测试文件中补充三轮测试记录（5/5 命中）与新旧 prompt 长度对比（压缩约83.22%）。
+- 2026-04-01 - Step4 - 将测试文件中的分镜系统提示升级为 `PROMPT_STORYBOARD_V3`，补回连续性、台词秒段、相对位置、动作因果链、AssetID、自检等关键细节，并新增“备注优先描述可见物理反馈、避免抽象运动控制术语”的规则。
+- 2026-04-01 - 验证 - `测试文件/step4 分镜脚本系统prompt` lint 0 错误；13 项规则覆盖检测全部命中（13/13）。
+- 2026-04-01 - Step4 - 将测试文件中的分镜提示升级为 `PROMPT_STORYBOARD_V3.1`：把“可见物理反馈优先”并入“镜头调度与内容融合”，删除“输出前自检”，放宽分镜组织规则，明确场景切换必须在备注写清切换方式，并将“画面描述”限定为每个场景第一行。
+- 2026-04-01 - 验证 - `测试文件/step4 分镜脚本系统prompt` lint 0 错误；已确认文件中不存在“输出前自检”段落，且已包含“画面描述只用于每个场景的第一行”“逐句用文字写清角色名”“硬切到某场景”等新规则。
+- 2026-04-01 - Step4 - 将测试文件中的分镜提示升级为 `PROMPT_STORYBOARD_V3.2`：为抽象描述与非人物主体补充示例；放宽时间轴切分条件并删除 7~8 秒限制；恢复 `过程` 按 `1.0-3.1s` 这类秒段拆写，要求每小段都写运镜；将动作、惯性、可见物理反馈、表情微动作合并描述；明确只有画面不连贯时才需要重写 `起始/画面描述/场景`，并将“场景切换”统一改为“画面切换”。
+- 2026-04-01 - 验证 - `测试文件/step4 分镜脚本系统prompt` lint 0 错误；已确认文件包含新增示例、秒段格式 `1.0-3.1s`、`硬切到某画面` 等规则，并移除了正文中的 7~8 秒限制。
+- 2026-04-01 - Step4 - 在 `测试文件/step4 分镜脚本系统prompt_仅镜头调度与内容融合` 新建仅保留“镜头调度与内容融合”的测试版 prompt，去掉时间轴、画面描述、角色形象、道具、场景相关输出要求。

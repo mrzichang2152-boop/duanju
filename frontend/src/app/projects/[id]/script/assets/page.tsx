@@ -34,6 +34,11 @@ const normalizeRoleKey = (name: string) => {
   return value;
 };
 
+const getAssetDisplayName = (name: string) => {
+  const raw = (name || "").replace(/[\u3000\s]+/g, " ").trim();
+  return raw.replace(/\s*(?:[·•\-—｜|:：])\s*(角色形象|角色|道具|场景)\s*$/u, "").trim();
+};
+
 const getAssetIdentityKey = (asset: Asset) => {
   const normalizedName = (asset.name || "").replace(/[\s\u3000]+/g, " ").trim();
   if (asset.type === "CHARACTER") {
@@ -279,6 +284,11 @@ export default function AssetsPage() {
   const [selectingVersionKey, setSelectingVersionKey] = useState<string | null>(null);
   const [deletingVersionKey, setDeletingVersionKey] = useState<string | null>(null);
   const [generatingSubjectAssetIds, setGeneratingSubjectAssetIds] = useState<Set<string>>(new Set());
+  const [subjectFallbackConfirm, setSubjectFallbackConfirm] = useState<{
+    uiAssetId: string;
+    targetAssetId: string;
+    hint: string;
+  } | null>(null);
   const uploadInputRef = useRef<HTMLInputElement | null>(null);
   const defaultTemplate =
     "为{{type_cn}} {{name}} 生成高质量、写实风格的参考图，包含细节描述、风格、光照与色调。{{description}}";
@@ -300,19 +310,14 @@ export default function AssetsPage() {
   }, []);
 
   const getAssetDisplayTitle = useCallback(
-    (asset: AggregatedAsset) => {
-      if (asset.type === "CHARACTER_LOOK") {
-        return asset.name;
-      }
-      return `${asset.name} · ${getAssetTypeLabel(asset.type)}`;
-    },
-    [getAssetTypeLabel]
+    (asset: AggregatedAsset) => getAssetDisplayName(asset.name),
+    []
   );
 
   const renderAssetTemplate = useCallback(
     (template: string, asset: Asset) =>
       applyTemplate(template, {
-        name: asset.name,
+        name: getAssetDisplayName(asset.name),
         type: asset.type,
         type_cn: getAssetTypeLabel(asset.type),
         description: asset.description ?? "",
@@ -741,9 +746,16 @@ export default function AssetsPage() {
       await generateAssetSubject(token, projectId, targetAssetId);
       setStatus("主体生成成功");
       setMessage("主体生成成功");
+      setSubjectFallbackConfirm(null);
     } catch (err) {
       setMessage(null);
-      setError(err instanceof Error ? err.message : "生成主体失败");
+      const errMsg = err instanceof Error ? err.message : "生成主体失败";
+      if (errMsg.includes("未通过“音色绑定主体”检测")) {
+        setSubjectFallbackConfirm({ uiAssetId: asset.activeAssetId, targetAssetId, hint: errMsg });
+        setStatus(null);
+        return;
+      }
+      setError(errMsg);
       setStatus(null);
     } finally {
       setGeneratingSubjectAssetIds((prev) => {
@@ -814,7 +826,7 @@ export default function AssetsPage() {
     try {
       await selectAssetVersion(token, projectId, version.assetId, version.id);
       await loadAssets();
-      setStatus(`已选中 ${asset.name} 的版本${asset.versions.findIndex((item) => item.id === version.id) + 1}`);
+      setStatus(`已选中 ${getAssetDisplayName(asset.name)} 的版本${asset.versions.findIndex((item) => item.id === version.id) + 1}`);
     } catch (err) {
       setError(err instanceof Error ? err.message : "选中版本失败");
     } finally {
@@ -1140,7 +1152,7 @@ export default function AssetsPage() {
                   </button>
                   <Image
                     src={version.image_url}
-                    alt={`${asset.name}-版本${index + 1}`}
+                    alt={`${getAssetDisplayName(asset.name)}-版本${index + 1}`}
                     width={900}
                     height={1200}
                     sizes="(min-width: 1024px) 33vw, (min-width: 640px) 50vw, 100vw"
@@ -1330,6 +1342,65 @@ export default function AssetsPage() {
           </div>
         )}
       </div>
+      {subjectFallbackConfirm ? (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4">
+          <div className="w-full max-w-md rounded-xl bg-white p-5 shadow-2xl">
+            <div className="text-base font-semibold text-slate-900">主体生成确认</div>
+            <div className="mt-3 text-sm leading-6 text-slate-600">
+              {subjectFallbackConfirm.hint}
+              <div className="mt-2">是否继续以“不绑定音色”方式生成主体？</div>
+            </div>
+            <div className="mt-5 flex justify-end gap-2">
+              <button
+                type="button"
+                onClick={() => setSubjectFallbackConfirm(null)}
+                className="rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700"
+              >
+                暂不生成
+              </button>
+              <button
+                type="button"
+                onClick={async () => {
+                  if (!projectId) return;
+                  const token = getToken();
+                  if (!token) {
+                    window.location.href = "/login";
+                    return;
+                  }
+                  const target = subjectFallbackConfirm;
+                  if (!target) return;
+                  setSubjectFallbackConfirm(null);
+                  setError(null);
+                  setStatus("正在生成主体（不绑定音色）...");
+                  setGeneratingSubjectAssetIds((prev) => {
+                    const next = new Set(prev);
+                    next.add(target.uiAssetId);
+                    return next;
+                  });
+                  try {
+                    await generateAssetSubject(token, projectId, target.targetAssetId, { allow_without_voice: true });
+                    setStatus("主体生成成功（未绑定音色）");
+                    setMessage("主体生成成功（未绑定音色）");
+                  } catch (err) {
+                    setMessage(null);
+                    setError(err instanceof Error ? err.message : "生成主体失败");
+                    setStatus(null);
+                  } finally {
+                    setGeneratingSubjectAssetIds((prev) => {
+                      const next = new Set(prev);
+                      next.delete(target.uiAssetId);
+                      return next;
+                    });
+                  }
+                }}
+                className="rounded-lg bg-slate-900 px-3 py-2 text-sm text-white"
+              >
+                继续生成（不绑定音色）
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
       {previewImageUrl ? (
         <div
           className="fixed inset-0 z-50 overflow-auto bg-black/70 p-4"

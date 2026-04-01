@@ -176,7 +176,34 @@ def _sanitize_step2_metadata(text: str) -> str:
     value = re.sub(r"[，,；;。\s]*出场集数\s*[：:]?\s*[^，,；;。\n\r]*", "", value, flags=re.IGNORECASE)
     value = re.sub(r"[，,；;。\s]*信息来源\s*[：:]?\s*[^，,；;。\n\r]*", "", value, flags=re.IGNORECASE)
     value = re.sub(r"\s{2,}", " ", value)
-    return value.strip(" ，,；;。\t\n\r")
+    cleaned = value.strip(" ，,；;。\t\n\r")
+    if re.fullmatch(r"(?:第\s*\d+\s*集)(?:[、，,\s]*(?:第\s*\d+\s*集))*", cleaned):
+        return ""
+    return cleaned
+
+
+def _normalize_character_look_payload(role: str, look: str, desc: str) -> tuple[str, str]:
+    role_name = _normalize_role_name(role)
+    look_text = re.sub(r"[\s\u3000]+", "", str(look or "")).strip("*")
+    desc_text = str(desc or "").strip()
+    if not role_name or not look_text:
+        return look_text, desc_text
+
+    suffix = look_text
+    if look_text.startswith(f"{role_name}·"):
+        suffix = look_text[len(role_name) + 1 :]
+    elif look_text.startswith(role_name) and len(look_text) > len(role_name):
+        suffix = look_text[len(role_name) :]
+
+    parts = [p.strip() for p in suffix.split("·") if p.strip()]
+    if not parts:
+        return f"{role_name}·{suffix}", desc_text
+
+    normalized_look = f"{role_name}·{parts[0]}"
+    extra = "·".join(parts[1:]).strip()
+    if extra:
+        desc_text = f"{extra}；{desc_text}" if desc_text else extra
+    return normalized_look, desc_text
 
 
 def _extract_role_descriptions(body: str) -> dict[str, str]:
@@ -729,13 +756,9 @@ async def extract_assets_from_script(
         desc = _sanitize_step2_metadata(item.get("description", ""))
         if not role or not look:
             continue
-        
-        # Ensure base character exists or is planned? 
-        # Actually we just add the look asset.
-        look_name = f"{role}·{look}"
-        
-        # Combine descriptions if needed, but LLM usually gives full description
-        full_desc = desc
+
+        look_name, normalized_desc = _normalize_character_look_payload(role, look, desc)
+        full_desc = _sanitize_step2_metadata(normalized_desc)
         
         key = _asset_identity_key("CHARACTER_LOOK", look_name)
         

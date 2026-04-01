@@ -76,23 +76,87 @@ def _normalize_mode_model(mode: str, model: Optional[str]) -> str:
     return _OPENROUTER_TEXT_MODEL
 
 
-def _extract_role_name_from_look(asset_name: str) -> str:
-    value = str(asset_name or "").strip()
-    for sep in ["·", "：", ":", "-", "—", "｜", "|"]:
-        if sep in value:
-            left = value.split(sep, 1)[0].strip()
-            if left:
-                return left
-    return value
+def _cn_numeral_to_int(raw: str) -> Optional[int]:
+    text = str(raw or "").strip()
+    if not text:
+        return None
+    if text.isdigit():
+        return int(text)
+
+    mapping = {
+        "零": 0,
+        "〇": 0,
+        "一": 1,
+        "二": 2,
+        "两": 2,
+        "三": 3,
+        "四": 4,
+        "五": 5,
+        "六": 6,
+        "七": 7,
+        "八": 8,
+        "九": 9,
+    }
+    if text == "十":
+        return 10
+    if "十" in text:
+        left, right = text.split("十", 1)
+        tens = mapping.get(left, 1 if left == "" else None)
+        if tens is None:
+            return None
+        ones = mapping.get(right, 0 if right == "" else None)
+        if ones is None:
+            return None
+        return tens * 10 + ones
+
+    total = 0
+    for ch in text:
+        if ch not in mapping:
+            return None
+        total = total * 10 + mapping[ch]
+    return total if total > 0 else None
+
+
+def _episode_text_mentions_all(text: str) -> bool:
+    value = str(text or "")
+    return any(k in value for k in ["跨集", "每集", "全程", "贯穿", "通篇", "多集"])
 
 
 def _extract_episode_numbers(text: str) -> set[int]:
-    values = set()
-    for match in re.finditer(r"第\s*(\d+)\s*集", str(text or "")):
+    source = str(text or "")
+    values: set[int] = set()
+
+    for match in re.finditer(r"第\s*([^\n\r，,；;。]{1,40})\s*集", source):
+        token = (match.group(1) or "").strip()
+        if not token:
+            continue
+        normalized = token.replace("至", "-").replace("~", "-").replace("～", "-")
+        parts = re.split(r"[、，,/\s]+", normalized)
+        for part in parts:
+            part = part.strip()
+            if not part:
+                continue
+            part = re.sub(r"^第", "", part)
+            if "-" in part:
+                left, right = [p.strip() for p in part.split("-", 1)]
+                start = _cn_numeral_to_int(left)
+                end = _cn_numeral_to_int(right)
+                if start and end:
+                    if start <= end:
+                        values.update(range(start, end + 1))
+                    else:
+                        values.update(range(end, start + 1))
+                continue
+            parsed = _cn_numeral_to_int(part)
+            if parsed:
+                values.add(parsed)
+
+    for match in re.finditer(r"(?<!第)(\d+)\s*集", source):
         try:
             values.add(int(match.group(1)))
         except Exception:
             continue
+
     return values
 
 
@@ -204,18 +268,31 @@ async def _build_storyboard_prompt_user_content(
     asset_context = ""
     if assets:
         valid_asset_types = ["CHARACTER_LOOK", "PROP", "SCENE"]
-        filtered_assets = [a for a in assets if a.type in valid_asset_types]
+        all_candidate_assets = [a for a in assets if a.type in valid_asset_types]
+        filtered_assets = list(all_candidate_assets)
         if episode_index is not None and episode_index >= 0:
             target_episode_no = episode_index + 1
             episode_assets = []
-            for item in filtered_assets:
-                episodes = _extract_episode_numbers(str(item.description or ""))
+            for item in all_candidate_assets:
+                desc_text = str(item.description or "")
+                if _episode_text_mentions_all(desc_text):
+                    episode_assets.append(item)
+                    continue
+                episodes = _extract_episode_numbers(desc_text)
                 if target_episode_no in episodes:
                     episode_assets.append(item)
             filtered_assets = episode_assets
+            if not filtered_assets and all_candidate_assets:
+                logger.warning(
+                    "No episode-scoped assets matched by 出场集数, fallback to all whitelisted assets. project_id=%s episode=%s total_assets=%s",
+                    project_id,
+                    target_episode_no,
+                    len(all_candidate_assets),
+                )
+                filtered_assets = list(all_candidate_assets)
 
         if filtered_assets:
-            asset_context = "【可用素材库】\n请在生成分镜时，参考以下素材信息。如果当前镜头使用了某个素材（角色、道具、场景），请务必在该单元格描述的末尾加上 `[AssetID:素材ID]` 标记，以便程序自动关联图片。\n"
+            asset_context = "【可用素材库】\n请在生成分镜时，严格只使用以下素材。若名称不在下方白名单中，视为非法虚构，禁止输出。\n"
             type_mapping = {
                 "CHARACTER_LOOK": "角色形象",
                 "PROP": "道具",
@@ -225,30 +302,62 @@ async def _build_storyboard_prompt_user_content(
                 desc = asset.description or "无描述"
                 type_display = type_mapping.get(asset.type, asset.type)
                 asset_context += f"- [{type_display}] {asset.name} (ID: {asset.id}): {desc}\n"
+
             look_assets = [a for a in filtered_assets if a.type == "CHARACTER_LOOK"]
+            prop_assets = [a for a in filtered_assets if a.type == "PROP"]
+            scene_assets = [a for a in filtered_assets if a.type == "SCENE"]
+
+            asset_context += "\n【素材白名单（强制）】\n"
             if look_assets:
-                asset_context += "\n【角色与角色形象命名约束（强制）】\n"
-                asset_context += "当镜头出现角色时，角色形象列和“镜头调度与内容融合”列都必须直接使用“角色形象全名[AssetID:xxx]”，禁止简称或嵌套写法。\n"
+                asset_context += "可用角色形象（仅可从以下选择，禁止新增/改写/简称）：\n"
                 for look_asset in look_assets:
                     look_full_name = str(look_asset.name or "").strip()
-                    look_desc = str(look_asset.description or "无描述").strip()
-                    asset_context += (
-                        f"- 角色形象全名：{look_full_name}；"
-                        f"分镜写法：{look_full_name}[AssetID:{look_asset.id}]；"
-                        f"形象要点：{look_desc}\n"
-                    )
+                    asset_context += f"- {look_full_name}[AssetID:{look_asset.id}]\n"
+            else:
+                asset_context += "可用角色形象：无\n"
+
+            if prop_assets:
+                asset_context += "可用道具（仅可从以下选择，禁止新增/改写/别名）：\n"
+                for prop_asset in prop_assets:
+                    prop_name = str(prop_asset.name or "").strip()
+                    asset_context += f"- {prop_name}[AssetID:{prop_asset.id}]\n"
+            else:
+                asset_context += "可用道具：无\n"
+
+            if scene_assets:
+                asset_context += "可用场景（仅可从以下选择，禁止新增/改写/别名）：\n"
+                for scene_asset in scene_assets:
+                    scene_name = str(scene_asset.name or "").strip()
+                    asset_context += f"- {scene_name}[AssetID:{scene_asset.id}]\n"
+            else:
+                asset_context += "可用场景：无\n"
+
+            asset_context += (
+                "\n【强制约束】\n"
+                "1) 角色形象列、镜头调度与内容融合列、台词角色标识中，凡涉及角色主体，必须直接使用“角色形象全名”，禁止使用“汪老板/冯硕”等简称。\n"
+                "2) 角色形象列只允许填写白名单中的角色形象全名及其AssetID；若该镜头无角色，填“无”。\n"
+                "3) 道具列只允许填写白名单道具及其AssetID；若无道具填“无”；若剧情需要但白名单缺失，填“缺失道具:xxx（待补素材）”，且不得附AssetID。\n"
+                "4) 场景列只允许填写白名单场景及其AssetID；若剧情需要但白名单缺失，填“缺失场景:xxx（待补素材）”，且不得附AssetID。\n"
+                "5) 禁止输出任何白名单之外的角色形象/道具/场景名称；一旦出现即判定为错误输出。\n"
+            )
             asset_context += "\n"
             logger.info(f"Attached {len(filtered_assets)} assets to storyboard prompt (filtered from {len(assets)})")
         elif episode_index is not None and episode_index >= 0:
-            logger.info("No episode-scoped assets matched by 出场集数, generate storyboard without asset list. project_id=%s episode=%s", project_id, episode_index + 1)
+            logger.info("No assets available for storyboard prompt. project_id=%s episode=%s", project_id, episode_index + 1)
 
     style_instruction = (instruction or "").strip()
     style_block = f"【全局风格要求】\n{style_instruction}\n\n" if style_instruction else ""
 
-    return (
+    base_prompt = (
         f"{style_block}"
         f"{asset_context}"
         f"请将以下剧本转换为分镜脚本：\n\n{content}\n\n"
+    )
+    if not asset_context:
+        return base_prompt
+
+    return (
+        f"{base_prompt}"
         "【再次提醒】\n"
         "时间轴单行时长必须在3~15秒，禁止把7~8秒作为默认折中值；"
         "同画面与同场景的连续动作优先在15秒范围内合并成长镜头，接近15秒再切分。\n"
@@ -256,7 +365,8 @@ async def _build_storyboard_prompt_user_content(
         "请务必使用素材库中的AssetID标记角色、道具和场景。严禁省略。"
         "如果某个角色/道具/场景在素材库中存在，必须附带 `[AssetID:xxx]`，否则视为错误。"
         "如果同一镜头出现多个角色，角色形象列必须逐个列出所有角色形象，且每个角色都要附带各自的 `[AssetID:xxx]`。"
-        "角色相关字段（含镜头调度与内容融合中的台词角色标识）必须直接使用“角色形象全名”，例如：汪老板（金毛拟人）·商户老板装。"
+        "角色形象列只允许输出“角色形象全名[AssetID:xxx]”列表，不允许追加任何外观长描述、出场集数或解释性文本。"
+        "镜头调度与内容融合中的台词角色标识也必须直接使用“角色形象全名”。"
     )
 
 
@@ -286,7 +396,7 @@ async def _run_storyboard_task(task_id: str) -> None:
                         {"role": "system", "content": PROMPT_STORYBOARD},
                         {"role": "user", "content": user_prompt},
                     ],
-                    "temperature": 0.7,
+                    "temperature": 0.2,
                     "max_tokens": 120000,
                 },
             ):
@@ -801,6 +911,7 @@ async def generate_script(
     elif payload.instruction:
          user_prompt = f"{payload.instruction}\n\n当前内容：\n{payload.content}"
 
+    temperature = 0.2 if payload.mode == "generate_storyboard" else 0.7
     api_payload = {
         "model": model,
         "messages": [
@@ -808,7 +919,7 @@ async def generate_script(
             {"role": "user", "content": user_prompt}
         ],
         "stream": True,
-        "temperature": 0.7,
+        "temperature": temperature,
         # Set a very large max_tokens for Step 0 generation/rewriting to avoid truncation
         # Doubao 2.0 Pro supports up to 128k output tokens
         "max_tokens": 120000 

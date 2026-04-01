@@ -1,7 +1,10 @@
 import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import Image from "next/image";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 import { getToken } from "@/lib/auth";
-import { generateSegmentFrameImage, getSegmentFrameImageTaskStatus, generateTTS, getProjectVoices, type Asset, type CharacterVoice } from "@/lib/api";
+import { generateSegmentFrameImage, getModels, getSegmentFrameImageTaskStatus, generateTTS, getProjectVoices, type Asset, type CharacterVoice } from "@/lib/api";
+import { extractDrawModels } from "@/lib/models";
 
 interface ScriptEditorProps {
   content: string;
@@ -16,7 +19,7 @@ interface ScriptEditorProps {
   rowTaskStatusMap?: Record<number, string>;
   rowTaskIdMap?: Record<number, string>;
   rowVideoUrlMap?: Record<number, string>;
-  rowVersionListMap?: Record<number, Array<{ id: string; video_url: string; status: string; is_selected: boolean }>>;
+  rowVersionListMap?: Record<number, Array<{ id: string; video_url: string; status: string; task_status_msg?: string | null; is_selected: boolean }>>;
   rowSelectedVersionIdMap?: Record<number, string>;
   onGenerateKlingRow?: (params: {
     globalRowIndex: number;
@@ -27,6 +30,16 @@ interface ScriptEditorProps {
     customFirstFrameUrl?: string;
     customLastFrameUrl?: string;
   }) => void;
+  onModifyKlingRow?: (params: {
+    globalRowIndex: number;
+    headers: string[];
+    row: string[];
+    currentVideoUrl: string;
+    instruction: string;
+    referenceImageUrls: string[];
+    keepOriginalSound: boolean;
+  }) => void;
+  modifyingGlobalRowIndex?: number | null;
   onSelectKlingVersion?: (globalRowIndex: number, versionId: string) => void;
   onDeleteKlingVersion?: (globalRowIndex: number, versionId: string) => void;
   deletingVersionKey?: string | null;
@@ -158,6 +171,7 @@ const VOICE_TAG_GROUPS: VoiceTagGroup[] = [
 
 const KLING_COLUMN = "视频生成";
 const LEGACY_KLING_COLUMN = "Kling视频生成";
+const FRAME_DEFAULT_IMAGE_MODEL = "nano-banana-2";
 const getFrameStateStorageKey = (projectId: string) => `script_editor_frame_state_v2:${projectId}`;
 const FRAME_PENDING_MAX_AGE_MS = 30 * 60 * 1000;
 const buildFramePendingKey = (rowIndex: number, frameType: "first" | "last") => `${rowIndex}:${frameType}`;
@@ -235,6 +249,8 @@ export function ScriptEditor({
   rowVersionListMap,
   rowSelectedVersionIdMap,
   onGenerateKlingRow,
+  onModifyKlingRow,
+  modifyingGlobalRowIndex = null,
   onSelectKlingVersion,
   onDeleteKlingVersion,
   deletingVersionKey = null,
@@ -274,12 +290,21 @@ export function ScriptEditor({
   const [dialogueCellAudioMap, setDialogueCellAudioMap] = useState<Record<string, AppliedVoiceSegment[]>>(dialogueCellAudioMapProp || {});
   const [previewVideoUrl, setPreviewVideoUrl] = useState<string | null>(null);
   const [downloadingVideoKey, setDownloadingVideoKey] = useState<string | null>(null);
+  const [videoEditModalRowIndex, setVideoEditModalRowIndex] = useState<number | null>(null);
+  const [videoEditCurrentUrl, setVideoEditCurrentUrl] = useState("");
+  const [videoEditTab, setVideoEditTab] = useState<FrameMaterialTab>("character");
+  const [videoEditReferences, setVideoEditReferences] = useState<FrameReference[]>([]);
+  const [videoEditPromptInput, setVideoEditPromptInput] = useState("");
+  const [videoEditKeepOriginalSound, setVideoEditKeepOriginalSound] = useState(true);
+  const [videoEditError, setVideoEditError] = useState("");
   const [frameModalRowIndex, setFrameModalRowIndex] = useState<number | null>(null);
   const [frameModalTab, setFrameModalTab] = useState<FrameMaterialTab>("character");
   const [frameGenerateTab, setFrameGenerateTab] = useState<"first" | "last">("first");
   const [framePromptInput, setFramePromptInput] = useState("");
   const [frameReferences, setFrameReferences] = useState<FrameReference[]>([]);
   const [frameGeneratingType, setFrameGeneratingType] = useState<"first" | "last" | null>(null);
+  const [frameImageModels, setFrameImageModels] = useState<string[]>([FRAME_DEFAULT_IMAGE_MODEL]);
+  const [frameImageModel, setFrameImageModel] = useState(FRAME_DEFAULT_IMAGE_MODEL);
   const [frameFirstImageMap, setFrameFirstImageMap] = useState<Record<number, string[]>>({});
   const [frameLastImageMap, setFrameLastImageMap] = useState<Record<number, string[]>>({});
   const [frameAppliedMap, setFrameAppliedMap] = useState<Record<number, { first?: string; last?: string }>>({});
@@ -295,6 +320,7 @@ export function ScriptEditor({
   const voiceAudioRefs = useRef<Record<string, HTMLAudioElement | null>>({});
   const voiceTextareaRefs = useRef<Record<string, HTMLTextAreaElement | null>>({});
   const frameEditorRef = useRef<HTMLDivElement | null>(null);
+  const videoEditEditorRef = useRef<HTMLDivElement | null>(null);
   const frameModalRowIndexRef = useRef<number | null>(null);
   const previewAudioRef = useRef<HTMLAudioElement | null>(null);
   // Initialize with specific value to ensure first sync happens if content is present
@@ -372,6 +398,37 @@ export function ScriptEditor({
   }, [projectId]);
 
   useEffect(() => {
+    if (!projectId) return;
+    const token = getToken();
+    if (!token) return;
+    getModels(token)
+      .then((modelsRaw) => {
+        const drawIds = extractDrawModels(modelsRaw);
+        const merged: string[] = [];
+        const seen = new Set<string>();
+        for (const id of drawIds) {
+          const key = id.toLowerCase();
+          if (seen.has(key)) continue;
+          seen.add(key);
+          merged.push(id);
+        }
+        if (!seen.has(FRAME_DEFAULT_IMAGE_MODEL.toLowerCase())) {
+          merged.push(FRAME_DEFAULT_IMAGE_MODEL);
+        }
+        const nextModels = merged.length ? merged : [FRAME_DEFAULT_IMAGE_MODEL];
+        setFrameImageModels(nextModels);
+        setFrameImageModel((prev) => {
+          if (!prev) return nextModels[0];
+          const exists = nextModels.some((item) => item.toLowerCase() === prev.toLowerCase());
+          return exists ? prev : nextModels[0];
+        });
+      })
+      .catch(() => {
+        setFrameImageModels([FRAME_DEFAULT_IMAGE_MODEL]);
+      });
+  }, [projectId]);
+
+  useEffect(() => {
     setDialogueCellAudioMap(dialogueCellAudioMapProp || {});
   }, [dialogueCellAudioMapProp]);
 
@@ -399,8 +456,10 @@ export function ScriptEditor({
         return;
       }
       const parsed = JSON.parse(raw) as PersistedFrameState;
-      setFrameFirstImageMap(parsed.firstImageMap || {});
-      setFrameLastImageMap(parsed.lastImageMap || {});
+      const firstImageMap = parsed.firstImageMap || {};
+      const lastImageMap = parsed.lastImageMap || {};
+      setFrameFirstImageMap(firstImageMap);
+      setFrameLastImageMap(lastImageMap);
       setFrameAppliedMap(parsed.appliedMap || {});
       setUsePreviousEndFrameMap(parsed.previousEndFrameMap || {});
       const now = Date.now();
@@ -408,9 +467,17 @@ export function ScriptEditor({
       const nextPendingMap: Record<string, number> = {};
       Object.entries(rawPendingMap).forEach(([key, ts]) => {
         const value = Number(ts || 0);
-        if (value > 0 && now - value <= FRAME_PENDING_MAX_AGE_MS) {
-          nextPendingMap[key] = value;
-        }
+        if (!(value > 0 && now - value <= FRAME_PENDING_MAX_AGE_MS)) return;
+        const [rowIndexText, frameTypeText] = String(key).split(":", 2);
+        const rowIndex = Number(rowIndexText);
+        const frameType = frameTypeText === "last" ? "last" : "first";
+        const hasGeneratedImage = Number.isFinite(rowIndex)
+          ? frameType === "first"
+            ? Boolean(firstImageMap[rowIndex]?.length)
+            : Boolean(lastImageMap[rowIndex]?.length)
+          : false;
+        if (hasGeneratedImage) return;
+        nextPendingMap[key] = value;
       });
       setFramePendingMap(nextPendingMap);
     } catch {
@@ -1153,6 +1220,171 @@ export function ScriptEditor({
     insertFrameReferenceToken({ assetId, name, imageUrl });
   };
 
+  const syncVideoEditEditorState = useCallback(() => {
+    const editor = videoEditEditorRef.current;
+    if (!editor) return;
+    const tokenNodes = Array.from(editor.querySelectorAll("span[data-video-edit-ref='1']")) as HTMLSpanElement[];
+    const refs: FrameReference[] = [];
+    tokenNodes.forEach((node) => {
+      const refId = String(node.dataset.refId || "").trim();
+      if (!refId) return;
+      const mapped = frameReferenceOptionMap[refId];
+      if (mapped) {
+        refs.push(mapped);
+      } else {
+        const refName = String(node.dataset.refName || "").trim();
+        const refUrl = String(node.dataset.refUrl || "").trim();
+        if (refName && refUrl) refs.push({ assetId: refId, name: refName, imageUrl: refUrl });
+      }
+    });
+    const prompt = String(editor.textContent || "").replace(/\u00a0/g, " ").trim();
+    setVideoEditReferences(refs);
+    setVideoEditPromptInput(prompt);
+  }, [frameReferenceOptionMap]);
+
+  const insertVideoEditReferenceToken = useCallback((ref: FrameReference) => {
+    const editor = videoEditEditorRef.current;
+    if (!editor) return;
+    editor.focus();
+    const token = document.createElement("span");
+    token.dataset.videoEditRef = "1";
+    token.dataset.refId = ref.assetId;
+    token.dataset.refName = ref.name;
+    token.dataset.refUrl = ref.imageUrl;
+    token.contentEditable = "false";
+    token.className = "mx-1 inline-flex rounded bg-indigo-100 px-2 py-0.5 text-xs text-indigo-700 align-middle";
+    token.textContent = ref.name;
+    const space = document.createTextNode(" ");
+    const selection = window.getSelection();
+    if (selection && selection.rangeCount > 0 && editor.contains(selection.anchorNode)) {
+      const range = selection.getRangeAt(0);
+      range.deleteContents();
+      range.insertNode(space);
+      range.insertNode(token);
+      range.setStartAfter(space);
+      range.collapse(true);
+      selection.removeAllRanges();
+      selection.addRange(range);
+    } else {
+      editor.appendChild(token);
+      editor.appendChild(space);
+    }
+    syncVideoEditEditorState();
+  }, [syncVideoEditEditorState]);
+
+  const readVideoDurationSeconds = useCallback((videoUrl: string) => new Promise<number>((resolve, reject) => {
+    if (!videoUrl) {
+      reject(new Error("empty video url"));
+      return;
+    }
+    const video = document.createElement("video");
+    let finished = false;
+    const cleanup = () => {
+      video.onloadedmetadata = null;
+      video.onerror = null;
+      video.removeAttribute("src");
+      video.load();
+    };
+    const done = (resolver: () => void) => {
+      if (finished) return;
+      finished = true;
+      window.clearTimeout(timeout);
+      cleanup();
+      resolver();
+    };
+    const timeout = window.setTimeout(() => {
+      done(() => reject(new Error("timeout")));
+    }, 12000);
+    video.preload = "metadata";
+    video.onloadedmetadata = () => {
+      const duration = Number(video.duration || 0);
+      if (!Number.isFinite(duration) || duration <= 0) {
+        done(() => reject(new Error("invalid duration")));
+        return;
+      }
+      done(() => resolve(duration));
+    };
+    video.onerror = () => {
+      done(() => reject(new Error("load metadata failed")));
+    };
+    video.src = videoUrl;
+  }), []);
+
+  const openVideoEditModal = async (globalRowIndex: number, currentVideoUrl: string) => {
+    try {
+      const duration = await readVideoDurationSeconds(currentVideoUrl);
+      if (duration < 3 || duration > 10) {
+        window.alert(`当前视频时长为 ${duration.toFixed(1)}s，仅支持修改 3-10s 的视频。`);
+        return;
+      }
+    } catch {
+      window.alert("无法读取当前视频时长，仅支持修改 3-10s 的视频。");
+      return;
+    }
+    setVideoEditModalRowIndex(globalRowIndex);
+    setVideoEditCurrentUrl(currentVideoUrl);
+    setVideoEditTab("character");
+    setVideoEditReferences([]);
+    setVideoEditPromptInput("");
+    setVideoEditKeepOriginalSound(true);
+    setVideoEditError("");
+    window.setTimeout(() => {
+      if (videoEditEditorRef.current) {
+        videoEditEditorRef.current.innerHTML = "";
+      }
+    }, 0);
+  };
+
+  const closeVideoEditModal = () => {
+    setVideoEditModalRowIndex(null);
+    setVideoEditCurrentUrl("");
+    setVideoEditReferences([]);
+    setVideoEditPromptInput("");
+    setVideoEditError("");
+    if (videoEditEditorRef.current) {
+      videoEditEditorRef.current.innerHTML = "";
+    }
+  };
+
+  const submitVideoEdit = () => {
+    if (videoEditModalRowIndex === null) return;
+    const instruction = videoEditPromptInput.trim();
+    if (!instruction) {
+      setVideoEditError("请输入修改指令");
+      return;
+    }
+    if (!videoEditCurrentUrl) {
+      setVideoEditError("当前视频地址无效，请先生成视频");
+      return;
+    }
+    setVideoEditError("");
+    const references = Array.from(new Set(videoEditReferences.map((item) => item.imageUrl))).filter(Boolean);
+    let headers: string[] = [];
+    let row: string[] = [];
+    let cursor = rowStartIndex;
+    for (const block of blocks) {
+      if (block.type !== "table") continue;
+      const nextCursor = cursor + block.rows.length;
+      if (videoEditModalRowIndex >= cursor && videoEditModalRowIndex < nextCursor) {
+        const rowOffset = videoEditModalRowIndex - cursor;
+        headers = block.headers;
+        row = block.headers.map((_, i) => block.rows[rowOffset]?.[i] || "");
+        break;
+      }
+      cursor = nextCursor;
+    }
+    onModifyKlingRow?.({
+      globalRowIndex: videoEditModalRowIndex,
+      headers,
+      row,
+      currentVideoUrl: videoEditCurrentUrl,
+      instruction,
+      referenceImageUrls: references,
+      keepOriginalSound: videoEditKeepOriginalSound,
+    });
+    closeVideoEditModal();
+  };
+
   const markFramePending = useCallback((rowIndex: number, frameType: "first" | "last", pending: boolean) => {
     const key = buildFramePendingKey(rowIndex, frameType);
     setFramePendingMap((prev) => {
@@ -1241,6 +1473,7 @@ export function ScriptEditor({
         references,
         frame_type: frameType,
         aspect_ratio: "16:9",
+        model: frameImageModel,
       });
       const generated = await waitForFrameTask(task.task_id);
       appendGeneratedFrameImage(rowIndex, frameType, generated);
@@ -1312,6 +1545,7 @@ export function ScriptEditor({
         references,
         frame_type: editTarget.frameType,
         aspect_ratio: "16:9",
+        model: frameImageModel,
       });
       const generated = await waitForFrameTask(task.task_id);
       appendGeneratedFrameImage(rowIndex, editTarget.frameType, generated);
@@ -1374,6 +1608,9 @@ export function ScriptEditor({
                         const rowVersions = rowVersionListMap?.[globalRowIndex] || [];
                         const completedVersions = rowVersions.filter((version) => isCompletedVideoVersion(version));
                         const completedVersionsForDisplay = [...completedVersions].reverse();
+                        const latestVersion = rowVersions[0];
+                        const latestStatus = String(latestVersion?.status || "").toUpperCase();
+                        const latestFailedMsg = String(latestVersion?.task_status_msg || "").trim();
                         const previousRow = rowIndex > 0 ? block.rows[rowIndex - 1] : null;
                         const canUsePreviousEndFrame = Boolean(previousRow);
                         const defaultUsePreviousEndFrame = isSameSceneAsPreviousRow(block.headers, row, previousRow);
@@ -1467,6 +1704,11 @@ export function ScriptEditor({
                                 {!isPending && generatedRowIndexSet?.has(globalRowIndex) ? (
                                   <span className="text-xs text-green-600">已生成</span>
                                 ) : null}
+                                {!isPending && latestStatus.includes("FAILED") ? (
+                                  <span className="text-[11px] text-rose-600">
+                                    生成失败{latestFailedMsg ? `：${latestFailedMsg}` : "，请重试"}
+                                  </span>
+                                ) : null}
                                 {completedVersions.length > 0 ? (
                                   <div className="flex w-full items-center gap-1">
                                     {completedVersionsForDisplay.length > 1 ? (
@@ -1498,12 +1740,20 @@ export function ScriptEditor({
                                   </div>
                                 ) : null}
                                 {previewUrl ? (
-                                  <div className="flex items-center gap-2">
+                                  <div className="flex flex-wrap items-center gap-2">
                                     <button
                                       onClick={() => setPreviewVideoUrl(previewUrl)}
                                       className="rounded border border-green-300 px-3 py-1 text-xs text-green-700 hover:bg-green-50"
                                     >
                                       播放视频
+                                    </button>
+                                    <button
+                                      type="button"
+                                      onClick={() => { void openVideoEditModal(globalRowIndex, previewUrl); }}
+                                      disabled={modifyingGlobalRowIndex === globalRowIndex}
+                                      className="rounded border border-amber-300 px-3 py-1 text-xs text-amber-700 hover:bg-amber-50 disabled:opacity-50"
+                                    >
+                                      {modifyingGlobalRowIndex === globalRowIndex ? "修改中..." : "修改当前视频"}
                                     </button>
                                     <button
                                       type="button"
@@ -1577,6 +1827,104 @@ export function ScriptEditor({
         </div>
       </div>
     ) : null}
+    {videoEditModalRowIndex !== null ? (
+      <div className="fixed inset-0 z-[85] overflow-y-auto bg-black/50 px-4 py-6">
+        <div className="mx-auto w-full max-w-6xl rounded-2xl border border-slate-200 bg-white shadow-xl">
+          <div className="sticky top-0 z-10 flex items-center justify-between border-b border-slate-100 bg-white px-5 py-4">
+            <div className="text-sm font-semibold text-slate-900">修改当前视频</div>
+            <button
+              onClick={closeVideoEditModal}
+              className="rounded-md px-2 py-1 text-xs text-slate-500 hover:bg-slate-100"
+            >
+              关闭
+            </button>
+          </div>
+          <div className="space-y-4 p-5">
+            <div className="overflow-hidden rounded-xl border border-slate-200 bg-black">
+              <video src={videoEditCurrentUrl} controls className="h-auto max-h-[45vh] w-full" />
+            </div>
+            <div className="flex items-center gap-2 border-b border-slate-100 pb-2">
+              <button
+                type="button"
+                onClick={() => setVideoEditTab("character")}
+                className={`rounded px-3 py-1 text-xs ${videoEditTab === "character" ? "bg-blue-600 text-white" : "border border-slate-200 text-slate-600"}`}
+              >
+                角色形象
+              </button>
+              <button
+                type="button"
+                onClick={() => setVideoEditTab("prop")}
+                className={`rounded px-3 py-1 text-xs ${videoEditTab === "prop" ? "bg-blue-600 text-white" : "border border-slate-200 text-slate-600"}`}
+              >
+                道具
+              </button>
+              <button
+                type="button"
+                onClick={() => setVideoEditTab("scene")}
+                className={`rounded px-3 py-1 text-xs ${videoEditTab === "scene" ? "bg-blue-600 text-white" : "border border-slate-200 text-slate-600"}`}
+              >
+                场景
+              </button>
+            </div>
+            <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
+              {(materialAssetsByTab[videoEditTab] || []).map(({ asset, imageUrl }) => {
+                const selected = videoEditReferences.some((item) => item.assetId === asset.id);
+                return (
+                  <button
+                    key={`video-edit-${asset.id}`}
+                    type="button"
+                    onClick={() => insertVideoEditReferenceToken({ assetId: asset.id, name: asset.name, imageUrl })}
+                    className={`overflow-hidden rounded-lg border text-left ${selected ? "border-indigo-500 ring-2 ring-indigo-200" : "border-slate-200"}`}
+                  >
+                    <img src={imageUrl} alt={asset.name} className="h-24 w-full object-cover bg-slate-100" />
+                    <div className="truncate px-2 py-1 text-xs">{asset.name}</div>
+                  </button>
+                );
+              })}
+            </div>
+            <div className="space-y-2">
+              <div className="relative min-h-[96px] w-full rounded-lg border border-slate-200 px-3 py-2">
+                <div
+                  ref={videoEditEditorRef}
+                  contentEditable
+                  suppressContentEditableWarning
+                  onInput={syncVideoEditEditorState}
+                  className="min-h-[80px] w-full whitespace-pre-wrap break-words text-sm outline-none"
+                />
+                {!videoEditPromptInput && videoEditReferences.length === 0 ? (
+                  <span className="pointer-events-none absolute left-3 top-2 text-sm text-slate-400">
+                    输入修改指令，可引用上方素材
+                  </span>
+                ) : null}
+              </div>
+              <div className="flex items-center justify-between gap-3">
+                <div className="space-y-1">
+                  <div className="text-xs text-slate-500">提示：将基于当前视频进行编辑，已选素材会作为参考图。</div>
+                  <label className="inline-flex items-center gap-2 text-xs text-slate-600">
+                    <input
+                      type="checkbox"
+                      checked={videoEditKeepOriginalSound}
+                      onChange={(e) => setVideoEditKeepOriginalSound(e.target.checked)}
+                      className="h-3.5 w-3.5 rounded border-slate-300"
+                    />
+                    保留原声
+                  </label>
+                </div>
+                <button
+                  type="button"
+                  onClick={submitVideoEdit}
+                  disabled={modifyingGlobalRowIndex !== null}
+                  className="rounded bg-amber-600 px-3 py-1.5 text-xs text-white hover:bg-amber-700 disabled:opacity-50"
+                >
+                  提交视频修改
+                </button>
+              </div>
+              {videoEditError ? <div className="text-xs text-rose-600">{videoEditError}</div> : null}
+            </div>
+          </div>
+        </div>
+      </div>
+    ) : null}
     {frameModalRowIndex !== null ? (
       <div className="fixed inset-0 z-50 overflow-y-auto bg-black/50 px-4 py-6">
         <div className="mx-auto w-full max-w-6xl rounded-2xl border border-slate-200 bg-white shadow-xl">
@@ -1630,7 +1978,7 @@ export function ScriptEditor({
               })}
             </div>
             <div className="space-y-2">
-              <div className="flex items-center gap-2">
+              <div className="flex flex-wrap items-center gap-2">
                 <button
                   type="button"
                   onClick={() => setFrameGenerateTab("first")}
@@ -1645,6 +1993,20 @@ export function ScriptEditor({
                 >
                   尾帧
                 </button>
+                <label className="ml-1 flex items-center gap-1 text-xs text-slate-600">
+                  <span>模型</span>
+                  <select
+                    value={frameImageModel}
+                    onChange={(event) => setFrameImageModel(event.target.value)}
+                    className="rounded border border-slate-300 bg-white px-2 py-1 text-xs text-slate-700"
+                  >
+                    {frameImageModels.map((modelId) => (
+                      <option key={modelId} value={modelId}>
+                        {modelId}
+                      </option>
+                    ))}
+                  </select>
+                </label>
               </div>
               <div className="relative min-h-[96px] w-full rounded-lg border border-slate-200 px-3 py-2">
                 <div
@@ -2186,10 +2548,16 @@ function TableCell({
   }, []);
 
   const { displayText, assetRefs } = React.useMemo(() => {
+    const normalizeMarkdownText = (input: string) =>
+      String(input || "")
+        .replace(/<br\s*\/?>/gi, "\n")
+        .replace(/\\n/g, "\n")
+        .replace(/\\\\/g, "\n");
+
     const assetTagRegex = /\[AssetID:\s*([^\]]+)\]/g;
     const refs: Array<{ raw: string; id?: string; name: string }> = [];
     const seenRefKey = new Set<string>();
-    const trimmedValue = value || "";
+    const trimmedValue = normalizeMarkdownText(value || "");
     if (!enableAssetBindingAssist) {
       return { displayText: trimmedValue, assetRefs: refs };
     }
@@ -2246,12 +2614,6 @@ function TableCell({
     }
 
     const text = trimmedValue.replace(assetTagRegex, "").trim();
-    text
-      .split(/\r?\n/)
-      .map((line) => line.trim())
-      .filter(Boolean)
-      .forEach((line) => pushRef(line));
-
     return { displayText: text, assetRefs: refs };
   }, [enableAssetBindingAssist, normalizeAssetKey, preferredAssetTypes, projectAssets, value]);
   const pickerAssetData = React.useMemo<{
@@ -2359,18 +2721,26 @@ function TableCell({
     });
   }, []);
   const applyPickerSelection = React.useCallback(() => {
-    const selectedNames = selectedPickerIds
-      .map((id) => pickerAssets.find((item) => item.id === id)?.name)
-      .filter((name): name is string => Boolean(name));
+    const selectedTaggedLines = selectedPickerIds
+      .map((id) => {
+        const item = pickerAssets.find((asset) => asset.id === id);
+        if (!item) return "";
+        return `${item.name} [AssetID: ${item.id}]`;
+      })
+      .filter(Boolean);
     const pickerNameKeySet = new Set(pickerAssets.map((item) => normalizeAssetKey(item.name)));
-    const baseLines = String(displayText || "")
+    const baseLines = String(value || "")
       .split(/\r?\n/)
       .map((line) => line.trim())
-      .filter((line) => line && !pickerNameKeySet.has(normalizeAssetKey(line)));
-    const nextLines = [...baseLines, ...selectedNames];
+      .filter((line) => {
+        if (!line) return false;
+        if (/\[AssetID:\s*[^\]]+\]/i.test(line)) return false;
+        return !pickerNameKeySet.has(normalizeAssetKey(line));
+      });
+    const nextLines = [...baseLines, ...selectedTaggedLines];
     onChange(nextLines.join("\n"));
     setPickerOpen(false);
-  }, [displayText, normalizeAssetKey, onChange, pickerAssets, selectedPickerIds]);
+  }, [normalizeAssetKey, onChange, pickerAssets, selectedPickerIds, value]);
 
   if (isEditing) {
     return (
@@ -2401,8 +2771,21 @@ function TableCell({
             </button>
           </div>
         ) : null}
-        <div className="whitespace-pre-wrap text-slate-700 leading-relaxed">
-          {displayText || <span className="text-slate-300 italic">空</span>}
+        <div className="text-slate-700 leading-relaxed">
+          {displayText ? (
+            <ReactMarkdown
+              remarkPlugins={[remarkGfm]}
+              components={{
+                p: ({ children }) => <p className="whitespace-pre-wrap mb-1 last:mb-0">{children}</p>,
+                strong: ({ children }) => <strong className="font-semibold text-slate-800">{children}</strong>,
+                ul: ({ children }) => <ul className="list-disc pl-5 space-y-1">{children}</ul>,
+                ol: ({ children }) => <ol className="list-decimal pl-5 space-y-1">{children}</ol>,
+                li: ({ children }) => <li className="whitespace-pre-wrap">{children}</li>,
+              }}
+            >
+              {displayText}
+            </ReactMarkdown>
+          ) : <span className="text-slate-300 italic">空</span>}
         </div>
 
         {enableAssetBindingAssist && assetRefs.length > 0 ? (

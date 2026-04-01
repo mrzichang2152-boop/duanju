@@ -1,4 +1,5 @@
 import asyncio
+import json
 import logging
 import os
 from uuid import uuid4
@@ -93,11 +94,14 @@ async def fetch_segments(
             all_versions.extend(versions)
             
         processing_versions = [v for v in all_versions if _is_kling_pending_status(v.status) and v.task_id and "|" in v.task_id]
+        version_status_msg_map: dict[str, str] = {}
         if processing_versions:
             async def check_and_update(v):
                 try:
                     endpoint, tid = v.task_id.split("|", 1)
-                    new_status, video_url = await query_kling_task_status(db, user_id, endpoint, tid)
+                    new_status, video_url, task_status_msg = await query_kling_task_status(db, user_id, endpoint, tid)
+                    if task_status_msg:
+                        version_status_msg_map[str(v.id)] = task_status_msg
                     if not _is_kling_pending_status(new_status):
                         v.status = str(new_status or v.status or "PENDING")
                         if video_url:
@@ -129,6 +133,7 @@ async def fetch_segments(
                         prompt=str(v.prompt) if v.prompt is not None else None,
                         status=str(v.status or "PENDING"),
                         task_id=str(v.task_id) if v.task_id is not None else None,
+                        task_status_msg=version_status_msg_map.get(str(v.id)),
                         is_selected=bool(v.is_selected),
                     )
                 )
@@ -240,7 +245,7 @@ async def _generate_segment_frame_image_sync(
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="提示词不能为空")
     references = [str(item).strip() for item in (payload.references or []) if str(item).strip()]
     request_payload: dict[str, object] = {
-        "model": OPENROUTER_IMAGE_MODEL,
+        "model": str(payload.model or OPENROUTER_IMAGE_MODEL).strip() or OPENROUTER_IMAGE_MODEL,
         "prompt": prompt,
         "aspect_ratio": str(payload.aspect_ratio or "16:9"),
         "size": "4K",

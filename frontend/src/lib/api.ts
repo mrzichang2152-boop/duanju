@@ -96,12 +96,7 @@ const resolveApiBaseUrl = () => {
     return raw;
   }
   if (raw === "/api") {
-    const hostname = window.location.hostname;
-    const isLocalHost = hostname === "localhost" || hostname === "127.0.0.1";
-    const isFrontendPort = window.location.port === "3001" || window.location.port === "3000";
-    if (isLocalHost && isFrontendPort) {
-      return `http://${hostname}:8003/api`;
-    }
+    return "/api";
   }
   if (raw.startsWith("/")) {
     return raw;
@@ -122,6 +117,7 @@ const resolveApiBaseUrl = () => {
 const baseUrl = resolveApiBaseUrl();
 const normalizeToken = (token?: string | null) => (token ?? "").trim();
 const REQUEST_TIMEOUT_MS = 15000;
+const SUBJECT_GENERATE_TIMEOUT_MS = 180000;
 const VIDEO_GENERATE_TIMEOUT_MS = 420000;
 const SCRIPT_GENERATE_TIMEOUT_MS = 240000;
 
@@ -634,13 +630,20 @@ export const getAssetGenerateTaskStatus = (token: string, projectId: string, tas
     token
   );
 
-export const generateAssetSubject = (token: string, projectId: string, assetId: string) =>
+export const generateAssetSubject = (
+  token: string,
+  projectId: string,
+  assetId: string,
+  payload?: { allow_without_voice?: boolean }
+) =>
   request<{ status: string; subject_id: string }>(
     `/projects/${projectId}/assets/${assetId}/generate-subject`,
     {
       method: "POST",
+      body: payload ? JSON.stringify(payload) : undefined,
     },
-    token
+    token,
+    SUBJECT_GENERATE_TIMEOUT_MS
   );
 
 export const uploadAssetImage = async (
@@ -985,6 +988,7 @@ export type SegmentVersion = {
   prompt?: string | null;
   status: string;
   task_id?: string | null;
+  task_status_msg?: string | null;
   is_selected: boolean;
 };
 
@@ -1019,7 +1023,7 @@ export const generateSegment = (
 export const generateSegmentFrameImage = (
   token: string,
   projectId: string,
-  payload: { prompt: string; references?: string[]; frame_type?: "first" | "last"; aspect_ratio?: string }
+  payload: { prompt: string; references?: string[]; frame_type?: "first" | "last"; aspect_ratio?: string; model?: string }
 ) =>
   request<AsyncTaskStatusResponse>(
     `/projects/${projectId}/segments/frame-images/generate`,
