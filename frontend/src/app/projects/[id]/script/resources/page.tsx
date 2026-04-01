@@ -2,10 +2,30 @@
 
 import { useEffect, useRef, useState } from "react";
 import { useParams, useRouter } from "next/navigation";
-import { generateScript, getScript, saveScript, extractAssets } from "@/lib/api";
+import { getScript, saveScript, startStep2Task, getStep2TaskStatus } from "@/lib/api";
 import { getToken } from "@/lib/auth";
 
 const SEPARATOR = "\n\n=== 原文剧本 (请勿删除此行) ===\n\n";
+const STEP2_PENDING_MAX_AGE_MS = 30 * 60 * 1000;
+
+type Step2PendingTask = {
+  op: "extract" | "modify" | "sync";
+  taskId: string;
+  startedAt: number;
+  baselineVersion?: number;
+};
+
+function stripThinkingContent(text: string) {
+  const source = String(text || "");
+  let cleaned = source.replace(/<think>[\s\S]*?<\/think>/gi, "");
+  if (/<think>/i.test(cleaned) && !/<\/think>/i.test(cleaned)) {
+    const thinkStart = cleaned.search(/<think>/i);
+    if (thinkStart >= 0) {
+      cleaned = cleaned.slice(0, thinkStart);
+    }
+  }
+  return cleaned.replace(/<\/?think>/gi, "").trim();
+}
 
 export default function ScriptResourcesPage() {
   const params = useParams<{ id: string }>();
@@ -35,9 +55,117 @@ export default function ScriptResourcesPage() {
   }, [projectId, selectedModel]);
 
   const [message, setMessage] = useState<string | null>(null);
+  const [currentScriptVersion, setCurrentScriptVersion] = useState(0);
 
+  const pendingTaskStorageKey = projectId ? `step2-pending-task-${projectId}` : "";
   const saveTimeoutRef = useRef<NodeJS.Timeout | null>(null);
   const lastSavedContentRef = useRef("");
+
+  const persistPendingTask = (task: Step2PendingTask) => {
+    if (!pendingTaskStorageKey || typeof window === "undefined") return;
+    localStorage.setItem(pendingTaskStorageKey, JSON.stringify(task));
+  };
+
+  const clearPendingTask = () => {
+    if (!pendingTaskStorageKey || typeof window === "undefined") return;
+    localStorage.removeItem(pendingTaskStorageKey);
+  };
+
+  useEffect(() => {
+    if (!pendingTaskStorageKey || typeof window === "undefined") return;
+    try {
+      const raw = localStorage.getItem(pendingTaskStorageKey);
+      if (!raw) return;
+      const parsed = JSON.parse(raw) as Step2PendingTask;
+      const op = parsed?.op;
+      const taskId = String(parsed?.taskId || "").trim();
+      const startedAt = Number(parsed?.startedAt || 0);
+      if (!op || !taskId || !startedAt || Date.now() - startedAt > STEP2_PENDING_MAX_AGE_MS) {
+        localStorage.removeItem(pendingTaskStorageKey);
+        return;
+      }
+      if (op === "modify") {
+        setIsModifying(true);
+        setMessage("检测到上次仍在 AI 修改中，请稍候...");
+      } else if (op === "extract") {
+        setGenerating(true);
+        setMessage("检测到上次仍在提取资源中，请稍候...");
+      } else {
+        setGenerating(true);
+        setMessage("检测到上次仍在同步素材中，请稍候...");
+      }
+    } catch {
+      localStorage.removeItem(pendingTaskStorageKey);
+    }
+  }, [pendingTaskStorageKey]);
+
+  useEffect(() => {
+    if (!pendingTaskStorageKey || typeof window === "undefined" || !projectId) return;
+    const token = getToken();
+    if (!token) return;
+    let timer: number | null = null;
+    const poll = async () => {
+      try {
+        const raw = localStorage.getItem(pendingTaskStorageKey);
+        if (!raw) return;
+        const pending = JSON.parse(raw) as Step2PendingTask;
+        const startedAt = Number(pending?.startedAt || 0);
+        if (!pending?.op || !startedAt || Date.now() - startedAt > STEP2_PENDING_MAX_AGE_MS) {
+          clearPendingTask();
+          setGenerating(false);
+          setIsModifying(false);
+          return;
+        }
+        const taskId = String(pending.taskId || "").trim();
+        if (!taskId) return;
+        const status = await getStep2TaskStatus(token, projectId, taskId);
+        if (status.status === "FAILED") {
+          clearPendingTask();
+          setGenerating(false);
+          setIsModifying(false);
+          setMessage(status.error || "任务执行失败");
+          return;
+        }
+        if (status.status !== "COMPLETED") {
+          return;
+        }
+        if (pending.op === "sync") {
+          clearPendingTask();
+          setGenerating(false);
+          setIsModifying(false);
+          setMessage("素材同步完成");
+          return;
+        }
+        const latest = await getScript(token, projectId);
+        const fullContent = latest.content ?? "";
+        if (!fullContent.includes(SEPARATOR)) {
+          return;
+        }
+        const [res, orig] = fullContent.split(SEPARATOR);
+        const cleanedResources = stripThinkingContent(res || "");
+        const cleanedOriginal = stripThinkingContent(orig || "");
+        if (!cleanedResources.trim()) {
+          return;
+        }
+        setResourcesContent(cleanedResources);
+        lastSavedContentRef.current = cleanedResources;
+        setOriginalContent(cleanedOriginal);
+        setCurrentScriptVersion(Number(latest.version || 0));
+        clearPendingTask();
+        setGenerating(false);
+        setIsModifying(false);
+        setMessage(pending.op === "modify" ? "AI 修改完成" : "提取完成");
+      } catch {
+      }
+    };
+    void poll();
+    timer = window.setInterval(() => {
+      void poll();
+    }, 2500);
+    return () => {
+      if (timer) window.clearInterval(timer);
+    };
+  }, [pendingTaskStorageKey, projectId]);
 
   // Load initial script
   useEffect(() => {
@@ -50,19 +178,22 @@ export default function ScriptResourcesPage() {
 
     getScript(token, projectId)
       .then((data) => {
+        setCurrentScriptVersion(Number(data.version || 0));
         const fullContent = data.content ?? "";
         
         // Try to split existing resources and original content
         if (fullContent.includes(SEPARATOR)) {
           const [res, orig] = fullContent.split(SEPARATOR);
-          setResourcesContent(res.trim());
-          lastSavedContentRef.current = res.trim();
-          setOriginalContent(orig.trim());
+          const cleanedResources = stripThinkingContent(res);
+          const cleanedOriginal = stripThinkingContent(orig);
+          setResourcesContent(cleanedResources);
+          lastSavedContentRef.current = cleanedResources;
+          setOriginalContent(cleanedOriginal);
         } else {
           // If no separator, assume it's all original content (from Step 1)
           // But if it already looks like resources (starts with template header), handle that?
           // For now, assume Step 1 output is raw text.
-          setOriginalContent(fullContent);
+          setOriginalContent(stripThinkingContent(fullContent));
           setResourcesContent("");
           lastSavedContentRef.current = "";
         }
@@ -83,8 +214,9 @@ export default function ScriptResourcesPage() {
       if (!token) return;
       const fullContent = resourcesContent + SEPARATOR + originalContent;
       try {
-        await saveScript(token, projectId, fullContent);
+        const saved = await saveScript(token, projectId, fullContent);
         lastSavedContentRef.current = resourcesContent;
+        setCurrentScriptVersion(Number(saved.version || 0));
         setMessage("已自动保存");
       } catch (e) {
         console.error("Auto-save failed", e);
@@ -108,24 +240,22 @@ export default function ScriptResourcesPage() {
 
     setGenerating(true);
     setMessage("正在提取资源...");
-    
+
     try {
-      // Use original content for extraction
-      const result = await generateScript(token, projectId, {
-        mode: "extract_resources",
-        content: originalContent, // Extract from the raw script
+      const task = await startStep2Task(token, projectId, {
+        op: "extract",
+        original_content: originalContent,
         model: selectedModel,
       });
-      
-      if (result.content) {
-        setResourcesContent(result.content);
-        setMessage("提取完成");
-      } else {
-        setMessage("提取失败：AI 未返回可用内容，请重试");
-      }
+      persistPendingTask({
+        op: "extract",
+        taskId: task.task_id,
+        startedAt: Date.now(),
+        baselineVersion: currentScriptVersion,
+      });
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "提取失败");
-    } finally {
+      clearPendingTask();
       setGenerating(false);
     }
   };
@@ -141,19 +271,22 @@ export default function ScriptResourcesPage() {
     setIsModifying(true);
     setMessage("AI 修改中...");
     try {
-      const result = await generateScript(token, projectId, {
-        mode: "step2_modify",
-        content: resourcesContent, // Modify the extracted resources
+      const task = await startStep2Task(token, projectId, {
+        op: "modify",
+        original_content: originalContent,
+        resources_content: resourcesContent,
         model: selectedModel,
-        instruction: instruction,
+        instruction,
       });
-      if (result.content) {
-        setResourcesContent(result.content);
-        setMessage("AI 修改完成");
-      }
+      persistPendingTask({
+        op: "modify",
+        taskId: task.task_id,
+        startedAt: Date.now(),
+        baselineVersion: currentScriptVersion,
+      });
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "修改失败");
-    } finally {
+      clearPendingTask();
       setIsModifying(false);
     }
   };
@@ -165,7 +298,8 @@ export default function ScriptResourcesPage() {
 
     const fullContent = resourcesContent + SEPARATOR + originalContent;
     try {
-      await saveScript(token, projectId, fullContent);
+      const saved = await saveScript(token, projectId, fullContent);
+      setCurrentScriptVersion(Number(saved.version || 0));
       setMessage("已保存");
     } catch {
       setMessage("保存失败");
@@ -180,13 +314,24 @@ export default function ScriptResourcesPage() {
     setGenerating(true);
     setMessage("保存并同步素材...");
     try {
-      await save();
-      await extractAssets(token, projectId);
-      setMessage("同步完成");
+      const fullContent = resourcesContent + SEPARATOR + originalContent;
+      const saved = await saveScript(token, projectId, fullContent);
+      setCurrentScriptVersion(Number(saved.version || 0));
+      const task = await startStep2Task(token, projectId, {
+        op: "sync",
+        original_content: originalContent,
+        resources_content: resourcesContent,
+      });
+      persistPendingTask({
+        op: "sync",
+        taskId: task.task_id,
+        startedAt: Date.now(),
+        baselineVersion: Number(saved.version || 0),
+      });
       router.push(`/projects/${projectId}/script/assets`);
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "同步失败");
-    } finally {
+      clearPendingTask();
       setGenerating(false);
     }
   };

@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import Image from "next/image";
 import { getToken } from "@/lib/auth";
-import { generateSegmentFrameImage, generateTTS, getProjectVoices, type Asset, type CharacterVoice } from "@/lib/api";
+import { generateSegmentFrameImage, getSegmentFrameImageTaskStatus, generateTTS, getProjectVoices, type Asset, type CharacterVoice } from "@/lib/api";
 
 interface ScriptEditorProps {
   content: string;
@@ -49,6 +49,8 @@ type PersistedFrameState = {
   firstImageMap?: Record<string, string[]>;
   lastImageMap?: Record<string, string[]>;
   appliedMap?: Record<string, { first?: string; last?: string }>;
+  previousEndFrameMap?: Record<string, boolean>;
+  pendingMap?: Record<string, number>;
 };
 
 const VOICE_TAG_GROUPS: VoiceTagGroup[] = [
@@ -156,7 +158,9 @@ const VOICE_TAG_GROUPS: VoiceTagGroup[] = [
 
 const KLING_COLUMN = "视频生成";
 const LEGACY_KLING_COLUMN = "Kling视频生成";
-const getFrameStateStorageKey = (projectId: string) => `script_editor_frame_state_v1:${projectId}`;
+const getFrameStateStorageKey = (projectId: string) => `script_editor_frame_state_v2:${projectId}`;
+const FRAME_PENDING_MAX_AGE_MS = 30 * 60 * 1000;
+const buildFramePendingKey = (rowIndex: number, frameType: "first" | "last") => `${rowIndex}:${frameType}`;
 const isCompletedVideoVersion = (version: { video_url: string; status: string }) => {
   const status = String(version.status || "").toUpperCase();
   if (!version.video_url) return false;
@@ -279,6 +283,7 @@ export function ScriptEditor({
   const [frameFirstImageMap, setFrameFirstImageMap] = useState<Record<number, string[]>>({});
   const [frameLastImageMap, setFrameLastImageMap] = useState<Record<number, string[]>>({});
   const [frameAppliedMap, setFrameAppliedMap] = useState<Record<number, { first?: string; last?: string }>>({});
+  const [framePendingMap, setFramePendingMap] = useState<Record<string, number>>({});
   const [previewFrameUrl, setPreviewFrameUrl] = useState<string | null>(null);
   const [frameError, setFrameError] = useState("");
   const [frameEditTarget, setFrameEditTarget] = useState<{ frameType: "first" | "last"; imageUrl: string } | null>(null);
@@ -379,6 +384,8 @@ export function ScriptEditor({
       setFrameFirstImageMap({});
       setFrameLastImageMap({});
       setFrameAppliedMap({});
+      setUsePreviousEndFrameMap({});
+      setFramePendingMap({});
       return;
     }
     try {
@@ -387,16 +394,31 @@ export function ScriptEditor({
         setFrameFirstImageMap({});
         setFrameLastImageMap({});
         setFrameAppliedMap({});
+        setUsePreviousEndFrameMap({});
+        setFramePendingMap({});
         return;
       }
       const parsed = JSON.parse(raw) as PersistedFrameState;
       setFrameFirstImageMap(parsed.firstImageMap || {});
       setFrameLastImageMap(parsed.lastImageMap || {});
       setFrameAppliedMap(parsed.appliedMap || {});
+      setUsePreviousEndFrameMap(parsed.previousEndFrameMap || {});
+      const now = Date.now();
+      const rawPendingMap = parsed.pendingMap || {};
+      const nextPendingMap: Record<string, number> = {};
+      Object.entries(rawPendingMap).forEach(([key, ts]) => {
+        const value = Number(ts || 0);
+        if (value > 0 && now - value <= FRAME_PENDING_MAX_AGE_MS) {
+          nextPendingMap[key] = value;
+        }
+      });
+      setFramePendingMap(nextPendingMap);
     } catch {
       setFrameFirstImageMap({});
       setFrameLastImageMap({});
       setFrameAppliedMap({});
+      setUsePreviousEndFrameMap({});
+      setFramePendingMap({});
     }
   }, [projectId]);
 
@@ -406,11 +428,13 @@ export function ScriptEditor({
       firstImageMap: frameFirstImageMap,
       lastImageMap: frameLastImageMap,
       appliedMap: frameAppliedMap,
+      previousEndFrameMap: usePreviousEndFrameMap,
+      pendingMap: framePendingMap,
     };
     try {
       localStorage.setItem(getFrameStateStorageKey(projectId), JSON.stringify(payload));
     } catch {}
-  }, [projectId, frameFirstImageMap, frameLastImageMap, frameAppliedMap]);
+  }, [projectId, frameFirstImageMap, frameLastImageMap, frameAppliedMap, usePreviousEndFrameMap, framePendingMap]);
 
   // Parse markdown content into blocks
   const stripThinkingContent = useCallback((markdown: string) => {
@@ -1129,6 +1153,74 @@ export function ScriptEditor({
     insertFrameReferenceToken({ assetId, name, imageUrl });
   };
 
+  const markFramePending = useCallback((rowIndex: number, frameType: "first" | "last", pending: boolean) => {
+    const key = buildFramePendingKey(rowIndex, frameType);
+    setFramePendingMap((prev) => {
+      if (pending) {
+        return { ...prev, [key]: Date.now() };
+      }
+      if (!Object.prototype.hasOwnProperty.call(prev, key)) return prev;
+      const next = { ...prev };
+      delete next[key];
+      return next;
+    });
+  }, []);
+
+  const appendGeneratedFrameImage = useCallback((rowIndex: number, frameType: "first" | "last", imageUrl: string) => {
+    if (!projectId || !imageUrl) return;
+    setFrameFirstImageMap((prev) => {
+      if (frameType !== "first") return prev;
+      const list = prev[rowIndex] || [];
+      return { ...prev, [rowIndex]: [imageUrl, ...list] };
+    });
+    setFrameLastImageMap((prev) => {
+      if (frameType !== "last") return prev;
+      const list = prev[rowIndex] || [];
+      return { ...prev, [rowIndex]: [imageUrl, ...list] };
+    });
+    try {
+      const raw = localStorage.getItem(getFrameStateStorageKey(projectId));
+      const parsed = raw ? (JSON.parse(raw) as PersistedFrameState) : {};
+      const firstImageMap = parsed.firstImageMap || {};
+      const lastImageMap = parsed.lastImageMap || {};
+      if (frameType === "first") {
+        const list = firstImageMap[rowIndex] || [];
+        firstImageMap[rowIndex] = [imageUrl, ...list];
+      } else {
+        const list = lastImageMap[rowIndex] || [];
+        lastImageMap[rowIndex] = [imageUrl, ...list];
+      }
+      localStorage.setItem(
+        getFrameStateStorageKey(projectId),
+        JSON.stringify({
+          ...parsed,
+          firstImageMap,
+          lastImageMap,
+        })
+      );
+    } catch {}
+  }, [projectId]);
+
+  const waitForFrameTask = useCallback(async (taskId: string) => {
+    if (!projectId) throw new Error("项目不存在");
+    const token = getToken();
+    if (!token) throw new Error("登录已失效");
+    const start = Date.now();
+    while (Date.now() - start < 15 * 60 * 1000) {
+      const status = await getSegmentFrameImageTaskStatus(token, projectId, taskId);
+      if (status.status === "COMPLETED") {
+        const imageUrl = String((status.result?.image_url as string) || "").trim();
+        if (!imageUrl) throw new Error("未返回图片地址");
+        return imageUrl;
+      }
+      if (status.status === "FAILED") {
+        throw new Error(status.error || "生成失败");
+      }
+      await new Promise((resolve) => setTimeout(resolve, 2000));
+    }
+    throw new Error("生成超时，请稍后刷新查看");
+  }, [projectId]);
+
   const generateFrameImage = async (frameType: "first" | "last") => {
     if (!projectId || frameModalRowIndex === null) return;
     const rowIndex = frameModalRowIndex;
@@ -1140,36 +1232,24 @@ export function ScriptEditor({
       return;
     }
     setFrameGeneratingType(frameType);
+    markFramePending(rowIndex, frameType, true);
     setFrameError("");
     try {
       const references = Array.from(new Set(frameReferences.map((item) => item.imageUrl))).filter(Boolean);
-      const result = await generateSegmentFrameImage(token, projectId, {
+      const task = await generateSegmentFrameImage(token, projectId, {
         prompt,
         references,
         frame_type: frameType,
         aspect_ratio: "16:9",
       });
-      const generated = String(result.image_url || "").trim();
-      if (!generated) {
-        setFrameError("未返回图片地址");
-        return;
-      }
-      if (frameType === "first") {
-        setFrameFirstImageMap((prev) => {
-          const list = prev[rowIndex] || [];
-          return { ...prev, [rowIndex]: [generated, ...list] };
-        });
-      } else {
-        setFrameLastImageMap((prev) => {
-          const list = prev[rowIndex] || [];
-          return { ...prev, [rowIndex]: [generated, ...list] };
-        });
-      }
+      const generated = await waitForFrameTask(task.task_id);
+      appendGeneratedFrameImage(rowIndex, frameType, generated);
     } catch (error) {
       if (frameModalRowIndexRef.current === rowIndex) {
         setFrameError(error instanceof Error ? error.message : "生成失败");
       }
     } finally {
+      markFramePending(rowIndex, frameType, false);
       setFrameGeneratingType(null);
     }
   };
@@ -1222,32 +1302,19 @@ export function ScriptEditor({
       return;
     }
     setFrameEditing(true);
+    markFramePending(rowIndex, editTarget.frameType, true);
     setFrameError("");
     try {
       const references = Array.from(new Set([editTarget.imageUrl, ...extraRefs])).filter(Boolean);
       const mergedPrompt = `${basePrompt}\n修改意见：${editPrompt}`.trim();
-      const result = await generateSegmentFrameImage(token, projectId, {
+      const task = await generateSegmentFrameImage(token, projectId, {
         prompt: mergedPrompt,
         references,
         frame_type: editTarget.frameType,
         aspect_ratio: "16:9",
       });
-      const generated = String(result.image_url || "").trim();
-      if (!generated) {
-        setFrameError("未返回图片地址");
-        return;
-      }
-      if (editTarget.frameType === "first") {
-        setFrameFirstImageMap((prev) => {
-          const list = prev[rowIndex] || [];
-          return { ...prev, [rowIndex]: [generated, ...list] };
-        });
-      } else {
-        setFrameLastImageMap((prev) => {
-          const list = prev[rowIndex] || [];
-          return { ...prev, [rowIndex]: [generated, ...list] };
-        });
-      }
+      const generated = await waitForFrameTask(task.task_id);
+      appendGeneratedFrameImage(rowIndex, editTarget.frameType, generated);
       if (frameModalRowIndexRef.current === rowIndex) {
         setFrameEditTarget(null);
         setFrameEditInput("");
@@ -1257,6 +1324,7 @@ export function ScriptEditor({
         setFrameError(error instanceof Error ? error.message : "修改失败");
       }
     } finally {
+      markFramePending(rowIndex, editTarget.frameType, false);
       setFrameEditing(false);
     }
   };
@@ -1597,19 +1665,19 @@ export function ScriptEditor({
                   <button
                     type="button"
                     onClick={() => generateFrameImage("first")}
-                    disabled={frameGeneratingType !== null}
+                    disabled={frameGeneratingType !== null || (frameModalRowIndex !== null && Boolean(framePendingMap[buildFramePendingKey(frameModalRowIndex, "first")]))}
                     className="rounded bg-emerald-600 px-3 py-1.5 text-xs text-white hover:bg-emerald-700 disabled:opacity-50"
                   >
-                    {frameGeneratingType === "first" ? "生成中..." : "生成首帧"}
+                    {frameGeneratingType === "first" || (frameModalRowIndex !== null && Boolean(framePendingMap[buildFramePendingKey(frameModalRowIndex, "first")])) ? "生成中..." : "生成首帧"}
                   </button>
                 ) : (
                   <button
                     type="button"
                     onClick={() => generateFrameImage("last")}
-                    disabled={frameGeneratingType !== null}
+                    disabled={frameGeneratingType !== null || (frameModalRowIndex !== null && Boolean(framePendingMap[buildFramePendingKey(frameModalRowIndex, "last")]))}
                     className="rounded bg-fuchsia-600 px-3 py-1.5 text-xs text-white hover:bg-fuchsia-700 disabled:opacity-50"
                   >
-                    {frameGeneratingType === "last" ? "生成中..." : "生成尾帧"}
+                    {frameGeneratingType === "last" || (frameModalRowIndex !== null && Boolean(framePendingMap[buildFramePendingKey(frameModalRowIndex, "last")])) ? "生成中..." : "生成尾帧"}
                   </button>
                 )}
                 {frameError ? <span className="text-xs text-rose-600">{frameError}</span> : null}
@@ -2103,6 +2171,11 @@ function TableCell({
     if (text.includes("场景")) return "SCENE";
     return null;
   }, [columnHeader]);
+  const enableAssetBindingAssist = React.useMemo(() => {
+    const text = (columnHeader || "").replace(/\s+/g, "");
+    if (!text) return false;
+    return text.includes("角色形象") || text === "形象" || text.includes("道具") || text.includes("场景") || text.includes("角色");
+  }, [columnHeader]);
   const resolveAssetImageUrl = React.useCallback((asset: Asset) => {
     const versions = asset.versions || [];
     const selectedVersion = versions.find((v) => v.is_selected && Boolean((v.image_url || "").trim()));
@@ -2115,21 +2188,21 @@ function TableCell({
   const { displayText, assetRefs } = React.useMemo(() => {
     const assetTagRegex = /\[AssetID:\s*([^\]]+)\]/g;
     const refs: Array<{ raw: string; id?: string; name: string }> = [];
+    const seenRefKey = new Set<string>();
     const trimmedValue = value || "";
-    let text = trimmedValue;
-    let match: RegExpExecArray | null;
-
-    while ((match = assetTagRegex.exec(trimmedValue)) !== null) {
-      const raw = (match[1] || "").trim();
-      if (!raw) continue;
+    if (!enableAssetBindingAssist) {
+      return { displayText: trimmedValue, assetRefs: refs };
+    }
+    const allAssets = projectAssets || [];
+    const typeFiltered =
+      preferredAssetTypes && preferredAssetTypes.length > 0
+        ? allAssets.filter((asset) => preferredAssetTypes.includes(asset.type))
+        : allAssets;
+    const searchPool = typeFiltered.length > 0 ? typeFiltered : allAssets;
+    const findAssetByRaw = (raw: string) => {
       const rawKey = normalizeAssetKey(raw);
-      const allAssets = projectAssets || [];
-      const exact = allAssets.find((asset) => asset.id === raw);
-      const typeFiltered =
-        preferredAssetTypes && preferredAssetTypes.length > 0
-          ? allAssets.filter((asset) => preferredAssetTypes.includes(asset.type))
-          : allAssets;
-      const searchPool = typeFiltered.length > 0 ? typeFiltered : allAssets;
+      const exactById = searchPool.find((asset) => asset.id === raw) || allAssets.find((asset) => asset.id === raw);
+      if (exactById) return exactById;
       const scored = searchPool
         .map((asset) => {
           const versions = asset.versions || [];
@@ -2138,11 +2211,8 @@ function TableCell({
           const hasImage = Boolean(latestVersion);
           const assetKey = normalizeAssetKey(asset.name);
           let nameMatchScore = 0;
-          if (asset.name.trim() === raw) nameMatchScore = Math.max(nameMatchScore, 100);
-          if (assetKey && rawKey && assetKey === rawKey) nameMatchScore = Math.max(nameMatchScore, 80);
-          if (assetKey && rawKey && (assetKey.includes(rawKey) || rawKey.includes(assetKey))) {
-            nameMatchScore = Math.max(nameMatchScore, 50);
-          }
+          if (asset.name.trim() === raw) nameMatchScore = Math.max(nameMatchScore, 120);
+          if (assetKey && rawKey && assetKey === rawKey) nameMatchScore = Math.max(nameMatchScore, 100);
           if (nameMatchScore <= 0) {
             return { asset, score: 0 };
           }
@@ -2154,23 +2224,42 @@ function TableCell({
         })
         .filter((item) => item.score > 0)
         .sort((a, b) => b.score - a.score);
-      const byName = exact || scored[0]?.asset;
+      return scored[0]?.asset;
+    };
+    const pushRef = (raw: string) => {
+      const text = String(raw || "").trim();
+      if (!text) return;
+      const byName = findAssetByRaw(text);
+      const refKey = `${byName?.id || ""}:${text}`;
+      if (seenRefKey.has(refKey)) return;
+      seenRefKey.add(refKey);
       refs.push({
-        raw,
+        raw: text,
         id: byName?.id,
-        name: byName?.name || raw,
+        name: byName?.name || text,
       });
+    };
+
+    let match: RegExpExecArray | null;
+    while ((match = assetTagRegex.exec(trimmedValue)) !== null) {
+      pushRef((match[1] || "").trim());
     }
 
-    text = trimmedValue.replace(assetTagRegex, "").trim();
+    const text = trimmedValue.replace(assetTagRegex, "").trim();
+    text
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter(Boolean)
+      .forEach((line) => pushRef(line));
+
     return { displayText: text, assetRefs: refs };
-  }, [normalizeAssetKey, preferredAssetTypes, projectAssets, value]);
+  }, [enableAssetBindingAssist, normalizeAssetKey, preferredAssetTypes, projectAssets, value]);
   const pickerAssetData = React.useMemo<{
     items: Array<{ id: string; name: string; hasImage: boolean; imageUrl: string }>;
     canonicalIdBySourceId: Map<string, string>;
   }>(() => {
     const canonicalIdBySourceId = new Map<string, string>();
-    if (!pickerAssetType || !projectAssets || projectAssets.length === 0) {
+    if (!enableAssetBindingAssist || !pickerAssetType || !projectAssets || projectAssets.length === 0) {
       return { items: [], canonicalIdBySourceId };
     }
     const grouped = new Map<
@@ -2226,7 +2315,7 @@ function TableCell({
       });
     });
     return { items, canonicalIdBySourceId };
-  }, [normalizeAssetKey, pickerAssetType, projectAssets, projectId, resolveAssetImageUrl]);
+  }, [enableAssetBindingAssist, normalizeAssetKey, pickerAssetType, projectAssets, projectId, resolveAssetImageUrl]);
   const pickerAssets = pickerAssetData.items;
 
   const assetImages = React.useMemo(() => {
@@ -2270,11 +2359,18 @@ function TableCell({
     });
   }, []);
   const applyPickerSelection = React.useCallback(() => {
-    const tags = selectedPickerIds.map((id) => `[AssetID:${id}]`).join(" ");
-    const nextValue = displayText && tags ? `${displayText}\n${tags}` : displayText || tags;
-    onChange(nextValue);
+    const selectedNames = selectedPickerIds
+      .map((id) => pickerAssets.find((item) => item.id === id)?.name)
+      .filter((name): name is string => Boolean(name));
+    const pickerNameKeySet = new Set(pickerAssets.map((item) => normalizeAssetKey(item.name)));
+    const baseLines = String(displayText || "")
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter((line) => line && !pickerNameKeySet.has(normalizeAssetKey(line)));
+    const nextLines = [...baseLines, ...selectedNames];
+    onChange(nextLines.join("\n"));
     setPickerOpen(false);
-  }, [displayText, onChange, selectedPickerIds]);
+  }, [displayText, normalizeAssetKey, onChange, pickerAssets, selectedPickerIds]);
 
   if (isEditing) {
     return (
@@ -2294,7 +2390,7 @@ function TableCell({
         onClick={() => setIsEditing(true)}
         className="min-h-[24px] cursor-text"
       >
-        {pickerAssetType ? (
+        {enableAssetBindingAssist && pickerAssetType ? (
           <div className="mb-1">
             <button
               type="button"
@@ -2309,7 +2405,7 @@ function TableCell({
           {displayText || <span className="text-slate-300 italic">空</span>}
         </div>
 
-        {assetRefs.length > 0 ? (
+        {enableAssetBindingAssist && assetRefs.length > 0 ? (
           <div className="mt-1 flex flex-wrap gap-2">
             {assetRefs.map((assetRef, index) => {
               const image = assetRef.id ? assetImages.find((item) => item.id === assetRef.id) : undefined;

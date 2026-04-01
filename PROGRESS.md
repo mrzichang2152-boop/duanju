@@ -417,6 +417,10 @@
 - 2026-03-22 - 排查 - 核对 `segment_versions`：`KLING_PROCESSING` 数量为 0，`FAILED` 仅剩历史测试记录 `fake-ver-1`（task_id=`...|fake123`），非真实线上任务。
 - 2026-03-22 - 验证 - 复核 Step4 生成参数链路：前端按“所选分镜行字段 + system_prompt”组装请求并传入 `segments/generate`，后端透传至 `create_video`。
 - 2026-03-22 - 修复 - 修复前端 3001 端口直连登录时报 500：`next.config.ts` 的 `/api` 重写默认后端地址改为“开发环境 localhost:8003，生产环境 backend:8000”，避免容器内误指向 localhost。
+- 2026-03-31 - 前后端 - 调整 Step2 角色形象命名规范为“角色名·形象名”（示例：`冯硕·探长法神装`）；Step3 素材列表卡片标题移除“· 角色/· 角色形象”拼接，仅显示素材名；后端提取逻辑兼容已带角色名前缀的角色形象名，避免重复拼接。
+- 2026-03-31 - 后端 - 修复 Step2 输出污染：提取阶段禁用 thinking，并在流式与落库解析前统一剥离 `<think>...</think>`/reasoning 内容，避免思考链展示到资源列表。
+- 2026-03-31 - 后端 - 强化 Step2 提示词约束：角色形象命名增加反例与硬性自检规则，要求每条形象名必须以“角色名·”开头（如 `冯硕·探长法神装`）。
+- 2026-03-31 - 前端 - 修复 Step3 素材列表标题展示：统一去除名称末尾的类型后缀（如“· 角色/· 角色形象/· 道具/· 场景”），卡片标题与版本提示仅显示素材名本体。
 - 2026-03-22 - 验证 - 重建并重启 `frontend` 容器后，`POST http://localhost:3001/api/auth/login` 返回 `400 {"detail":"账号或密码错误"}`，不再出现 500。
 - 2026-03-22 - 验证 - 前端执行 `npm run lint && npm run typecheck` 完成，当前为历史遗留告警/报错（与本次改动文件无关）。
 - 2026-03-22 - 排查 - 复现 Step4 失败并确认 Kling 返回 `code=1201`：`prompt: size must be between 0 and 2500`，根因为分镜行内容与系统提示词拼接后超长。
@@ -453,6 +457,22 @@
 - 2026-03-22 - 修复 - Step4 单元格名称解析同名素材时按“已选且有图 > 有图 > 版本数”择优，避免同名旧资产 ID 被优先命中。
 - 2026-03-22 - 验证 - 后端执行 `python3 -m py_compile app/services/linkapi.py` 通过；前端执行 `npx eslint src/app/projects/[id]/script/storyboard/page.tsx` 与 `npm run typecheck` 通过（0 error）。
 - 2026-03-22 - 修复 - 排查 Step4 按钮状态“未生效”根因：docker-compose 前后端服务仅重启未重建镜像，导致最新前后端代码未加载。
+- 2026-03-31 - 前后端 - 恢复主体生成功能全链路：从 `3d9db23` 回补主体相关模型/服务/API 与 Step2-4 对应前端交互改动，并部署到 82.156.124.215。
+- 2026-03-31 - 后端 - 调整 Step2 素材提取/修改提示词：角色形象命名强制为“角色名·形象名”（示例：`冯硕·神探教父装`），禁止仅输出形象名。
+- 2026-03-31 - 前后端 - 修复 Step3/Step4 素材与分镜链路：Step3 素材标题统一去除“·角色/·角色形象/·道具/·场景”后缀；Step4 分镜按“出场集数优先+分集内容命中兜底”筛选该集素材并下发；角色形象列强制仅输出“角色形象全名[AssetID]”；修复角色形象解析避免把描述串进名称。
+- 2026-03-31 - 后端 - 调整 Step4 分镜生成：分集素材筛选仅按“出场集数”命中；若该集未命中任何素材，则不注入素材库与AssetID约束，直接使用系统提示词 + 风格instruction + 该集内容生成。
+- 2026-03-31 - 后端 - 修复 Step3 角色形象解析：新增角色形象名标准化（仅保留“角色名·形象名”），当模型把描述误串入名称（多余“·”片段）时自动回流到描述字段；并清理“第X集”类残留描述。
+- 2026-03-31 - 前后端 - 进一步修复 Step3 角色形象错位：`/assets` 返回前自动纠正历史 `CHARACTER_LOOK` 名称/描述（并持久化）；Step2 提示词改为“角色名形象名（禁用·）”以降低名称与描述混淆。
+- 2026-03-31 - 后端 - 修复 Step3 500：补回 `assets` API 对角色形象标准化函数的导入并恢复元数据变更提交标记，解决 `/projects/{id}/assets` NameError。
+- 2026-03-31 - 前后端 - 修复 Step3 角色形象丢失：恢复 Step2 提示词为“角色名·形象名”；`/assets` 新增无分隔符角色形象名的角色前缀识别与自动纠正（按已有角色名最长前缀匹配），兼容历史“禁用·”期间产生的数据。
+- 2026-03-31 - 后端 - 收紧 Step4 分镜提示词约束：按“该集素材白名单”显式下发角色形象/道具/场景并禁止越界虚构；强制“镜头调度与内容融合”及台词角色标识使用完整角色形象名（禁止简称）。
+- 2026-03-31 - 后端 - 调整 Step4 分镜生成参数：将模型 temperature 从 0.7 下调至 0.2，降低素材越界与角色简称漂移概率。
+- 2026-03-31 - 后端 - 统一 Step4 两条生成路径（异步任务接口与通用生成接口）的采样参数：`generate_storyboard` 模式均使用 `temperature=0.2`。
+- 2026-03-31 - 后端 - 修复 Step3/Step4 角色音色映射：主体生成与视频生成的角色匹配从“仅规范名相等”升级为“角色全名优先 + 规范名 + 最长前缀”，确保角色形象（如“金毛汪老板·落魄暴发户装”）能稳定命中对应 Kling 自定义音色。
+- 2026-03-31 - 后端 - 排查并修复 Step4 主体引用链路：`element_list` 改为严格官方格式（仅传 `element_id`），移除非官方字段；当角色已配置 Kling 音色但主体创建失败时不再静默回退图片，改为直接报错，避免“形象对但声音回退默认音色”的隐性失败。
+- 2026-03-31 - 后端 - 按 2026-03-23 官方更新对齐：确认“多图主体可绑定音色”，并清理 Step4 请求构造中的遗留 `elements` 兼容分支条件，统一以官方 `element_list` 字段判定与下发。
+- 2026-03-31 - 后端 - 临时切换 Step4 为“仅主体生成”诊断模式：角色素材在视频生成阶段必须命中可用主体，彻底禁用角色图片降级路径；主体缺失即直接报错，用于区分“主体引用问题”与“主体音色绑定问题”。
+- 2026-03-31 - 后端 - 新增“同角色仅保留最新音色/主体”机制：Step3 生成新 Kling 音色后自动删除该角色历史音色（本地+远端）；Step4 角色主体复用/新建时自动清理同角色历史主体记录并删除远端旧主体，仅保留最新结果供视频生成使用。
 - 2026-03-22 - 验证 - 执行 `docker compose up -d --build backend frontend` 重建并重启服务，随后 `curl http://127.0.0.1:8003/health` 与 `curl http://127.0.0.1:3001` 均返回 200。
 - 2026-03-22 - 规则 - 更新 `.trae/rules/project_rules.md`：新增 Docker 重启规范，约束代码改动后必须执行 `docker compose up -d --build backend frontend`，禁止仅 restart。
 - 2026-03-22 - 修复 - 修正 Step4/Step5 版本回退方向：后端按 `created_at desc` 返回时，前端不再回退到数组末尾旧版本，统一改为优先最新完成版本，修复“选新版本却播放旧视频”问题。
@@ -978,3 +998,77 @@
 
 
 - 2026-03-29 - 规范 - 新增 CodeBuddy 项目规则入口 `.codebuddy/rules/project_rules.md`（always 生效），保留 `.trae/rules/project_rules.md` 不变；同步更新 `RULES.md` 入口与三处规则语义一致约定。
+
+- 2026-03-31 - 前端 - Step4 资产绑定解析增强：`resolveAssetIdsFromCell` 新增“按整格文本模糊匹配资产名”兜底，支持包含补充描述/括号信息的角色形象文本命中正确素材，避免未传 `asset_bindings` 导致生成角色跑偏。
+- 2026-03-31 - 验证 - 前端执行 `npm run dev` 启动检查通过（无启动报错）。
+
+- 2026-03-31 - 后端 - 修复 Kling 主体创建 `external_task_id` 生成策略：由事件循环毫秒值改为 UUID 随机值，并在接口返回 code=1201（重复任务ID）时自动重试一次，避免“新建主体失败后沿用旧主体”导致音色错配。
+- 2026-03-31 - 验证 - 已执行 `frontend/npm run dev` 启动检查通过（Next.js Ready）。
+
+- 2026-03-31 - 前端 - 主体生成接口超时策略调整：`generateAssetSubject` 独立超时提升至 180s，避免生成主体首请求在 15s 被前端中断（499）。
+- 2026-03-31 - 后端 - 主体创建任务ID防重：`external_task_id` 改为 UUID 随机，并在可灵返回 `code=1201` 时自动重试一次。
+- 2026-03-31 - 部署 - 已将 `backend/app/services/linkapi.py` 与 `frontend/src/lib/api.ts` 部署到 82.156.124.215（`/root/video-gen`），并重建重启 `backend/frontend` 容器。
+- 2026-03-31 - 验证 - 线上脚本连续两次强制重建“金毛汪老板·受害者常服”主体均一次成功（约 10.3s），未复现旧版 `1201 external_task_id already exists`。
+- 2026-03-31 - 验证 - 本地执行 `frontend/npm run dev` 启动检查通过（Next.js Ready）。
+- 2026-03-31 - 后端 - 修复 Step5 分镜素材白名单回退：当按出场集数筛选素材为空时自动回退到项目全量白名单，避免提示词缺失【可用素材库】导致模型虚构 `[AssetID:xxxx]` 占位。
+- 2026-03-31 - 验证 - 已执行 `frontend/npm run dev` 启动检查通过（Next.js Ready，白名单回退修复后）。
+- 2026-03-31 - 后端 - 修复 Step5 分镜集数匹配：增强出场集数解析（支持中文数字、范围、列表与“第二、第三集”写法），并支持“跨集/每集/全程”等全分集素材标记，避免误判为无白名单。
+- 2026-03-31 - 后端 - 修复 Step4 首尾帧异步任务报错：`backend/app/api/segments.py` 补充 `import json`，解决 `name 'json' is not defined`。
+- 2026-03-31 - 部署 - 已将 `backend/app/api/script.py`（Step5 集数解析增强）与 `backend/app/api/segments.py`（Step4 首尾帧 json 导入修复）同步到 82.156.124.215:/root/video-gen，并重建 `backend` 容器。
+- 2026-03-31 - 验证 - 服务器内 `http://127.0.0.1:8003/health` 与公网 `http://82.156.124.215/api/health` 均返回 `{"status":"ok"}`。
+- 2026-03-31 - 前端 - 修复 Step4 首尾帧“已出图仍显示生成中”：恢复本地 `pendingMap` 时若同分镜同帧已存在生成图片则自动清理残留 pending 标记，避免按钮长期禁用。
+- 2026-03-31 - 验证 - `read_lints frontend/src/app/components/ScriptEditor.tsx` 0 错误；执行 `frontend/npm run dev` 启动通过（Next.js Ready）。
+- 2026-03-31 - 部署 - 已将 `frontend/src/app/components/ScriptEditor.tsx` 同步到 82.156.124.215:/root/video-gen，并重建 `frontend` 容器。
+- 2026-03-31 - 验证 - 服务器内 `http://127.0.0.1:3001` 可访问（FRONTEND_OK），`http://127.0.0.1:8003/health` 与公网 `http://82.156.124.215/api/health` 均返回正常。
+- 2026-03-31 - 前后端 - Step4 首尾帧支持切换 GRSAI 绘画模型：前端弹窗新增模型下拉（读取 `/linkapi/models` 的 draw 模型），并将所选 `model` 透传给首/尾帧生成与修改接口；后端 `SegmentFrameGenerateRequest` 新增 `model` 字段并用于 `create_image` 请求。
+- 2026-03-31 - 验证 - 本地：`read_lints`（ScriptEditor/api.ts/segments.py）0 错误，`python3 -m py_compile backend/app/api/segments.py backend/app/schemas/segments.py` 通过，`frontend/npm run dev` 启动 Ready。
+- 2026-03-31 - 部署 - 已同步 `backend/app/api/segments.py`、`backend/app/schemas/segments.py`、`frontend/src/app/components/ScriptEditor.tsx`、`frontend/src/lib/api.ts` 到 82.156.124.215:/root/video-gen，并重建 `backend/frontend` 容器。
+- 2026-03-31 - 验证 - 线上 `http://127.0.0.1:8003/health`、`http://127.0.0.1:3001`、公网 `http://82.156.124.215/` 与 `http://82.156.124.215/api/health` 均正常。
+- 2026-03-31 - 线上运维 - 排查 `svgn@qq.com` 生成视频报错，定位为该账号 `user_settings.api_key_encrypted` 为空（Kling 官方鉴权缺失，报 `has_saved_key=False key_len=0`）。
+- 2026-03-31 - 线上修复 - 已为 `svgn@qq.com` 同步可用视频鉴权配置（数据库内 key 长度由 0 变更为 204）。
+- 2026-03-31 - 验证 - 远程 `data/db.sqlite3` 查询确认 `svgn@qq.com` 已有保存 key；错误前置条件（无 key）已消除。
+- 2026-03-31 - 后端 - 修复 `svgn@qq.com` Step3「生成主体失败」：Kling 主体创建接口在 HTTP 400 且 `code=1201`（external_task_id 已存在）时，新增同端点换新 `external_task_id` 立即重试逻辑，避免误判失败并错误回退到非官方端点。
+- 2026-03-31 - 运维 - 线上构建失败排障：清理 Docker build cache（释放约 30.94GB）后成功重建 `backend` 容器。
+- 2026-03-31 - 部署/验证 - 已同步 `backend/app/services/linkapi.py` 到 82.156.124.215 并重建后端；容器内代码含 `got 400 duplicate external_task_id` 修复分支，`http://127.0.0.1:8003/health` 与公网 `http://82.156.124.215/api/health` 正常。
+- 2026-03-31 - 后端 - 修复项目「喵喵喵」Step3 生成主体 400：当 Kling 主体创建启用 voice 绑定失败（`task_status_msg` 提示图中未识别到角色）时，新增无 voice payload 回退重试，避免直接失败。
+- 2026-03-31 - 验证 - `read_lints backend/app/services/linkapi.py` 0 错误；`python3 -m py_compile backend/app/services/linkapi.py` 通过；`frontend/npm run dev` Ready。
+- 2026-03-31 - 部署 - 已同步 `backend/app/services/linkapi.py` 到 82.156.124.215:/root/video-gen 并重建 `backend` 容器。
+- 2026-03-31 - 验证 - 内网 `http://127.0.0.1:8003/health` 与公网 `http://82.156.124.215/api/health` 正常。
+- 2026-03-31 - 前后端 - Step3「生成主体」兜底策略改造：不再自动回退无 `element_voice_id`；当音色绑定路径失败时返回可确认提示，前端弹窗由用户选择“继续生成（不绑定音色）”或“暂不生成”。
+- 2026-03-31 - 前端 - `assets/page.tsx` 新增主体生成确认弹窗与二次请求（`allow_without_voice=true`），并优化提示文案。
+- 2026-03-31 - 后端 - `generate-subject` 新增可选入参 `allow_without_voice`，默认走音色绑定；首次失败返回 `409` 提示确认，用户确认后再走无音色绑定生成。
+- 2026-03-31 - 验证 - 本地 `read_lints`（assets.py/linkapi.py/assets page/api.ts）0 错误，`python3 -m py_compile backend/app/api/assets.py backend/app/services/linkapi.py` 通过，`frontend/npm run dev` Ready。
+- 2026-03-31 - 部署/验证 - 已同步并重建线上 `backend/frontend`，内网 `127.0.0.1:8003/health` 与公网 `http://82.156.124.215/api/health` 正常。
+- 2026-03-31 - 修正 - Step3 主体兜底最终实现：后端 `generate-subject` 增加 `allow_without_voice` 入参与 409 确认提示；前端捕获“未通过音色绑定检测”后弹窗让用户选择是否改为不带 `element_voice_id` 继续生成。
+- 2026-03-31 - 运维 - 线上重建 `backend/frontend` 后补充重启 `nginx`（刷新 upstream DNS），修复公网 `/api/*` 短时 502。
+- 2026-03-31 - 验证 - 公网 `http://82.156.124.215/` 200，`http://82.156.124.215/api/health` 返回 `{"status":"ok"}`。
+- 2026-03-31 - 排障 - 定位项目「喵喵喵」分镜（00:27-00:32，含“￥12,000.00元→￥0.00元”）生成中数秒消失根因：Kling 任务失败 `task_status_msg=Image pixel is invalid`（任务ID示例 `868004886213468258`）。
+- 2026-03-31 - 后端 - `query_kling_task_status` 扩展返回 `task_status_msg`，`/projects/{id}/segments` 在轮询状态时透传到 `SegmentVersionResponse.task_status_msg`。
+- 2026-03-31 - 前端 - `ScriptEditor` 在分镜版本最新状态为 `FAILED` 时展示失败提示文案（含后端透传原因，如 `Image pixel is invalid`），避免“状态消失但无报错”的体验。
+- 2026-03-31 - 验证 - 本地 `read_lints`（segments.py/kling_query.py/schemas/segments.py/ScriptEditor.tsx/api.ts）0 错误；`python3 -m py_compile` 通过；`frontend npm run dev` Ready。
+- 2026-03-31 - 部署/验证 - 已同步并重建线上 `backend/frontend`，内网与公网健康检查均为 `{"status":"ok"}`。
+- 2026-04-01 - 前端 - Step4 分镜表格单元格新增 Markdown 渲染（支持粗体/列表）并规范化 `\\n`、`\\\\`、`<br>` 为换行，提升“镜头调度与内容融合”等长文案可读性。
+- 2026-04-01 - 验证 - `frontend/src/app/components/ScriptEditor.tsx` lints 0 错误；`npm run dev` 启动成功（Local: http://localhost:3000, Ready）。
+- 2026-04-01 - 后端 - 修复 Step4 本地生成视频 `code=1201`：在 Kling 请求前新增 `reference_images + element_list` 总数上限控制（最大7），按优先级自动裁剪并同步 `image_list`，避免“The number of images and elements exceeds the limit”。
+- 2026-04-01 - 验证 - `python3 -m py_compile backend/app/services/linkapi.py` 通过；`npm run dev` 检查通过（检测到已有 `next dev` 占用 3000，服务持续可用）。
+- 2026-04-01 - 后端 - 按需求回退 Step4 Kling 引用自动裁剪逻辑，恢复“超过上限由上游直接报错”行为。
+- 2026-04-01 - 前端 - 修复 Step4 资产绑定过量：`resolveAssetIdsFromCell` 移除整段文本 fuzzy 资产匹配，优先仅使用显式 `[AssetID:...]`（无显式ID时才按整行精确名匹配），避免同名重复素材被隐式扩展为多条引用。
+- 2026-04-01 - 排查 - 本地账号 `1123@qq.com` 最新可落库分镜视频记录停在 `2026-03-26 15:58:39`，本次报错属于提交阶段失败；项目 `35b22908-f64e-409a-8b7f-80f7ded0f259` 存在大量同名素材（如“冯硕法探社”4条、“国家反诈中心APP/复古放大镜/民法典”各3条），会放大 fuzzy 匹配误命中风险。
+- 2026-04-01 - 验证 - `read_lints`（storyboard/page.tsx、linkapi.py）0 错误；`python3 -m py_compile backend/app/services/linkapi.py` 通过；`npm run dev` 本地 Ready(`http://localhost:3000`)；`docker compose up -d --build backend` 后健康检查 `{"status":"ok"}`。
+- 2026-04-01 - 前端 - Step4 生成视频改为“仅按用户显式选择素材绑定”：`resolveAssetIdsFromCell` 仅解析 `[AssetID: ...]`，不再按分镜文本/图片URL自动推断素材，避免系统自动绑定导致引用超限。
+- 2026-04-01 - 前端 - ScriptEditor 素材选择器写回格式改为 `名称 [AssetID: 资产ID]`；展示时去除标签，仅展示名称，确保“展示文本”与“真实绑定”解耦。
+- 2026-04-01 - 验证 - `read_lints`(storyboard/page.tsx、ScriptEditor.tsx) 0 错误；`npm run dev` 启动成功（Local: http://localhost:3000, Ready）。
+- 2026-04-01 - 前端 - 进一步收紧 Step4 引用来源：移除从表格文本中自动提取 `image_url` 的逻辑，角色/道具/场景列仅作展示，不再参与隐式引用。
+- 2026-04-01 - 验证 - 复测 `read_lints`(storyboard/page.tsx、ScriptEditor.tsx) 0 错误；`npm run dev` 再次启动成功（Local: http://localhost:3000, Ready）。
+- 2026-04-01 - 后端 - 修复 Step4 无声模式误拦截：Kling 角色音色缺失仅在 `with_audio=true` 或 `sound=on` 时强校验；无声模式允许仅主体生成，不再提示“未配置音色”。
+- 2026-04-01 - 排查 - 本地账号 `1123@qq.com` 项目 `35b22908-f64e-409a-8b7f-80f7ded0f259` 的 `character_voices` 为空（当前无该项目角色音色记录）；此前报错触发于后端对角色音色的全局强校验。
+- 2026-04-01 - 验证 - `read_lints`(linkapi.py) 0 错误；`python3 -m py_compile backend/app/services/linkapi.py` 通过；`npm run dev` Ready(`http://localhost:3000`)；后端重建后健康检查 `{"status":"ok"}`。
+- 2026-04-01 - 后端 - Kling 鉴权改为优先系统级 Key：新增 `resolve_kling_auth_token`（支持 `KLING_AK/KLING_SK` 或 `KLING_API_KEY/KLING_JWT`），Step4 视频生成、主体生成、角色音色上传/清理、Kling 任务查询统一走系统兜底，不再要求每个用户在设置页单独配置。
+- 2026-04-01 - 认证 - 关闭注册入口：移除登录页“去注册”入口，`/register` 页面改为关闭提示；后端下线 `/auth/register` 路由，仅保留登录。
+- 2026-04-01 - 数据 - 已在 `data/db.sqlite3` 生成 10 个测试账号（`test01@demo.local`~`test10@demo.local`，统一密码 `123456`）。
+- 2026-04-01 - 验证 - `read_lints`(linkapi.py/assets.py/voices.py/kling_query.py/auth.py/login.tsx/register.tsx) 0 错误；`python3 -m py_compile` 通过；`npm run dev` 启动成功（Local: http://localhost:3000, Ready）。
+- 2026-04-01 - 验证 - 后端已重建并启动：`docker compose up -d --build backend` 完成；健康检查 `curl http://127.0.0.1:8003/health` 返回 `{"status":"ok"}`。
+- 2026-04-01 - 数据 - 测试账号已改为无序好记命名：`red@apple.fun`、`blue@banana.fun`、`mint@orange.fun`、`sun@lemon.fun`、`cloud@grape.fun`、`river@peach.fun`、`panda@berry.fun`、`mango@cocoa.fun`、`luna@melon.fun`、`echo@plum.fun`（密码保持 `123456`）。
+- 2026-04-01 - 前端 - 顶部右上角头像下拉菜单在“设置”下新增“退出登录”按钮，点击后清理 `shortplay_token` 与 `shortplay_email` 并跳转 `/login`。
+- 2026-04-01 - 数据 - 测试账号已更新为无序且好记的 10 个邮箱（`red@apple.fun` 等），统一密码 `123456`；线上实例 `82.156.124.215` 也已同步。
+- 2026-04-01 - 部署 - 已将本次前后端改动同步到 `82.156.124.215:/root/video-gen` 并执行 `docker compose up -d --build backend frontend nginx`，前端 `http://82.156.124.215/login` 返回 200，后端实例内健康检查 `http://127.0.0.1:8003/health` 返回 `{"status":"ok"}`。

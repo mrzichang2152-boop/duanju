@@ -21,6 +21,13 @@ from app.core.config import settings
 logger = logging.getLogger(__name__)
 
 
+def _setting(name: str, default: str = "") -> str:
+    value = getattr(settings, name, "")
+    if value is None or str(value).strip() == "":
+        value = os.getenv(name.upper(), os.getenv(name, default))
+    return str(value or "")
+
+
 def _backend_root() -> str:
     return os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -31,15 +38,15 @@ def backend_static_dir() -> str:
 
 def cos_enabled() -> bool:
     return bool(
-        (settings.tencent_cos_secret_id or "").strip()
-        and (settings.tencent_cos_secret_key or "").strip()
-        and (settings.tencent_cos_region or "").strip()
-        and (settings.tencent_cos_bucket or "").strip()
+        _setting("tencent_cos_secret_id").strip()
+        and _setting("tencent_cos_secret_key").strip()
+        and _setting("tencent_cos_region").strip()
+        and _setting("tencent_cos_bucket").strip()
     )
 
 
 def _cos_prefix() -> str:
-    p = (settings.tencent_cos_prefix or "duanju").strip().strip("/")
+    p = _setting("tencent_cos_prefix", "duanju").strip().strip("/")
     return p or "duanju"
 
 
@@ -49,11 +56,11 @@ def _encode_cos_key_for_url(key: str) -> str:
 
 def build_cos_object_public_url(object_key: str) -> str:
     key = str(object_key or "").strip().lstrip("/")
-    custom = (settings.tencent_cos_public_base_url or "").strip().rstrip("/")
+    custom = _setting("tencent_cos_public_base_url").strip().rstrip("/")
     if custom:
         return f"{custom}/{_encode_cos_key_for_url(key)}"
-    bucket = (settings.tencent_cos_bucket or "").strip()
-    region = (settings.tencent_cos_region or "").strip()
+    bucket = _setting("tencent_cos_bucket").strip()
+    region = _setting("tencent_cos_region").strip()
     return f"https://{bucket}.cos.{region}.myqcloud.com/{_encode_cos_key_for_url(key)}"
 
 
@@ -61,9 +68,9 @@ def _cos_client():
     from qcloud_cos import CosConfig, CosS3Client
 
     cfg = CosConfig(
-        Region=(settings.tencent_cos_region or "").strip(),
-        SecretId=(settings.tencent_cos_secret_id or "").strip(),
-        SecretKey=(settings.tencent_cos_secret_key or "").strip(),
+        Region=_setting("tencent_cos_region").strip(),
+        SecretId=_setting("tencent_cos_secret_id").strip(),
+        SecretKey=_setting("tencent_cos_secret_key").strip(),
         Scheme="https",
     )
     return CosS3Client(cfg)
@@ -72,7 +79,7 @@ def _cos_client():
 def upload_bytes_to_cos_sync(object_key: str, body: bytes, content_type: Optional[str] = None) -> str:
     """同步上传，供 asyncio.to_thread 调用；对象 ACL 设为 public-read 便于前端直链（若控制台策略禁止需调整桶策略）。"""
     client = _cos_client()
-    bucket = (settings.tencent_cos_bucket or "").strip()
+    bucket = _setting("tencent_cos_bucket").strip()
     kwargs: dict = {
         "Bucket": bucket,
         "Body": body,

@@ -12,6 +12,10 @@ export const clearToken = () => {
   localStorage.removeItem(tokenKey);
 };
 
+export const clearEmail = () => {
+  localStorage.removeItem(emailKey);
+};
+
 export const setEmail = (email: string) => {
   localStorage.setItem(emailKey, email);
 };

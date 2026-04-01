@@ -10,6 +10,7 @@ import logging
 import re
 import time
 import hashlib
+import uuid
 import tempfile
 import subprocess
 import ipaddress
@@ -24,6 +25,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.config import settings as app_settings
 from app.models.asset import Asset
 from app.models.asset_version import AssetVersion
+from app.models.character_voice import CharacterVoice
+from app.models.kling_subject import KlingSubject
 from app.services.settings import get_api_key, get_or_create_settings
 
 logger = logging.getLogger(__name__)
@@ -711,10 +714,10 @@ async def _poll_suchuang_image_result(
     if max_attempts <= 0:
         max_attempts = 180
     try:
-        max_wall_seconds = float(str(os.getenv("GRSAI_POLL_MAX_WALL_SECONDS", "200")).strip() or "200")
+        max_wall_seconds = float(str(os.getenv("GRSAI_POLL_MAX_WALL_SECONDS", "480")).strip() or "480")
     except Exception:
-        max_wall_seconds = 200.0
-    max_wall_seconds = max(60.0, min(300.0, max_wall_seconds))
+        max_wall_seconds = 480.0
+    max_wall_seconds = max(60.0, min(1800.0, max_wall_seconds))
     # running 状态下 progress 可能长时间不变（例如上游排队），默认不要早于总墙钟超时判失败。
     default_stall_polls = int(max_wall_seconds // 2)  # 轮询间隔 2s
     try:
@@ -797,14 +800,17 @@ async def _poll_suchuang_image_result(
                     stall_polls += 1
                 else:
                     stall_polls = 0
+                    stall_warned = False
                     last_running_progress = pr
-                if stall_polls >= stall_poll_threshold:
-                    raise RuntimeError(
-                        f"GRSAI 任务长时间无进展（约 {stall_poll_threshold * 2}s 内 progress 未变化）："
-                        f"status={status_text} progress={pr} task_id={task_id}。"
-                        f"常见原因：参考图 URL 外网不可访问、COS 未公有读、上游排队异常，或 Google Gemini 侧超时；"
-                        f"可换 nano-banana-fast 等模型重试，并以 /v1/draw/result 返回的 error 字段为准。"
+                if stall_polls >= stall_poll_threshold and not stall_warned:
+                    logger.warning(
+                        "GRSAI 任务长时间进度不变（约 %ss，status=%s progress=%s task_id=%s），继续轮询直到终态或墙钟超时",
+                        stall_poll_threshold * 2,
+                        status_text,
+                        pr,
+                        task_id,
                     )
+                    stall_warned = True
         urls = _extract_suchuang_image_urls(body)
         preferred = _pick_preferred_image_url(urls)
         if preferred:
@@ -1356,6 +1362,56 @@ def _parse_kling_ak_sk(raw_key_text: str) -> tuple[str, str]:
     return "", ""
 
 
+def _resolve_system_kling_key_text() -> str:
+    jwt_token = (
+        str(getattr(app_settings, "kling_api_key", "") or "").strip()
+        or os.getenv("KLING_API_KEY", "").strip()
+        or os.getenv("KLING_JWT", "").strip()
+        or os.getenv("KLING_AUTH_TOKEN", "").strip()
+    )
+    if jwt_token:
+        return jwt_token
+    access_key = (
+        str(getattr(app_settings, "kling_access_key", "") or "").strip()
+        or str(getattr(app_settings, "kling_ak", "") or "").strip()
+        or os.getenv("KLING_ACCESS_KEY", "").strip()
+        or os.getenv("KLING_AK", "").strip()
+    )
+    secret_key = (
+        str(getattr(app_settings, "kling_secret_key", "") or "").strip()
+        or str(getattr(app_settings, "kling_sk", "") or "").strip()
+        or os.getenv("KLING_SECRET_KEY", "").strip()
+        or os.getenv("KLING_SK", "").strip()
+    )
+    if access_key and secret_key:
+        return f"{access_key}|{secret_key}"
+    return ""
+
+
+def _resolve_kling_auth_token_from_key_text(raw_key_text: str) -> tuple[str, str]:
+    normalized = str(raw_key_text or "").strip()
+    if not normalized:
+        return "", ""
+    ak, sk = _parse_kling_ak_sk(normalized)
+    if ak and sk:
+        return _build_kling_jwt(ak, sk), "aksk_jwt"
+    if normalized.count(".") == 2 and " " not in normalized:
+        return normalized, "jwt"
+    return "", ""
+
+
+async def resolve_kling_auth_token(session: AsyncSession, user_id: str) -> tuple[str, str]:
+    configured_key = str(await get_api_key(session, user_id) or "").strip()
+    token, token_mode = _resolve_kling_auth_token_from_key_text(configured_key)
+    if token:
+        return token, f"configured_{token_mode}"
+    system_key_text = _resolve_system_kling_key_text()
+    token, token_mode = _resolve_kling_auth_token_from_key_text(system_key_text)
+    if token:
+        return token, f"system_{token_mode}"
+    return "", ""
+
+
 async def _resolve_asset_bindings(
     session: AsyncSession,
     project_id: str,
@@ -1456,11 +1512,321 @@ async def _resolve_asset_bindings(
     return resolved
 
 
+def _normalize_role_key(name: str) -> str:
+    value = str(name or "").strip()
+    for sep in ["·", "：", ":", "-", "—", "｜", "|"]:
+        if sep in value:
+            left = value.split(sep, 1)[0].strip()
+            if left:
+                return left
+    return value
+
+
+def _normalize_subject_name_key(name: str) -> str:
+    value = str(name or "").replace("\u3000", " ").strip()
+    value = re.sub(r"\s+", " ", value)
+    return value.lower()
+
+
+async def _delete_kling_subject_remote(
+    client: httpx.AsyncClient,
+    api_key: str,
+    subject_id: str,
+) -> bool:
+    element_id = str(subject_id or "").strip()
+    if not element_id:
+        return True
+
+    endpoint_candidates = [
+        str(os.getenv("KLING_SUBJECT_DELETE_ENDPOINT") or "").strip(),
+        "https://api-beijing.klingai.com/v1/general/delete-elements",
+        "https://api.magic666.cn/api/v1/general/delete-elements",
+    ]
+    endpoint_candidates = [item for item in endpoint_candidates if item]
+
+    payload = {"element_id": element_id}
+
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+
+    for endpoint in endpoint_candidates:
+        try:
+            response = await client.post(endpoint, headers=headers, json=payload)
+        except Exception as exc:
+            logger.warning("Delete kling subject request failed endpoint=%s err=%s", endpoint, exc)
+            continue
+        if response.status_code != 200:
+            continue
+        try:
+            body = response.json()
+        except Exception:
+            body = {}
+        if isinstance(body, dict) and body.get("code") not in (None, 0, "0", 200, "200"):
+            continue
+        data_obj = body.get("data") if isinstance(body, dict) and isinstance(body.get("data"), dict) else {}
+        task_status = str(data_obj.get("task_status") or "").strip().lower()
+        if not task_status or task_status in {"submitted", "processing", "succeed", "success"}:
+            return True
+    return False
+
+
+def _pick_character_voice_for_subject_name(
+    subject_name: str,
+    voices: list[CharacterVoice],
+) -> CharacterVoice | None:
+    name = str(subject_name or "").strip()
+    if not name:
+        return None
+
+    normalized_name = _normalize_role_key(name)
+    compact_name = name.replace(" ", "")
+    compact_normalized_name = normalized_name.replace(" ", "")
+
+    exact_match: CharacterVoice | None = None
+    normalized_match: CharacterVoice | None = None
+    prefix_candidates: list[tuple[int, CharacterVoice]] = []
+
+    for voice in voices:
+        raw_name = str(voice.character_name or "").strip()
+        if not raw_name:
+            continue
+        raw_normalized = _normalize_role_key(raw_name)
+
+        if raw_name == name:
+            exact_match = exact_match or voice
+            continue
+        if raw_name == normalized_name or raw_normalized == normalized_name:
+            normalized_match = normalized_match or voice
+            continue
+
+        compact_raw = raw_name.replace(" ", "")
+        compact_raw_normalized = raw_normalized.replace(" ", "")
+        for candidate in [compact_raw, compact_raw_normalized]:
+            if not candidate:
+                continue
+            if compact_name.startswith(candidate) or compact_normalized_name.startswith(candidate):
+                prefix_candidates.append((len(candidate), voice))
+                break
+
+    if exact_match:
+        return exact_match
+    if normalized_match:
+        return normalized_match
+    if prefix_candidates:
+        prefix_candidates.sort(key=lambda item: item[0], reverse=True)
+        return prefix_candidates[0][1]
+    return None
+
+
+async def _attach_character_voice_ids(
+    session: AsyncSession,
+    project_id: str,
+    items: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    if not items:
+        return items
+    has_character_item = any(
+        str(item.get("role", "")).strip().lower() == "character"
+        for item in items
+    )
+    if not has_character_item:
+        return items
+
+    voice_rows = await session.execute(
+        select(CharacterVoice).where(CharacterVoice.project_id == project_id)
+    )
+    voices = list(voice_rows.scalars().all())
+    if not voices:
+        return items
+
+    voices.sort(
+        key=lambda row: (row.updated_at or row.created_at or 0, row.created_at or 0),
+        reverse=True,
+    )
+
+    for item in items:
+        if str(item.get("role", "")).strip().lower() != "character":
+            continue
+        matched = _pick_character_voice_for_subject_name(str(item.get("name", "")), voices)
+        if not matched:
+            continue
+        voice_id = str(matched.voice_id or "").strip()
+        if voice_id:
+            item["voice_id"] = voice_id
+    return items
+
+
+async def _cleanup_redundant_character_subject_rows(
+    session: AsyncSession,
+    client: httpx.AsyncClient,
+    api_key: str,
+    project_id: str,
+    asset_id: str,
+    subject_name: str,
+    keep_subject_id: str,
+) -> str:
+    keep_sid = str(keep_subject_id or "").strip()
+    if not keep_sid:
+        return ""
+
+    subject_key = _normalize_subject_name_key(subject_name)
+    existing_q = await session.execute(
+        select(KlingSubject).where(
+            KlingSubject.project_id == project_id,
+            KlingSubject.role == "character",
+        )
+    )
+    existing_rows = list(existing_q.scalars().all())
+    candidates = [
+        row
+        for row in existing_rows
+        if (subject_key and _normalize_subject_name_key(str(row.subject_name or "")) == subject_key)
+        or str(row.asset_id or "").strip() == asset_id
+    ]
+    if not candidates:
+        return keep_sid
+
+    candidates.sort(
+        key=lambda row: (row.updated_at or row.created_at or 0, row.created_at or 0),
+        reverse=True,
+    )
+
+    keep_row = next(
+        (row for row in candidates if str(row.subject_id or "").strip() == keep_sid),
+        candidates[0],
+    )
+    remote_delete_ids: set[str] = set()
+    for row in candidates:
+        if row is keep_row:
+            continue
+        old_sid = str(row.subject_id or "").strip()
+        if old_sid and old_sid != keep_sid:
+            remote_delete_ids.add(old_sid)
+        await session.delete(row)
+
+    for old_sid in remote_delete_ids:
+        deleted = await _delete_kling_subject_remote(client, api_key, old_sid)
+        if not deleted:
+            logger.warning(
+                "删除冗余角色主体失败 project_id=%s asset_id=%s subject_id=%s",
+                project_id,
+                asset_id,
+                old_sid,
+            )
+    return str(keep_row.subject_id or keep_sid).strip()
+
+
+async def _get_or_create_character_subject_id(
+    session: AsyncSession,
+    client: httpx.AsyncClient,
+    api_key: str,
+    project_id: str,
+    item: dict[str, Any],
+    force_create: bool = False,
+) -> str:
+    asset_id = str(item.get("asset_id", "")).strip()
+    if not asset_id:
+        return ""
+
+    subject_name = str(item.get("name", "")).strip()[:64]
+    subject_key = _normalize_subject_name_key(subject_name)
+    voice_id = str(item.get("voice_id", "")).strip()
+    image_url = str(item.get("image_url", "")).strip()[:1024]
+
+    existing_q = await session.execute(
+        select(KlingSubject).where(
+            KlingSubject.project_id == project_id,
+            KlingSubject.role == "character",
+        )
+    )
+    existing_rows = list(existing_q.scalars().all())
+
+    same_name_rows = [
+        row
+        for row in existing_rows
+        if subject_key and _normalize_subject_name_key(str(row.subject_name or "")) == subject_key
+    ]
+    if not same_name_rows:
+        same_name_rows = [row for row in existing_rows if str(row.asset_id or "").strip() == asset_id]
+
+    same_name_rows.sort(
+        key=lambda row: (row.updated_at or row.created_at or 0, row.created_at or 0),
+        reverse=True,
+    )
+    latest = same_name_rows[0] if same_name_rows else None
+
+    if latest and str(latest.subject_id or "").strip() and not force_create:
+        latest_voice = str(latest.voice_id or "").strip()
+        if (voice_id and latest_voice == voice_id) or (not voice_id):
+            keep_sid = str(latest.subject_id).strip()
+            keep_sid = await _cleanup_redundant_character_subject_rows(
+                session,
+                client,
+                api_key,
+                project_id,
+                asset_id,
+                subject_name,
+                keep_sid,
+            )
+            await session.flush()
+            return keep_sid
+
+    created_subject_id = await _create_kling_element(
+        client,
+        api_key,
+        project_id,
+        item,
+        force_new=force_create,
+        allow_voice_fallback=allow_voice_fallback,
+    )
+    if not created_subject_id:
+        return ""
+
+    target_row = latest
+    if not target_row:
+        target_row = next((row for row in existing_rows if str(row.asset_id or "").strip() == asset_id), None)
+
+    if target_row:
+        target_row.asset_id = asset_id
+        target_row.subject_id = created_subject_id
+        target_row.subject_name = subject_name
+        target_row.image_url = image_url
+        target_row.voice_id = voice_id[:128]
+    else:
+        target_row = KlingSubject(
+            project_id=project_id,
+            asset_id=asset_id,
+            role="character",
+            subject_id=created_subject_id,
+            subject_name=subject_name,
+            image_url=image_url,
+            voice_id=voice_id[:128],
+        )
+        session.add(target_row)
+
+    await session.flush()
+    created_subject_id = await _cleanup_redundant_character_subject_rows(
+        session,
+        client,
+        api_key,
+        project_id,
+        asset_id,
+        subject_name,
+        created_subject_id,
+    )
+    await session.flush()
+    return created_subject_id
+
+
 async def _create_kling_element(
     client: httpx.AsyncClient,
     api_key: str,
     project_id: str,
     item: dict[str, Any],
+    force_new: bool = False,
+    allow_voice_fallback: bool = True,
 ) -> str:
     image_url = str(item.get("image_url", "")).strip()
     if not image_url:
@@ -1469,54 +1835,202 @@ async def _create_kling_element(
     if role not in {"character", "scene", "prop"}:
         return ""
     asset_id = str(item.get("asset_id", "")).strip()
+    voice_id = str(item.get("voice_id", "")).strip() if role == "character" else ""
     image_hash = hashlib.sha1(image_url.encode("utf-8")).hexdigest()[:16]
-    cache_key = f"{project_id}:{asset_id}:{role}:{image_hash}"
+    cache_key = f"{project_id}:{asset_id}:{role}:{image_hash}:{voice_id}"
     cached = _KLING_ELEMENT_CACHE.get(cache_key)
     now_ts = time.time()
-    if cached and now_ts - cached[1] <= _KLING_ELEMENT_CACHE_TTL_SECONDS:
+    if force_new:
+        _KLING_ELEMENT_CACHE.pop(cache_key, None)
+    elif cached and now_ts - cached[1] <= _KLING_ELEMENT_CACHE_TTL_SECONDS:
         return cached[0]
-    if cached and now_ts - cached[1] > _KLING_ELEMENT_CACHE_TTL_SECONDS:
+    elif cached and now_ts - cached[1] > _KLING_ELEMENT_CACHE_TTL_SECONDS:
         _KLING_ELEMENT_CACHE.pop(cache_key, None)
     name = str(item.get("name", "")).strip() or f"asset-{asset_id[:8]}"
     desc = str(item.get("description", "")).strip()
-    payload = {
-        "name": name[:20],
-        "description": desc[:100],
+
+    def _new_external_task_id() -> str:
+        return f"{project_id}-{asset_id}-{uuid.uuid4().hex[:16]}"
+
+    base_payload = {
+        "element_name": name[:20],
+        "element_description": desc[:100],
         "reference_type": "image_refer",
         "element_image_list": {
-            "frontal_image": {"image_url": image_url},
-            "image_list": [{"image_url": image_url}],
+            "frontal_image": image_url,
+            "refer_images": [{"image_url": image_url}],
         },
         "tag_list": [{"tag_id": _kling_element_tag_id(role)}],
-        "external_task_id": f"{project_id}-{asset_id}-{int(asyncio.get_event_loop().time() * 1000)}",
+        "external_task_id": _new_external_task_id(),
     }
+
+    payload_candidates: list[dict[str, Any]] = []
+    if role == "character" and voice_id:
+        payload_candidates.append({**base_payload, "element_voice_id": voice_id})
+        if voice_id.isdigit():
+            try:
+                payload_candidates.append({**base_payload, "element_voice_id": int(voice_id)})
+            except Exception:
+                pass
+        if allow_voice_fallback:
+            payload_candidates.append(base_payload)
+    else:
+        payload_candidates.append(base_payload)
+
+    endpoint_candidates = [
+        str(os.getenv("KLING_SUBJECT_ENDPOINT") or "").strip(),
+        "https://api-beijing.klingai.com/v1/general/advanced-custom-elements",
+        "https://api.magic666.cn/api/v1/general/advanced-custom-elements",
+    ]
+    endpoint_candidates = [item for item in endpoint_candidates if item]
+
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
     }
-    try:
-        response = await client.post(
-            "https://api.magic666.cn/api/v1/general/advanced-custom-elements",
-            headers=headers,
-            json=payload,
-        )
-        if response.status_code != 200:
-            logger.warning("Create kling element failed: status=%s body=%s", response.status_code, response.text)
-            return ""
-        data = response.json()
-        if isinstance(data, dict):
-            if isinstance(data.get("data"), dict):
-                body = data["data"]
-                element_id = str(body.get("id") or body.get("element_id") or body.get("custom_element_id") or "")
+
+    async def _poll_element_id(task_id: str, endpoint: str) -> str:
+        query_url = f"{endpoint.rstrip('/')}/{quote(str(task_id).strip())}"
+        for _ in range(30):
+            try:
+                query_resp = await client.get(query_url, headers=headers)
+            except Exception:
+                await asyncio.sleep(2.0)
+                continue
+            if query_resp.status_code != 200:
+                await asyncio.sleep(2.0)
+                continue
+            try:
+                body = query_resp.json()
+            except Exception:
+                await asyncio.sleep(2.0)
+                continue
+            if isinstance(body, dict) and body.get("code") not in (None, 0, "0", 200, "200"):
+                await asyncio.sleep(2.0)
+                continue
+            data_obj = body.get("data") if isinstance(body, dict) and isinstance(body.get("data"), dict) else {}
+            task_status = str(data_obj.get("task_status") or "").strip().lower()
+            task_result = data_obj.get("task_result") if isinstance(data_obj.get("task_result"), dict) else {}
+            elements = task_result.get("elements") if isinstance(task_result.get("elements"), list) else []
+            if elements and isinstance(elements[0], dict):
+                element_id = str(elements[0].get("element_id") or elements[0].get("id") or "").strip()
                 if element_id:
-                    _KLING_ELEMENT_CACHE[cache_key] = (element_id, now_ts)
-                return element_id
-            element_id = str(data.get("id") or data.get("element_id") or data.get("custom_element_id") or "")
+                    return element_id
+            if task_status in {"failed", "error", "canceled", "cancelled"}:
+                return ""
+            await asyncio.sleep(2.0)
+        return ""
+
+    for endpoint in endpoint_candidates:
+        for payload in payload_candidates:
+            try:
+                response = await client.post(endpoint, headers=headers, json=payload)
+            except Exception as exc:
+                logger.warning("Create kling element request failed endpoint=%s err=%s", endpoint, exc)
+                continue
+            if response.status_code != 200:
+                if response.status_code == 400:
+                    try:
+                        bad_data = response.json()
+                    except Exception:
+                        bad_data = {}
+                    bad_code = str(bad_data.get("code") or "").strip() if isinstance(bad_data, dict) else ""
+                    if bad_code == "1201":
+                        payload["external_task_id"] = _new_external_task_id()
+                        logger.warning(
+                            "Create kling element got 400 duplicate external_task_id, retry once endpoint=%s new_external_task_id=%s",
+                            endpoint,
+                            payload.get("external_task_id"),
+                        )
+                        try:
+                            retry_response = await client.post(endpoint, headers=headers, json=payload)
+                        except Exception as exc:
+                            logger.warning("Create kling element retry failed endpoint=%s err=%s", endpoint, exc)
+                            continue
+                        if retry_response.status_code != 200:
+                            logger.warning("Create kling element retry failed endpoint=%s status=%s body=%s", endpoint, retry_response.status_code, retry_response.text)
+                            continue
+                        try:
+                            data = retry_response.json()
+                        except Exception:
+                            logger.warning("Create kling element retry failed endpoint=%s non-json body=%s", endpoint, retry_response.text)
+                            continue
+                    else:
+                        logger.warning("Create kling element failed endpoint=%s status=%s body=%s", endpoint, response.status_code, response.text)
+                        continue
+                else:
+                    logger.warning("Create kling element failed endpoint=%s status=%s body=%s", endpoint, response.status_code, response.text)
+                    continue
+            else:
+                try:
+                    data = response.json()
+                except Exception:
+                    logger.warning("Create kling element failed endpoint=%s non-json body=%s", endpoint, response.text)
+                    continue
+            if isinstance(data, dict) and data.get("code") not in (None, 0, "0", 200, "200"):
+                api_code = str(data.get("code") or "").strip()
+                if api_code == "1201":
+                    payload["external_task_id"] = _new_external_task_id()
+                    logger.warning(
+                        "Create kling element duplicate external_task_id, retry once endpoint=%s new_external_task_id=%s",
+                        endpoint,
+                        payload.get("external_task_id"),
+                    )
+                    try:
+                        retry_response = await client.post(endpoint, headers=headers, json=payload)
+                    except Exception as exc:
+                        logger.warning("Create kling element retry failed endpoint=%s err=%s", endpoint, exc)
+                        continue
+                    if retry_response.status_code != 200:
+                        logger.warning("Create kling element retry failed endpoint=%s status=%s body=%s", endpoint, retry_response.status_code, retry_response.text)
+                        continue
+                    try:
+                        data = retry_response.json()
+                    except Exception:
+                        logger.warning("Create kling element retry failed endpoint=%s non-json body=%s", endpoint, retry_response.text)
+                        continue
+                    if isinstance(data, dict) and data.get("code") not in (None, 0, "0", 200, "200"):
+                        logger.warning(
+                            "Create kling element retry api code failed endpoint=%s code=%s message=%s has_voice=%s",
+                            endpoint,
+                            data.get("code"),
+                            data.get("message") or data.get("msg") or "",
+                            bool(payload.get("element_voice_id")),
+                        )
+                        continue
+                else:
+                    logger.warning(
+                        "Create kling element api code failed endpoint=%s code=%s message=%s has_voice=%s",
+                        endpoint,
+                        data.get("code"),
+                        data.get("message") or data.get("msg") or "",
+                        bool(payload.get("element_voice_id")),
+                    )
+                    continue
+            element_id = ""
+            task_id = ""
+            if isinstance(data, dict):
+                body = data.get("data") if isinstance(data.get("data"), dict) else data
+                # 创建接口常见返回是 task_id（或 data.id 作为任务ID），不能直接当 element_id。
+                element_id = str(
+                    body.get("element_id")
+                    or body.get("custom_element_id")
+                    or ""
+                ).strip()
+                task_id = str(body.get("task_id") or body.get("id") or "").strip()
+            if not element_id and task_id:
+                element_id = await _poll_element_id(task_id, endpoint)
             if element_id:
                 _KLING_ELEMENT_CACHE[cache_key] = (element_id, now_ts)
-            return element_id
-    except Exception as exc:
-        logger.warning("Create kling element failed: %s", exc)
+                return element_id
+    if role == "character" and voice_id:
+        logger.warning(
+            "Create kling element failed after voice-bind attempts project_id=%s asset_id=%s subject=%s voice_id=%s",
+            project_id,
+            asset_id,
+            name[:20],
+            voice_id,
+        )
     return ""
 
 
@@ -1539,6 +2053,9 @@ async def create_video(
     is_kling_model = model_text_lower.startswith("kling")
     is_kling_o1_model = model_text_lower == "kling-video-o1"
     system_prompt = str(payload.get("system_prompt", "") or "").strip()
+    raw_sound = str(payload.get("sound") or "").strip().lower()
+    with_audio_requested = bool(payload.get("with_audio", False))
+    require_character_voice = with_audio_requested or raw_sound == "on"
     default_kling_endpoint = "https://api-beijing.klingai.com/v1/videos/omni-video"
     if is_kling_model:
         if "kling-v1" in model_text_lower:
@@ -1553,7 +2070,6 @@ async def create_video(
     endpoint = default_kling_endpoint if is_kling_model else default_video_endpoint
     use_configured_video_provider = False
     configured_key_normalized = str(configured_key or "").strip()
-    kling_access_key, kling_secret_key = _parse_kling_ak_sk(configured_key_normalized)
     use_official_kling = is_kling_model
     if is_kling_model and configured_endpoint:
         normalized_endpoint = configured_endpoint.strip().rstrip("/")
@@ -1582,17 +2098,12 @@ async def create_video(
     api_key = default_video_api_key
     key_source = "default"
     if is_kling_model:
-        if kling_access_key and kling_secret_key:
-            api_key = _build_kling_jwt(kling_access_key, kling_secret_key)
-            key_source = "configured_aksk_jwt"
-        elif configured_key_normalized.count(".") == 2 and " " not in configured_key_normalized:
-            api_key = configured_key_normalized
-            key_source = "configured_jwt"
+        kling_token, kling_key_source = await resolve_kling_auth_token(session, user_id)
+        if kling_token:
+            api_key = kling_token
+            key_source = kling_key_source
         else:
-            raise RuntimeError(
-                f"Kling v3 Omni 仅支持官方鉴权：请在设置页 Key 填写 AK|SK 或 Access Key/Secret Key（JSON也可）"
-                f"（current_user={user_id} has_saved_key={bool(configured_key_normalized)} key_len={len(configured_key_normalized)}）"
-            )
+            raise RuntimeError("Kling 鉴权未配置，请联系管理员配置系统 Key（KLING_AK/KLING_SK 或 KLING_API_KEY）")
     elif use_configured_video_provider and configured_key_normalized:
         if configured_key_normalized.startswith("sk-"):
             api_key = configured_key_normalized
@@ -1633,29 +2144,75 @@ async def create_video(
     resolved_assets: list[dict[str, Any]] = []
     if is_kling_model and project_id and asset_bindings:
         resolved_assets = await _resolve_asset_bindings(session, project_id, asset_bindings)
+        if resolved_assets:
+            resolved_assets = await _attach_character_voice_ids(session, project_id, resolved_assets)
         if not resolved_assets:
-            raise RuntimeError("检测到已选择素材，但未解析到可用素材图片，请确认素材版本已生成并被选中后重试")
+            logger.warning(
+                "检测到素材绑定但未解析到可用素材图片，回退为无参考图生成。project_id=%s user_id=%s asset_count=%s",
+                project_id,
+                user_id,
+                len(asset_bindings),
+            )
 
     if resolved_assets and is_kling_model:
-        prepared_refs: list[dict[str, str]] = []
-        for item in resolved_assets:
-            role = str(item.get("role", "")).strip().lower()
-            asset_id = str(item.get("asset_id", "")).strip()
-            prepared_image_url = _normalize_kling_image_value(str(item.get("image_url", "")))
-            if not prepared_image_url:
-                continue
-            mapped_type = ""
-            if first_frame_asset_id and asset_id == first_frame_asset_id:
-                mapped_type = "first_frame"
-            prepared_refs.append(
-                {
-                    "role": role,
-                    "name": str(item.get("name", "")).strip(),
-                    "description": str(item.get("description", "")).strip(),
-                    "image_url": prepared_image_url,
-                    "type": mapped_type,
-                }
+        # 确保被选中的角色在当前项目下已配置 Kling 音色；否则 Kling 会静默回退为默认音色，
+        # 容易让用户误以为使用了自定义音色，这里直接中断并给出明确错误提示。
+        missing_voice_roles = [
+            (str(item.get("name") or "").strip() or str(item.get("asset_id") or "").strip())
+            for item in resolved_assets
+            if str(item.get("role") or "").strip().lower() == "character"
+            and not str(item.get("voice_id") or "").strip()
+        ]
+        if require_character_voice and missing_voice_roles:
+            raise RuntimeError(
+                "Kling 视频生成失败：以下角色未配置音色，将回退为默认音色。"
+                "请先在 Step3 上传角色音频并生成 Kling 音色后再重试："
+                + "、".join(missing_voice_roles)
             )
+        prepared_refs: list[dict[str, str]] = []
+        character_elements: list[dict[str, Any]] = []
+        character_prompt_items: list[dict[str, str]] = []
+        async with httpx.AsyncClient(timeout=120.0, trust_env=True) as subject_client:
+            for item in resolved_assets:
+                role = str(item.get("role", "")).strip().lower()
+                asset_id = str(item.get("asset_id", "")).strip()
+                prepared_image_url = _normalize_kling_image_value(str(item.get("image_url", "")))
+                if not prepared_image_url:
+                    continue
+                if role == "character":
+                    item["image_url"] = prepared_image_url
+                    subject_id = await _get_or_create_character_subject_id(
+                        session,
+                        subject_client,
+                        api_key,
+                        project_id,
+                        item,
+                    )
+                    if subject_id:
+                        character_elements.append({"element_id": subject_id})
+                        character_prompt_items.append(
+                            {
+                                "name": str(item.get("name", "")).strip(),
+                                "description": str(item.get("description", "")).strip(),
+                            }
+                        )
+                        continue
+                    raise RuntimeError(
+                        "角色主体创建失败：当前 Step4 已启用仅主体生成模式，禁止回退为角色图片参考。"
+                        f"请先在 Step3 确保该角色主体创建成功后再重试（角色：{str(item.get('name', '')).strip() or asset_id}）。"
+                    )
+                mapped_type = ""
+                if first_frame_asset_id and asset_id == first_frame_asset_id:
+                    mapped_type = "first_frame"
+                prepared_refs.append(
+                    {
+                        "role": role,
+                        "name": str(item.get("name", "")).strip(),
+                        "description": str(item.get("description", "")).strip(),
+                        "image_url": prepared_image_url,
+                        "type": mapped_type,
+                    }
+                )
 
         prompt_lines = ["【主体语义映射】"]
         reference_images: list[dict[str, Any]] = []
@@ -1664,16 +2221,26 @@ async def create_video(
             if item.get("type"):
                 image_item["type"] = item["type"]
             reference_images.append(image_item)
-            role_name = "角色" if item.get("role") == "character" else "场景" if item.get("role") == "scene" else "道具" if item.get("role") == "prop" else "主体"
+            role_name = "场景" if item.get("role") == "scene" else "道具" if item.get("role") == "prop" else "主体"
             prompt_lines.append(f"{role_name}{index}: {item.get('name', '')}；描述：{item.get('description', '')}；引用：<<<image_{index}>>>")
-        if not reference_images:
-            raise RuntimeError("已解析到素材绑定，但未构造出有效 reference_images，请检查素材图片地址是否可访问")
+        for index, item in enumerate(character_prompt_items, start=1):
+            prompt_lines.append(
+                f"角色主体{index}: {item.get('name', '')}；描述：{item.get('description', '')}；引用：<<<element_{index}>>>"
+            )
         if reference_images:
             data["reference_images"] = reference_images
             data["image_list"] = reference_images
             if not image_url:
                 image_url = reference_images[0].get("image_url", "")
-        data["prompt"] = f"{str(data.get('prompt', '')).strip()}\n" + "\n".join(prompt_lines)
+        if character_elements:
+            data["element_list"] = character_elements
+            if not reference_images and image_url:
+                logger.info("角色已走主体引用，忽略顶层 image_url 以避免重复传角色图")
+                image_url = ""
+        if not reference_images and not character_elements:
+            raise RuntimeError("已解析到素材绑定，但未构造出有效角色主体/参考图")
+        if prompt_lines:
+            data["prompt"] = f"{str(data.get('prompt', '')).strip()}\n" + "\n".join(prompt_lines)
 
     if is_kling_model:
         original_prompt = str(data.get("prompt", ""))
@@ -1752,6 +2319,7 @@ async def create_video(
             single_image_ref = {"image_url": image_url}
             data["reference_images"] = [single_image_ref]
             data["image_list"] = [single_image_ref]
+
     else:
         data["size"] = payload.get("size", "1280x720")
         data["seconds"] = payload.get("seconds", 5)
@@ -1793,21 +2361,14 @@ async def create_video(
     for trust_env_mode in client_modes:
         try:
             async with httpx.AsyncClient(timeout=120.0, trust_env=trust_env_mode) as client:
-                if is_kling_model and project_id and resolved_assets and "magic666.cn" in endpoint.lower():
+                if is_kling_model and project_id and resolved_assets and "magic666.cn" in endpoint.lower() and not data.get("element_list"):
                     element_refs: list[dict[str, Any]] = []
                     for item in resolved_assets:
                         element_id = await _create_kling_element(client, api_key, project_id, item)
                         if not element_id:
                             continue
-                        element_refs.append(
-                            {
-                                "element_id": element_id,
-                                "type": _kling_image_type(str(item.get("role", ""))),
-                                "asset_id": item.get("asset_id"),
-                            }
-                        )
+                        element_refs.append({"element_id": element_id})
                     if element_refs:
-                        data["elements"] = element_refs
                         data["element_list"] = element_refs
                 logger.info(
                     "Video request final payload trust_env=%s payload=%s",
@@ -1836,7 +2397,7 @@ async def create_video(
                         )
                 payload_candidates: list[tuple[str, dict[str, Any]]] = [("primary", data)]
                 if is_kling_model:
-                    has_strict_constraints = str(data.get("sound") or "off").strip().lower() == "on" or bool(data.get("reference_images")) or bool(data.get("image_list")) or bool(data.get("elements")) or bool(data.get("element_list")) or bool(data.get("reference_video")) or bool(data.get("reference_video_url"))
+                    has_strict_constraints = str(data.get("sound") or "off").strip().lower() == "on" or bool(data.get("reference_images")) or bool(data.get("image_list")) or bool(data.get("element_list")) or bool(data.get("reference_video")) or bool(data.get("reference_video_url"))
                     if has_strict_constraints:
                         lower_model_payload = dict(data)
                         if "model" in lower_model_payload:

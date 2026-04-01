@@ -23,6 +23,8 @@ from app.schemas.script import (
     ScriptParseResponse,
     StoryboardTaskStartRequest,
     StoryboardTaskStatusResponse,
+    AsyncTaskStatusResponse,
+    Step2TaskStartRequest,
 )
 from app.services.projects import get_project
 from app.services.script_validation import validate_script_with_model as run_validation
@@ -34,10 +36,18 @@ from app.services.scripts import (
     get_script_history,
     delete_script,
 )
-from app.services.assets import list_assets
+from app.services.assets import list_assets, extract_assets_from_script
 from app.services.settings import get_or_create_settings
 from app.services.linkapi import create_chat_completion, create_chat_completion_stream
 from app.services.file_parsing import read_file_content
+from app.services.async_tasks import (
+    create_async_task,
+    get_async_task,
+    mark_async_task_running,
+    mark_async_task_completed,
+    mark_async_task_failed,
+    parse_task_result,
+)
 
 from app.core.script_prompts import (
     get_system_prompt,
@@ -66,29 +76,171 @@ def _normalize_mode_model(mode: str, model: Optional[str]) -> str:
     return _OPENROUTER_TEXT_MODEL
 
 
+def _extract_role_name_from_look(asset_name: str) -> str:
+    value = str(asset_name or "").strip()
+    for sep in ["·", "：", ":", "-", "—", "｜", "|"]:
+        if sep in value:
+            left = value.split(sep, 1)[0].strip()
+            if left:
+                return left
+    return value
+
+
+def _extract_episode_numbers(text: str) -> set[int]:
+    values = set()
+    for match in re.finditer(r"第\s*(\d+)\s*集", str(text or "")):
+        try:
+            values.add(int(match.group(1)))
+        except Exception:
+            continue
+    return values
+
+
+_STEP2_SEPARATOR = "\n\n=== 原文剧本 (请勿删除此行) ===\n\n"
+_STEP2_TASK_TYPE = "STEP2"
+
+
+def _strip_thinking_content(text: str) -> str:
+    source = str(text or "")
+    cleaned = re.sub(r"<think>[\s\S]*?</think>", "", source, flags=re.IGNORECASE)
+    if re.search(r"<think>", cleaned, flags=re.IGNORECASE) and not re.search(r"</think>", cleaned, flags=re.IGNORECASE):
+        idx = re.search(r"<think>", cleaned, flags=re.IGNORECASE)
+        if idx:
+            cleaned = cleaned[: idx.start()]
+    cleaned = re.sub(r"</?think>", "", cleaned, flags=re.IGNORECASE)
+    return cleaned.strip()
+
+
+async def _generate_script_once(
+    db: AsyncSession,
+    user_id: str,
+    payload: ScriptGenerateRequest,
+    project_id: str,
+) -> dict[str, str]:
+    response = await generate_script(project_id=project_id, payload=payload, user_id=user_id, db=db)
+    if isinstance(response, dict):
+        return {
+            "content": str(response.get("content") or ""),
+            "thinking": str(response.get("thinking") or ""),
+        }
+    return {"content": "", "thinking": ""}
+
+
+async def _run_step2_task(task_id: str) -> None:
+    async with SessionLocal() as db:
+        task = await get_async_task(db, task_id=task_id)
+        if not task:
+            return
+        try:
+            await mark_async_task_running(db, task)
+            payload = json.loads(task.payload_json or "{}") if task.payload_json else {}
+            op = str(payload.get("op") or "").strip().lower()
+            project_id = str(task.project_id)
+            user_id = str(task.user_id)
+            original_content = str(payload.get("original_content") or "")
+            resources_content = str(payload.get("resources_content") or "")
+            model = str(payload.get("model") or "").strip() or _OPENROUTER_TEXT_MODEL
+            instruction = str(payload.get("instruction") or "")
+
+            if op == "sync":
+                if original_content or resources_content:
+                    full_content = f"{resources_content}{_STEP2_SEPARATOR}{original_content}"
+                    await save_script(db, project_id, full_content, None, None, None, None)
+                await extract_assets_from_script(db, project_id, user_id, manual_only=True)
+                latest = await get_active_script(db, project_id)
+                await mark_async_task_completed(
+                    db,
+                    task,
+                    {
+                        "op": "sync",
+                        "version": int(latest.version) if latest else 0,
+                    },
+                )
+                return
+
+            mode = "extract_resources" if op == "extract" else "step2_modify"
+            base_content = original_content if op == "extract" else resources_content
+            if not base_content.strip():
+                raise RuntimeError("内容为空")
+
+            generated = await _generate_script_once(
+                db,
+                user_id,
+                ScriptGenerateRequest(
+                    mode=mode,
+                    content=base_content,
+                    model=model,
+                    instruction=instruction or None,
+                    stream=False,
+                ),
+                project_id,
+            )
+            cleaned_resources = _strip_thinking_content(generated.get("content") or "")
+            if not cleaned_resources:
+                raise RuntimeError("模型未返回可用内容")
+            full_content = f"{cleaned_resources}{_STEP2_SEPARATOR}{original_content}"
+            saved = await save_script(db, project_id, full_content, None, None, None, None)
+            await mark_async_task_completed(
+                db,
+                task,
+                {
+                    "op": op,
+                    "content": cleaned_resources,
+                    "version": int(saved.version) if saved else 0,
+                },
+            )
+        except Exception as exc:
+            await mark_async_task_failed(db, task, str(exc))
+
+
 async def _build_storyboard_prompt_user_content(
     db: AsyncSession,
     project_id: str,
     content: str,
     instruction: Optional[str],
+    episode_index: Optional[int] = None,
 ) -> str:
     assets = await list_assets(db, project_id)
     asset_context = ""
     if assets:
-        asset_context = "【可用素材库】\n请在生成分镜时，参考以下素材信息。如果当前镜头使用了某个素材（角色、道具、场景），请务必在该单元格描述的末尾加上 `[AssetID:素材ID]` 标记，以便程序自动关联图片。\n"
         valid_asset_types = ["CHARACTER_LOOK", "PROP", "SCENE"]
         filtered_assets = [a for a in assets if a.type in valid_asset_types]
-        type_mapping = {
-            "CHARACTER_LOOK": "角色形象",
-            "PROP": "道具",
-            "SCENE": "场景"
-        }
-        for asset in filtered_assets:
-            desc = asset.description or "无描述"
-            type_display = type_mapping.get(asset.type, asset.type)
-            asset_context += f"- [{type_display}] {asset.name} (ID: {asset.id}): {desc}\n"
-        asset_context += "\n"
-        logger.info(f"Attached {len(filtered_assets)} assets to storyboard prompt (filtered from {len(assets)})")
+        if episode_index is not None and episode_index >= 0:
+            target_episode_no = episode_index + 1
+            episode_assets = []
+            for item in filtered_assets:
+                episodes = _extract_episode_numbers(str(item.description or ""))
+                if target_episode_no in episodes:
+                    episode_assets.append(item)
+            filtered_assets = episode_assets
+
+        if filtered_assets:
+            asset_context = "【可用素材库】\n请在生成分镜时，参考以下素材信息。如果当前镜头使用了某个素材（角色、道具、场景），请务必在该单元格描述的末尾加上 `[AssetID:素材ID]` 标记，以便程序自动关联图片。\n"
+            type_mapping = {
+                "CHARACTER_LOOK": "角色形象",
+                "PROP": "道具",
+                "SCENE": "场景"
+            }
+            for asset in filtered_assets:
+                desc = asset.description or "无描述"
+                type_display = type_mapping.get(asset.type, asset.type)
+                asset_context += f"- [{type_display}] {asset.name} (ID: {asset.id}): {desc}\n"
+            look_assets = [a for a in filtered_assets if a.type == "CHARACTER_LOOK"]
+            if look_assets:
+                asset_context += "\n【角色与角色形象命名约束（强制）】\n"
+                asset_context += "当镜头出现角色时，角色形象列和“镜头调度与内容融合”列都必须直接使用“角色形象全名[AssetID:xxx]”，禁止简称或嵌套写法。\n"
+                for look_asset in look_assets:
+                    look_full_name = str(look_asset.name or "").strip()
+                    look_desc = str(look_asset.description or "无描述").strip()
+                    asset_context += (
+                        f"- 角色形象全名：{look_full_name}；"
+                        f"分镜写法：{look_full_name}[AssetID:{look_asset.id}]；"
+                        f"形象要点：{look_desc}\n"
+                    )
+            asset_context += "\n"
+            logger.info(f"Attached {len(filtered_assets)} assets to storyboard prompt (filtered from {len(assets)})")
+        elif episode_index is not None and episode_index >= 0:
+            logger.info("No episode-scoped assets matched by 出场集数, generate storyboard without asset list. project_id=%s episode=%s", project_id, episode_index + 1)
 
     style_instruction = (instruction or "").strip()
     style_block = f"【全局风格要求】\n{style_instruction}\n\n" if style_instruction else ""
@@ -104,6 +256,7 @@ async def _build_storyboard_prompt_user_content(
         "请务必使用素材库中的AssetID标记角色、道具和场景。严禁省略。"
         "如果某个角色/道具/场景在素材库中存在，必须附带 `[AssetID:xxx]`，否则视为错误。"
         "如果同一镜头出现多个角色，角色形象列必须逐个列出所有角色形象，且每个角色都要附带各自的 `[AssetID:xxx]`。"
+        "角色相关字段（含镜头调度与内容融合中的台词角色标识）必须直接使用“角色形象全名”，例如：汪老板（金毛拟人）·商户老板装。"
     )
 
 
@@ -121,6 +274,7 @@ async def _run_storyboard_task(task_id: str) -> None:
                 task["project_id"],
                 task["episode_content"],
                 task.get("instruction"),
+                int(task.get("episode_index") or 0),
             )
             content_chunks: list[str] = []
             async for chunk in create_chat_completion_stream(
@@ -218,6 +372,70 @@ async def _run_storyboard_task(task_id: str) -> None:
                     await save_script(session, task["project_id"], None, None, None, None, episodes)
         except Exception:
             logger.exception("更新分镜任务失败状态时异常")
+
+
+@router.post("/{project_id}/script/step2-tasks/start", response_model=AsyncTaskStatusResponse)
+async def start_step2_task(
+    project_id: str,
+    payload: Step2TaskStartRequest,
+    user_id: str = Depends(get_current_user_id),
+    db: AsyncSession = Depends(get_db),
+) -> AsyncTaskStatusResponse:
+    project = await get_project(db, user_id, project_id)
+    if not project:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="项目不存在")
+
+    task = await create_async_task(
+        db,
+        project_id=project_id,
+        user_id=user_id,
+        task_type=_STEP2_TASK_TYPE,
+        payload={
+            "op": payload.op,
+            "original_content": payload.original_content,
+            "resources_content": payload.resources_content,
+            "model": payload.model,
+            "instruction": payload.instruction,
+        },
+    )
+    asyncio.create_task(_run_step2_task(task.id))
+    return AsyncTaskStatusResponse(
+        task_id=task.id,
+        project_id=project_id,
+        task_type=_STEP2_TASK_TYPE,
+        status="RUNNING",
+        result=None,
+        error=None,
+    )
+
+
+@router.get("/{project_id}/script/step2-tasks/{task_id}", response_model=AsyncTaskStatusResponse)
+async def get_step2_task_status(
+    project_id: str,
+    task_id: str,
+    user_id: str = Depends(get_current_user_id),
+    db: AsyncSession = Depends(get_db),
+) -> AsyncTaskStatusResponse:
+    project = await get_project(db, user_id, project_id)
+    if not project:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="项目不存在")
+    task = await get_async_task(
+        db,
+        task_id=task_id,
+        project_id=project_id,
+        user_id=user_id,
+        task_type=_STEP2_TASK_TYPE,
+    )
+    if not task:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="任务不存在")
+    return AsyncTaskStatusResponse(
+        task_id=task.id,
+        project_id=project_id,
+        task_type=task.task_type,
+        status=str(task.status or "PENDING").upper(),
+        result=parse_task_result(task),
+        error=(str(task.error or "").strip() or None),
+    )
 
 
 @router.get("/{project_id}/script", response_model=ScriptResponse)
@@ -412,6 +630,16 @@ async def start_storyboard_task(
             _storyboard_tasks[task_id] = task
             existing_task = task
 
+    status_value = str(existing_task.get("status") or "running")
+    if status_value == "pending":
+        asyncio.create_task(_run_storyboard_task(str(existing_task["task_id"])))
+        status_value = "running"
+        async with _storyboard_task_lock:
+            latest = _storyboard_tasks.get(str(existing_task["task_id"]))
+            if latest:
+                latest["status"] = "running"
+                existing_task = latest
+
     script = await get_active_script(db, project_id)
     episodes: list[dict[str, Any]] = []
     if script and script.episodes:
@@ -421,26 +649,17 @@ async def start_storyboard_task(
     if 0 <= episode_index < len(episodes):
         target = dict(episodes[episode_index])
         target["storyboardTaskId"] = str(existing_task["task_id"])
-        target["storyboardTaskStatus"] = str(existing_task["status"])
+        target["storyboardTaskStatus"] = status_value
         target["storyboardTaskError"] = ""
         episodes[episode_index] = target
         await save_script(db, project_id, None, None, None, None, episodes)
-
-    status_value = str(existing_task.get("status") or "running")
-    if status_value == "pending":
-        asyncio.create_task(_run_storyboard_task(str(existing_task["task_id"])))
-        status_value = "running"
-        async with _storyboard_task_lock:
-            latest = _storyboard_tasks.get(str(existing_task["task_id"]))
-            if latest:
-                latest["status"] = "running"
 
     return StoryboardTaskStatusResponse(
         task_id=str(existing_task["task_id"]),
         project_id=project_id,
         episode_index=episode_index,
         episode_title=episode_title,
-        status=status_value if status_value in {"running", "completed", "failed"} else "running",
+        status=status_value if status_value in {"pending", "running", "completed", "failed"} else "running",
         content=existing_task.get("content"),
         error=existing_task.get("error"),
     )
@@ -469,7 +688,7 @@ async def get_storyboard_task_status(
             if str(episode.get("storyboardTaskId") or "").strip() != task_id:
                 continue
             status_value = str(episode.get("storyboardTaskStatus") or "running")
-            if status_value not in {"running", "completed", "failed"}:
+            if status_value not in {"pending", "running", "completed", "failed"}:
                 status_value = "running"
             return StoryboardTaskStatusResponse(
                 task_id=task_id,
@@ -482,7 +701,7 @@ async def get_storyboard_task_status(
             )
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="任务不存在")
     status_value = str(task.get("status") or "running")
-    if status_value not in {"running", "completed", "failed"}:
+    if status_value not in {"pending", "running", "completed", "failed"}:
         status_value = "running"
     return StoryboardTaskStatusResponse(
         task_id=str(task.get("task_id") or task_id),
@@ -514,7 +733,7 @@ async def generate_script(
     
     if payload.mode == "generate_storyboard":
         system_prompt = PROMPT_STORYBOARD
-        user_prompt = await _build_storyboard_prompt_user_content(db, project_id, payload.content, payload.instruction)
+        user_prompt = await _build_storyboard_prompt_user_content(db, project_id, payload.content, payload.instruction, None)
     
     if payload.mode == "suggestion_paid":
         system_prompt = PROMPT_SUGGESTION_PAID
@@ -599,6 +818,24 @@ async def generate_script(
     # User requested thinking mode for step0_modify, so we allow it there.
     if payload.mode in ["step0_generate", "split_script"]:
         api_payload["thinking"] = {"type": "disabled"}
+
+    if payload.stream is False:
+        non_stream_payload = dict(api_payload)
+        non_stream_payload["stream"] = False
+        response = await create_chat_completion(db, user_id, non_stream_payload)
+        content = ""
+        thinking = ""
+        if isinstance(response, dict):
+            choices = response.get("choices")
+            if isinstance(choices, list) and choices:
+                first_choice = choices[0] if isinstance(choices[0], dict) else {}
+                message_obj = first_choice.get("message") if isinstance(first_choice, dict) else None
+                if isinstance(message_obj, dict):
+                    content = str(message_obj.get("content") or "").strip()
+                    thinking = str(message_obj.get("reasoning_content") or "").strip()
+        if not content:
+            raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="模型未返回可用内容，请稍后重试")
+        return {"content": content, "thinking": thinking}
 
     async def event_generator():
         try:

@@ -2,7 +2,7 @@
 
 import { useEffect, useMemo, useState } from "react";
 import Link from "next/link";
-import { getEmail, getToken } from "@/lib/auth";
+import { clearEmail, clearToken, getEmail, getToken } from "@/lib/auth";
 
 const buildInitial = (value: string | null) => {
   if (!value) {
@@ -29,6 +29,14 @@ export default function TopNav() {
 
   const initial = useMemo(() => buildInitial(email), [email]);
 
+  const logout = () => {
+    clearToken();
+    clearEmail();
+    setIsAuthed(false);
+    setEmail(null);
+    window.location.href = "/login";
+  };
+
   return (
     <nav className="flex items-center gap-4 text-sm text-slate-600">
       <Link href="/projects" className="hover:text-slate-900">
@@ -44,6 +52,13 @@ export default function TopNav() {
               <a href="/settings" className="block px-3 py-1 hover:bg-slate-50">
                 设置
               </a>
+              <button
+                type="button"
+                onClick={logout}
+                className="block w-full px-3 py-1 text-left hover:bg-slate-50"
+              >
+                退出登录
+              </button>
             </div>
           </div>
         </div>

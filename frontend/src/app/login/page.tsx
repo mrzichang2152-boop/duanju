@@ -57,9 +57,7 @@ export default function LoginPage() {
         >
           {loading ? "登录中..." : "登录"}
         </button>
-        <a href="/register" className="block text-center text-sm text-slate-600">
-          没有账号？去注册
-        </a>
+        <div className="text-center text-sm text-slate-500">注册入口已关闭，请联系管理员分配测试账号</div>
       </div>
     </div>
   );

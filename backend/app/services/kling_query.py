@@ -1,63 +1,40 @@
 import httpx
 from typing import Optional, Tuple
 from sqlalchemy.ext.asyncio import AsyncSession
-from app.services.settings import get_or_create_settings, get_api_key
-from app.services.linkapi import _kling_task_query_url, _parse_kling_ak_sk, _build_kling_jwt
+from app.services.linkapi import _kling_task_query_url, resolve_kling_auth_token
 
-async def query_kling_task_status(session: AsyncSession, user_id: str, endpoint: str, task_id: str) -> Tuple[str, Optional[str]]:
+async def query_kling_task_status(session: AsyncSession, user_id: str, endpoint: str, task_id: str) -> Tuple[str, Optional[str], Optional[str]]:
     """
     Query the status of a Kling video generation task.
+    Returns: (status, video_url, task_status_msg)
     """
-    # 之前强制替换为 api.klingai.com 导致 1002 错误，已移除
-    settings = await get_or_create_settings(session, user_id)
-    configured_key = await get_api_key(session, user_id)
-    
-    key_value = ""
-    if configured_key:
-        key_value = configured_key
-    else:
-        key_value = str(settings.api_key_video or "").strip()
-    
-    print(f"DEBUG: query_kling_task_status called with endpoint: {endpoint}, task_id: {task_id}")
-    print(f"DEBUG: configured_key length: {len(configured_key) if configured_key else 0}")
-    
+    key_value, _key_source = await resolve_kling_auth_token(session, user_id)
     if not key_value:
-        print("DEBUG: key_value is empty")
-        return "FAILED", None
+        return "FAILED", None, "系统未配置 Kling 鉴权 Key"
 
-    # Handle AK/SK
-    ak, sk = _parse_kling_ak_sk(key_value)
-    if ak and sk:
-        key_value = _build_kling_jwt(ak, sk)
-        print(f"DEBUG: generated jwt token starting with {key_value[:20]}")
-    else:
-        print("DEBUG: _parse_kling_ak_sk failed to extract ak/sk")
-    
     query_url = _kling_task_query_url(endpoint, task_id)
-    print(f"DEBUG: query_url: {query_url}")
-    
     headers = {"Authorization": f"Bearer {key_value}"}
     async with httpx.AsyncClient(timeout=10.0) as client:
         try:
             response = await client.get(query_url, headers=headers)
-            print(f"DEBUG: Kling API response status: {response.status_code}, content: {response.text[:200]}")
             if response.status_code != 200:
-                return "FAILED", None
-            
+                return "FAILED", None, f"状态查询失败（HTTP {response.status_code}）"
+
             payload = response.json()
             if not isinstance(payload, dict):
-                return "FAILED", None
-                
+                return "FAILED", None, "状态查询返回格式异常"
+
             payload_code = payload.get("code")
             if payload_code not in {0, "0", None, ""}:
-                return "FAILED", None
-                
+                return "FAILED", None, str(payload.get("message") or "状态查询失败")
+
             data = payload.get("data")
             if not isinstance(data, dict):
-                return "FAILED", None
-                
+                return "FAILED", None, "状态查询缺少 data"
+
             task_status = str(data.get("task_status") or "").strip().lower()
-            
+            task_status_msg = str(data.get("task_status_msg") or "").strip() or None
+
             video_url = ""
             task_result = data.get("task_result")
             if isinstance(task_result, dict):
@@ -68,14 +45,14 @@ async def query_kling_task_status(session: AsyncSession, user_id: str, endpoint:
                         video_url = str(first_video.get("url") or "").strip()
                 if not video_url:
                     video_url = str(task_result.get("url") or task_result.get("video_url") or "").strip()
-            
+
             if video_url:
-                return "COMPLETED", video_url
-                
+                return "COMPLETED", video_url, task_status_msg
+
             if task_status in {"failed", "error", "canceled", "cancelled"}:
-                return "FAILED", None
-                
-            return "KLING_PROCESSING", None
-            
+                return "FAILED", None, task_status_msg
+
+            return "KLING_PROCESSING", None, task_status_msg
+
         except Exception:
-            return "KLING_PROCESSING", None
+            return "KLING_PROCESSING", None, None

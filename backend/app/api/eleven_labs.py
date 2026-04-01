@@ -3,11 +3,56 @@ from typing import Optional
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 from fastapi.responses import Response
+from sqlalchemy import delete, select
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_current_user_id
+from app.core.db import get_db
+from app.models.character_voice import CharacterVoice
+from app.models.eleven_labs_cloned_voice import ElevenLabsClonedVoice
+from app.models.project import Project
 from app.services.eleven_labs import eleven_labs_service
 
 router = APIRouter(tags=["eleven-labs"])
+MAX_CLONED_VOICES_PER_ACCOUNT = 3
+
+
+async def _get_owned_clone_voice_ids(db: AsyncSession, user_id: str) -> set[str]:
+    owned_rows = await db.execute(
+        select(ElevenLabsClonedVoice.voice_id).where(ElevenLabsClonedVoice.user_id == user_id)
+    )
+    owned_ids = {
+        str(voice_id).strip()
+        for voice_id in owned_rows.scalars().all()
+        if str(voice_id).strip()
+    }
+
+    project_rows = await db.execute(select(Project.id).where(Project.user_id == user_id))
+    project_ids = [str(item).strip() for item in project_rows.scalars().all() if str(item).strip()]
+    if project_ids:
+        clone_rows = await db.execute(
+            select(CharacterVoice.voice_id).where(
+                CharacterVoice.project_id.in_(project_ids),
+                CharacterVoice.voice_type == "CLONE",
+            )
+        )
+        referenced_ids = {
+            str(voice_id).strip()
+            for voice_id in clone_rows.scalars().all()
+            if str(voice_id).strip()
+        }
+        missing_ids = referenced_ids - owned_ids
+        if missing_ids:
+            db.add_all(
+                [
+                    ElevenLabsClonedVoice(user_id=user_id, voice_id=voice_id, title="")
+                    for voice_id in missing_ids
+                ]
+            )
+            await db.commit()
+            owned_ids.update(missing_ids)
+
+    return owned_ids
 
 
 @router.get("/voices")
@@ -54,17 +99,97 @@ async def list_models(
         raise HTTPException(status_code=502, detail=str(e))
 
 
+@router.get("/cloned-voices")
+async def list_cloned_voices(
+    user_id: str = Depends(get_current_user_id),
+    db: AsyncSession = Depends(get_db),
+):
+    try:
+        owned_ids = await _get_owned_clone_voice_ids(db, user_id)
+        items = await eleven_labs_service.list_my_cloned_voices()
+        filtered = [item for item in items if str(item.get("_id") or "").strip() in owned_ids]
+        return {
+            "items": filtered,
+            "total": len(filtered),
+            "limit": MAX_CLONED_VOICES_PER_ACCOUNT,
+            "remaining": max(0, MAX_CLONED_VOICES_PER_ACCOUNT - len(filtered)),
+        }
+    except RuntimeError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+
+@router.delete("/voices/{voice_id}")
+async def delete_voice(
+    voice_id: str,
+    user_id: str = Depends(get_current_user_id),
+    db: AsyncSession = Depends(get_db),
+):
+    try:
+        normalized_voice_id = str(voice_id or "").strip()
+        if not normalized_voice_id:
+            raise HTTPException(status_code=400, detail="voice_id 不能为空")
+        owned_ids = await _get_owned_clone_voice_ids(db, user_id)
+        if normalized_voice_id not in owned_ids:
+            raise HTTPException(status_code=403, detail="仅允许删除当前账号创建的克隆音色")
+        await eleven_labs_service.delete_voice(normalized_voice_id)
+        await db.execute(
+            delete(ElevenLabsClonedVoice).where(
+                ElevenLabsClonedVoice.user_id == user_id,
+                ElevenLabsClonedVoice.voice_id == normalized_voice_id,
+            )
+        )
+        await db.commit()
+        return {"status": "deleted", "voice_id": normalized_voice_id}
+    except RuntimeError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+
 @router.post("/clone")
 async def clone_voice(
     title: str = Form(...),
     file: UploadFile = File(...),
     user_id: str = Depends(get_current_user_id),
+    db: AsyncSession = Depends(get_db),
 ):
     try:
+        owned_ids = await _get_owned_clone_voice_ids(db, user_id)
+        existing = await eleven_labs_service.list_my_cloned_voices()
+        existing_owned = [item for item in existing if str(item.get("_id") or "").strip() in owned_ids]
+        if len(existing_owned) >= MAX_CLONED_VOICES_PER_ACCOUNT:
+            raise HTTPException(
+                status_code=400,
+                detail=f"当前账号最多可克隆 {MAX_CLONED_VOICES_PER_ACCOUNT} 个音色，请先删除旧音色后再克隆",
+            )
         content = await file.read()
-        return await eleven_labs_service.create_voice(title, content, file.filename, file.content_type)
+        result = await eleven_labs_service.create_voice(title, content, file.filename, file.content_type)
+        new_voice_id = str(result.get("_id") or result.get("model_id") or "").strip()
+        if new_voice_id:
+            exists_row = await db.execute(
+                select(ElevenLabsClonedVoice.id).where(
+                    ElevenLabsClonedVoice.user_id == user_id,
+                    ElevenLabsClonedVoice.voice_id == new_voice_id,
+                )
+            )
+            if not exists_row.scalar_one_or_none():
+                db.add(
+                    ElevenLabsClonedVoice(
+                        user_id=user_id,
+                        voice_id=new_voice_id,
+                        title=str(result.get("title") or title or "").strip(),
+                    )
+                )
+                await db.commit()
+        return result
     except RuntimeError as e:
         raise HTTPException(status_code=400, detail=str(e))
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=502, detail=str(e))
 

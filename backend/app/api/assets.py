@@ -5,6 +5,8 @@ import logging
 import base64
 import uuid
 import asyncio
+import httpx
+from pydantic import BaseModel
 from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File
 from fastapi.responses import Response, RedirectResponse, FileResponse
 
@@ -15,10 +17,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.deps import get_current_user_id
 from app.core.db import SessionLocal, get_db
 from app.schemas.assets import AssetGenerateRequest, AssetResponse, AssetSelectRequest, AssetUpdateRequest
+from app.schemas.script import AsyncTaskStatusResponse
 from app.schemas.common import StatusResponse
 from app.services.projects import get_project
 from app.models.asset import Asset
 from app.models.asset_version import AssetVersion
+from app.models.character_voice import CharacterVoice
 from app.services.assets import (
     create_asset_version,
     extract_assets_from_script,
@@ -29,12 +33,31 @@ from app.services.assets import (
     select_asset_version,
     download_image_as_local_file,
     update_asset_config,
+    _normalize_character_look_payload,
+    _sanitize_step2_metadata,
 )
 from app.services import media_storage
-from app.services.linkapi import create_image, create_image_edit, create_image_with_reference
+from app.services.linkapi import (
+    _get_or_create_character_subject_id,
+    _normalize_role_key,
+    _resolve_image_url,
+    create_image,
+    create_image_edit,
+    create_image_with_reference,
+    resolve_kling_auth_token,
+)
+from app.services.async_tasks import (
+    create_async_task,
+    get_async_task,
+    mark_async_task_running,
+    mark_async_task_completed,
+    mark_async_task_failed,
+    parse_task_result,
+)
 
 router = APIRouter()
 OPENROUTER_IMAGE_MODEL = "nano-banana-2"
+_ASSET_GENERATE_TASK_TYPE = "ASSET_GENERATE"
 
 
 def _get_style_prompts():
@@ -65,6 +88,18 @@ def _extract_role_name_from_look(look_name: str) -> str:
     return name
 
 
+def _resolve_role_name_from_look(look_name: str, character_names: list[str]) -> str:
+    base = _extract_role_name_from_look(look_name)
+    if base and base != (look_name or "").strip():
+        return base
+    compact_look = (look_name or "").replace(" ", "")
+    for candidate in sorted(character_names, key=len, reverse=True):
+        compact_candidate = (candidate or "").replace(" ", "")
+        if compact_candidate and compact_look.startswith(compact_candidate):
+            return candidate
+    return base
+
+
 async def _continue_asset_generation_after_disconnect(
     project_id: str,
     asset_id: str,
@@ -78,7 +113,7 @@ async def _continue_asset_generation_after_disconnect(
         return
     try:
         async with SessionLocal() as background_db:
-            await generate_asset(project_id, asset_id, payload, user_id, background_db)
+            await _generate_asset_sync(project_id, asset_id, payload, user_id, background_db)
     except Exception:
         logger.exception("恢复素材生成失败：后台任务执行异常 asset_id=%s", asset_id)
 
@@ -117,12 +152,15 @@ async def fetch_assets(
     try:
         await extract_assets_from_script(db, project_id, user_id, manual_only=True)
     except Exception as e:
+        await db.rollback()
         logger.warning(f"Failed to sync assets from script: {e}")
 
     assets = await list_assets(db, project_id)
-    
+    character_names = [str(item.name or "").strip() for item in assets if item.type == "CHARACTER"]
+
     responses: list[AssetResponse] = []
     has_version_url_updated = False
+    has_asset_meta_updated = False
     for asset in assets:
         versions = await list_asset_versions(db, asset.id)
         if len(versions) > 30:
@@ -148,6 +186,62 @@ async def fetch_assets(
                         f"Failed to convert base64 version image for asset={asset.id}, version={version.id}: {convert_exc}"
                     )
                     image_url = ""
+
+            if media_storage.cos_enabled() and image_url:
+                try:
+                    if image_url.startswith("/static/"):
+                        rel = image_url.replace("/static/", "", 1).lstrip("/")
+                        abs_img = os.path.join(media_storage.backend_static_dir(), rel)
+                        if os.path.isfile(abs_img):
+                            cos_url = await media_storage.publish_local_file_under_static(project_id, abs_img)
+                            if cos_url and cos_url != image_url:
+                                image_url = cos_url
+                                version.image_url = cos_url
+                                has_version_url_updated = True
+                    elif image_url.startswith(("http://", "https://")) and "myqcloud.com" not in image_url:
+                        mirrored = await media_storage.mirror_http_url_to_cos(project_id, "assets", image_url)
+                        if mirrored and mirrored != image_url:
+                            image_url = mirrored
+                            version.image_url = mirrored
+                            has_version_url_updated = True
+                except Exception as cos_exc:
+                    logger.warning(
+                        f"Failed to migrate asset image to COS for asset={asset.id}, version={version.id}: {cos_exc}"
+                    )
+            elif image_url.startswith(("http://", "https://")) and "/static/" not in image_url:
+                # 未启用 COS 时，保留原有兜底：将远程图落到本地 static，避免图床防盗链。
+                try:
+                    localized_url = await download_image_as_local_file(
+                        image_url, filename_base=f"{asset.id}_{version.id}"
+                    )
+                    if localized_url and localized_url != image_url:
+                        image_url = localized_url
+                        version.image_url = localized_url
+                        has_version_url_updated = True
+                except Exception as localize_exc:
+                    logger.warning(
+                        f"Failed to localize remote version image for asset={asset.id}, version={version.id}: {localize_exc}"
+                    )
+
+            if (
+                image_url.startswith(("http://", "https://"))
+                and "myqcloud.com" not in image_url
+                and "openpt.wuyinkeji.com" in image_url
+            ):
+                fallback_cos_url = next(
+                    (
+                        str(item.image_url or "").strip()
+                        for item in versions
+                        if str(item.id) != str(version.id)
+                        and "myqcloud.com" in str(item.image_url or "")
+                    ),
+                    "",
+                )
+                if fallback_cos_url:
+                    image_url = fallback_cos_url
+                    version.image_url = fallback_cos_url
+                    has_version_url_updated = True
+
             version_payloads.append(
                 {
                     "id": version.id,
@@ -156,12 +250,29 @@ async def fetch_assets(
                     "is_selected": version.is_selected,
                 }
             )
+        response_name = asset.name
+        response_description = asset.description
+        if asset.type == "CHARACTER_LOOK":
+            role_name = _resolve_role_name_from_look(str(asset.name or ""), character_names)
+            normalized_name, normalized_desc = _normalize_character_look_payload(
+                role_name,
+                str(asset.name or ""),
+                str(asset.description or ""),
+            )
+            normalized_desc = _sanitize_step2_metadata(normalized_desc)
+            response_name = normalized_name
+            response_description = normalized_desc
+            if normalized_name != (asset.name or "") or normalized_desc != (asset.description or ""):
+                asset.name = normalized_name
+                asset.description = normalized_desc
+                has_asset_meta_updated = True
+
         responses.append(
             AssetResponse(
                 id=asset.id,
                 type=asset.type,
-                name=asset.name,
-                description=asset.description,
+                name=response_name,
+                description=response_description,
                 prompt=asset.prompt,
                 model=asset.model,
                 size=asset.size,
@@ -170,7 +281,7 @@ async def fetch_assets(
                 created_at=asset.created_at,
             )
         )
-    if has_version_url_updated:
+    if has_version_url_updated or has_asset_meta_updated:
         await db.commit()
     return responses
 
@@ -294,8 +405,7 @@ async def update_asset(
     )
 
 
-@router.post("/{project_id}/assets/{asset_id}/generate", response_model=StatusResponse)
-async def generate_asset(
+async def _generate_asset_sync(
     project_id: str,
     asset_id: str,
     payload: AssetGenerateRequest,
@@ -333,6 +443,39 @@ async def generate_asset(
         raw = str(candidate_url or "").strip()
         if not raw:
             return ""
+
+        async def _publish_local_like_to_cos(url_text: str) -> str:
+            if not media_storage.cos_enabled():
+                return ""
+            normalized = str(url_text or "").strip()
+            static_path = ""
+            if normalized.startswith("/static/"):
+                static_path = normalized
+            elif normalized.startswith(("http://", "https://")) and "/static/" in normalized:
+                static_path = normalized[normalized.find("/static/") :]
+            elif normalized.startswith("data:image"):
+                try:
+                    localized = await download_image_as_local_file(
+                        normalized,
+                        filename_base=f"{asset.id}_{uuid.uuid4().hex[:8]}_ref",
+                    )
+                    if localized.startswith("/static/"):
+                        static_path = localized
+                except Exception as exc:
+                    logger.warning(f"Failed to persist data ref image before COS publish: {exc}")
+                    return ""
+            if not static_path.startswith("/static/"):
+                return ""
+            rel = static_path.replace("/static/", "", 1).lstrip("/")
+            abs_img = os.path.join(media_storage.backend_static_dir(), rel)
+            if not os.path.isfile(abs_img):
+                return ""
+            try:
+                return await media_storage.publish_local_file_under_static(project_id, abs_img)
+            except Exception as exc:
+                logger.warning(f"Failed to publish reference image to COS, fallback to original URL: {exc}")
+                return ""
+
         is_local_like = (
             raw.startswith("data:image")
             or raw.startswith("/static/")
@@ -344,6 +487,11 @@ async def generate_asset(
         )
         if not is_local_like:
             return raw
+
+        cos_ref_url = await _publish_local_like_to_cos(raw)
+        if cos_ref_url:
+            return cos_ref_url
+
         versions = await list_asset_versions(db, asset.id)
         selected_remote = ""
         latest_remote = ""
@@ -609,7 +757,8 @@ async def generate_asset(
     version_image_url = image_url_text
     if image_url_text.startswith(("http://", "https://")):
         try:
-            await download_image_as_local_file(image_url_text, filename_base=filename_base)
+            # 优先落本地静态文件，避免第三方图床防盗链导致前端白图/无法预览
+            version_image_url = await download_image_as_local_file(image_url_text, filename_base=filename_base)
         except Exception as exc:
             logger.warning(f"Image download skipped, keep remote URL for version: {exc}")
     else:
@@ -622,17 +771,109 @@ async def generate_asset(
                 detail=f"图片下载失败，请重试: {exc}",
             ) from exc
     if media_storage.cos_enabled():
-        if version_image_url.startswith("/static/"):
-            rel = version_image_url.replace("/static/", "", 1).lstrip("/")
-            abs_img = os.path.join(media_storage.backend_static_dir(), rel)
-            version_image_url = await media_storage.publish_local_file_under_static(project_id, abs_img)
-        elif version_image_url.startswith(("http://", "https://")):
-            version_image_url = await media_storage.mirror_http_url_to_cos(
-                project_id, "assets", version_image_url
-            )
+        try:
+            if version_image_url.startswith("/static/"):
+                rel = version_image_url.replace("/static/", "", 1).lstrip("/")
+                abs_img = os.path.join(media_storage.backend_static_dir(), rel)
+                version_image_url = await media_storage.publish_local_file_under_static(project_id, abs_img)
+            elif version_image_url.startswith(("http://", "https://")):
+                version_image_url = await media_storage.mirror_http_url_to_cos(
+                    project_id, "assets", version_image_url
+                )
+        except Exception as exc:
+            # 镜像/发布失败不应让整次生成报错，保留原始可访问 URL 继续落库
+            logger.warning(f"COS mirror/publish skipped, keep original image URL: {exc}")
     await create_asset_version(db, asset_id, version_image_url, prompt)
     
     return StatusResponse(status="ready")
+
+
+async def _run_asset_generate_task(task_id: str) -> None:
+    async with SessionLocal() as db:
+        task = await get_async_task(db, task_id=task_id)
+        if not task:
+            return
+        try:
+            await mark_async_task_running(db, task)
+            payload_data = json.loads(task.payload_json or "{}") if task.payload_json else {}
+            project_id = str(task.project_id)
+            user_id = str(task.user_id)
+            asset_id = str(payload_data.get("asset_id") or "")
+            req_payload = AssetGenerateRequest(**(payload_data.get("payload") or {}))
+            await _generate_asset_sync(project_id, asset_id, req_payload, user_id, db)
+            await mark_async_task_completed(
+                db,
+                task,
+                {
+                    "asset_id": asset_id,
+                },
+            )
+        except Exception as exc:
+            await mark_async_task_failed(db, task, str(exc))
+
+
+@router.post("/{project_id}/assets/{asset_id}/generate", response_model=AsyncTaskStatusResponse)
+async def generate_asset(
+    project_id: str,
+    asset_id: str,
+    payload: AssetGenerateRequest,
+    user_id: str = Depends(get_current_user_id),
+    db: AsyncSession = Depends(get_db),
+) -> AsyncTaskStatusResponse:
+    project = await get_project(db, user_id, project_id)
+    if not project:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="项目不存在")
+    asset = await get_asset(db, asset_id)
+    if not asset or asset.project_id != project_id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="素材不存在")
+    task = await create_async_task(
+        db,
+        project_id=project_id,
+        user_id=user_id,
+        task_type=_ASSET_GENERATE_TASK_TYPE,
+        payload={
+            "asset_id": asset_id,
+            "payload": payload.model_dump() if hasattr(payload, "model_dump") else payload.dict(),
+        },
+    )
+    asyncio.create_task(_run_asset_generate_task(task.id))
+    return AsyncTaskStatusResponse(
+        task_id=task.id,
+        project_id=project_id,
+        task_type=_ASSET_GENERATE_TASK_TYPE,
+        status="RUNNING",
+        result=None,
+        error=None,
+    )
+
+
+@router.get("/{project_id}/assets/generate-tasks/{task_id}", response_model=AsyncTaskStatusResponse)
+async def get_asset_generate_task_status(
+    project_id: str,
+    task_id: str,
+    user_id: str = Depends(get_current_user_id),
+    db: AsyncSession = Depends(get_db),
+) -> AsyncTaskStatusResponse:
+    project = await get_project(db, user_id, project_id)
+    if not project:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="项目不存在")
+    task = await get_async_task(
+        db,
+        task_id=task_id,
+        project_id=project_id,
+        user_id=user_id,
+        task_type=_ASSET_GENERATE_TASK_TYPE,
+    )
+    if not task:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="任务不存在")
+    return AsyncTaskStatusResponse(
+        task_id=task.id,
+        project_id=project_id,
+        task_type=task.task_type,
+        status=str(task.status or "PENDING").upper(),
+        result=parse_task_result(task),
+        error=(str(task.error or "").strip() or None),
+    )
 
 
 @router.post("/{project_id}/assets/{asset_id}/upload", response_model=StatusResponse)
@@ -682,6 +923,163 @@ async def upload_asset_image(
     await create_asset_version(db, asset_id, upload_url, f"upload:{file.filename or ''}")
     await file.close()
     return StatusResponse(status="ready")
+
+
+class GenerateSubjectResponse(StatusResponse):
+    subject_id: str
+
+
+class GenerateSubjectRequest(BaseModel):
+    allow_without_voice: bool = False
+
+
+@router.post("/{project_id}/assets/{asset_id}/generate-subject", response_model=GenerateSubjectResponse)
+async def generate_asset_subject(
+    project_id: str,
+    asset_id: str,
+    payload: GenerateSubjectRequest | None = None,
+    user_id: str = Depends(get_current_user_id),
+    db: AsyncSession = Depends(get_db),
+) -> GenerateSubjectResponse:
+    project = await get_project(db, user_id, project_id)
+    if not project:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="项目不存在")
+
+    asset = await get_asset(db, asset_id)
+    if not asset or asset.project_id != project_id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="素材不存在")
+    if str(asset.type or "").upper() != "CHARACTER_LOOK":
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="仅角色形象支持生成主体")
+
+    versions = await list_asset_versions(db, asset.id)
+    selected_version = next(
+        (item for item in versions if bool(item.is_selected) and str(item.image_url or "").strip()),
+        None,
+    )
+    if not selected_version:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="请先选中角色形象图片，再生成主体")
+    raw_image_url = str(selected_version.image_url or "").strip()
+    if not raw_image_url:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="角色形象图片地址无效，请重新选择")
+
+    image_url = ""
+    if media_storage.cos_enabled():
+        try:
+            if raw_image_url.startswith("data:image"):
+                localized = await download_image_as_local_file(
+                    raw_image_url,
+                    filename_base=f"{asset.id}_{uuid.uuid4().hex[:8]}_subject",
+                )
+                raw_image_url = localized
+            if raw_image_url.startswith("/static/"):
+                rel = raw_image_url.replace("/static/", "", 1).lstrip("/")
+                abs_img = os.path.join(media_storage.backend_static_dir(), rel)
+                image_url = await media_storage.publish_local_file_under_static(project_id, abs_img)
+            elif raw_image_url.startswith(("http://", "https://")):
+                if "myqcloud.com" in raw_image_url:
+                    image_url = raw_image_url
+                else:
+                    image_url = await media_storage.mirror_http_url_to_cos(project_id, "assets", raw_image_url)
+        except Exception as exc:
+            logger.warning(f"主体参考图自动发布 COS 失败，回退公共 URL 解析: {exc}")
+
+    if not image_url:
+        image_url = str(await _resolve_image_url(raw_image_url)).strip()
+
+    if not image_url.startswith(("http://", "https://")):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="主体参考图未解析为可公网访问 URL，请检查 COS 配置或重选图片",
+        )
+
+    if image_url != str(selected_version.image_url or "").strip():
+        selected_version.image_url = image_url
+
+    character_rows = await db.execute(
+        select(Asset).where(
+            Asset.project_id == project_id,
+            Asset.type == "CHARACTER",
+        )
+    )
+    character_assets = list(character_rows.scalars().all())
+    character_names = [str(item.name or "").strip() for item in character_assets if str(item.name or "").strip()]
+    resolved_role_name = _resolve_role_name_from_look(str(asset.name or ""), character_names)
+
+    voice_rows = await db.execute(select(CharacterVoice).where(CharacterVoice.project_id == project_id))
+    voices = list(voice_rows.scalars().all())
+
+    matched_voice = None
+    compact_role_name = resolved_role_name.replace(" ", "")
+    for voice in voices:
+        voice_name = str(voice.character_name or "").strip()
+        if not voice_name:
+            continue
+        if voice_name == resolved_role_name:
+            matched_voice = voice
+            break
+        if _normalize_role_key(voice_name) == _normalize_role_key(resolved_role_name):
+            matched_voice = voice
+            break
+        compact_voice_name = voice_name.replace(" ", "")
+        compact_voice_role = _normalize_role_key(voice_name).replace(" ", "")
+        if compact_voice_name and compact_role_name.startswith(compact_voice_name):
+            matched_voice = voice
+            break
+        if compact_voice_role and compact_role_name.startswith(compact_voice_role):
+            matched_voice = voice
+            break
+
+    if not matched_voice or not str(matched_voice.voice_id or "").strip():
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"请先为角色“{resolved_role_name or str(asset.name or '')}”上传音频并创建 Kling 音色，再生成主体",
+        )
+    if str(matched_voice.voice_type or "").strip().upper() != "KLING_CUSTOM":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"角色“{resolved_role_name or str(asset.name or '')}”尚未完成 Kling 自定义音色创建，请先在 Step3 上传角色音频",
+        )
+
+    kling_jwt, _kling_key_source = await resolve_kling_auth_token(db, user_id)
+    if not kling_jwt:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="系统未配置 Kling 鉴权 Key，请联系管理员配置",
+        )
+
+    allow_without_voice = bool(payload.allow_without_voice) if payload else False
+    subject_item = {
+        "asset_id": str(asset.id),
+        "role": "character",
+        "name": str(asset.name or "").strip(),
+        "description": str(asset.description or "").strip(),
+        "image_url": image_url,
+        "voice_id": "" if allow_without_voice else str(matched_voice.voice_id or "").strip(),
+    }
+    async with httpx.AsyncClient(timeout=120.0, trust_env=True) as client:
+        subject_id = await _get_or_create_character_subject_id(
+            db,
+            client,
+            kling_jwt,
+            project_id,
+            subject_item,
+            force_create=True,
+            allow_voice_fallback=False,
+        )
+
+    if not subject_id and not allow_without_voice:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "code": "VOICE_BIND_OPTIONAL_CONFIRM",
+                "message": "当前角色图未通过“音色绑定主体”检测。你可以继续生成“不绑定音色”的主体（成功率更高），或先更换更清晰的角色图后再试。",
+            },
+        )
+    if not subject_id:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="不绑定音色生成主体仍失败，请更换更清晰的角色图后重试")
+
+    await db.commit()
+    return GenerateSubjectResponse(status="ready", subject_id=subject_id)
 
 
 @router.put("/{project_id}/assets/{asset_id}/select", response_model=StatusResponse)

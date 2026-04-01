@@ -6,6 +6,8 @@ import { deleteSegmentVersion, generateSegment, getAssets, getScript, getSegment
 import { getToken } from "@/lib/auth";
 import { ScriptEditor } from "@/app/components/ScriptEditor";
 
+const SEPARATOR = "\n\n=== 原文剧本 (请勿删除此行) ===\n\n";
+
 const STYLE_OPTIONS = [
   "真人电影写实", "3D 写实渲染", "3D 超写实渲染", "3D 虚幻引擎风", "3D 游戏 CG",
   "3D 半写实", "3D 皮克斯风", "3D 迪士尼风", "3D 萌系 Q 版", "3D 粘土风",
@@ -51,6 +53,51 @@ type ManualPendingRowState = {
   submittedAt: number;
 };
 
+const getManualPendingStorageKey = (projectId: string) => `storyboard-manual-pending-v1:${projectId}`;
+const STORYBOARD_TASK_PENDING_MAX_AGE_MS = 60 * 60 * 1000;
+const getStoryboardTaskPendingStorageKey = (projectId: string) => `storyboard-task-pending-v1:${projectId}`;
+
+type StoryboardPendingTaskState = {
+  episodeIndex: number;
+  episodeTitle: string;
+  taskId: string;
+  startedAt: number;
+};
+
+function readStoryboardPendingTasks(projectId: string): Record<number, StoryboardPendingTaskState> {
+  if (typeof window === "undefined") return {};
+  try {
+    const raw = window.localStorage.getItem(getStoryboardTaskPendingStorageKey(projectId));
+    if (!raw) return {};
+    const parsed = JSON.parse(raw) as Record<string, StoryboardPendingTaskState>;
+    const now = Date.now();
+    const next: Record<number, StoryboardPendingTaskState> = {};
+    Object.entries(parsed || {}).forEach(([key, value]) => {
+      const episodeIndex = Number(key);
+      const taskId = String(value?.taskId || "").trim();
+      if (Number.isNaN(episodeIndex) || !taskId) return;
+      const startedAt = Number(value?.startedAt || 0);
+      if (!startedAt || now - startedAt > STORYBOARD_TASK_PENDING_MAX_AGE_MS) return;
+      next[episodeIndex] = {
+        episodeIndex,
+        episodeTitle: String(value?.episodeTitle || `第${episodeIndex + 1}集`),
+        taskId,
+        startedAt,
+      };
+    });
+    return next;
+  } catch {
+    return {};
+  }
+}
+
+function writeStoryboardPendingTasks(projectId: string, value: Record<number, StoryboardPendingTaskState>) {
+  if (typeof window === "undefined") return;
+  try {
+    window.localStorage.setItem(getStoryboardTaskPendingStorageKey(projectId), JSON.stringify(value));
+  } catch {}
+}
+
 function extractAssetTokensFromCell(cell: string) {
   const regex = /\[AssetID:\s*([^\]]+)\]/g;
   const tokens: string[] = [];
@@ -76,25 +123,46 @@ function extractImageUrlsFromCell(cell: string) {
   return Array.from(new Set(urls.filter(Boolean)));
 }
 
-function resolveAssetIdsFromCell(cell: string, assets: Asset[]) {
+function resolveAssetIdsFromCell(cell: string, assets: Asset[], role?: KlingAssetRole) {
   const tokens = extractAssetTokensFromCell(cell);
   const resolved: string[] = [];
   const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+  const normalizeKey = (text: string) =>
+    String(text || "")
+      .trim()
+      .replace(/[（(][^）)]*[）)]/g, "")
+      .replace(/[\s【】\[\]{}《》<>:：,，。.!！?？、·|｜/\\_-]/g, "")
+      .toLowerCase();
+  const roleTypeMap: Record<KlingAssetRole, Asset["type"][]> = {
+    character: ["CHARACTER_LOOK", "CHARACTER"],
+    scene: ["SCENE"],
+    prop: ["PROP"],
+    first_frame: ["CHARACTER_LOOK", "CHARACTER", "SCENE", "PROP"],
+  };
+  const scopedAssets = role ? assets.filter((asset) => roleTypeMap[role]?.includes(asset.type)) : assets;
+  const searchAssets = scopedAssets.length > 0 ? scopedAssets : assets;
   const pickBestAssetByName = (name: string) => {
-    const candidates = assets.filter((asset) => asset.name.trim() === name);
+    const tokenKey = normalizeKey(name);
+    const candidates = searchAssets.filter((asset) => {
+      const assetName = String(asset.name || "").trim();
+      const assetKey = normalizeKey(assetName);
+      return assetName === name || (tokenKey && assetKey === tokenKey);
+    });
     if (candidates.length === 0) return null;
-    return candidates
-      .map((asset) => {
-        const versions = asset.versions || [];
-        const hasSelectedImage = versions.some((version) => version.is_selected && Boolean((version.image_url || "").trim()));
-        const hasAnyImage = versions.some((version) => Boolean((version.image_url || "").trim()));
-        const score = (hasSelectedImage ? 1000 : 0) + (hasAnyImage ? 100 : 0) + versions.length;
-        return { asset, score };
-      })
-      .sort((a, b) => b.score - a.score)[0]?.asset || null;
+    return (
+      candidates
+        .map((asset) => {
+          const versions = asset.versions || [];
+          const hasSelectedImage = versions.some((version) => version.is_selected && Boolean((version.image_url || "").trim()));
+          const hasAnyImage = versions.some((version) => Boolean((version.image_url || "").trim()));
+          const score = (hasSelectedImage ? 1000 : 0) + (hasAnyImage ? 100 : 0) + versions.length;
+          return { asset, score };
+        })
+        .sort((a, b) => b.score - a.score)[0]?.asset || null
+    );
   };
   tokens.forEach((token) => {
-    const exact = assets.find((asset) => asset.id === token);
+    const exact = searchAssets.find((asset) => asset.id === token);
     const byName = exact || pickBestAssetByName(token);
     if (byName?.id) {
       resolved.push(byName.id);
@@ -104,6 +172,15 @@ function resolveAssetIdsFromCell(cell: string, assets: Asset[]) {
       resolved.push(token);
     }
   });
+  const textWithoutTags = String(cell || "").replace(/\[AssetID:\s*[^\]]+\]/gi, " ");
+  textWithoutTags
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .forEach((line) => {
+      const byName = pickBestAssetByName(line);
+      if (byName?.id) resolved.push(byName.id);
+    });
   const imageUrls = extractImageUrlsFromCell(cell);
   imageUrls.forEach((url) => {
     const fromPath = url.match(/\/assets\/([0-9a-f-]{36})(?:\/|$)/i)?.[1];
@@ -366,6 +443,10 @@ export default function ScriptStoryboardPage() {
   const [expandedEpisodes, setExpandedEpisodes] = useState<Set<number>>(new Set([0])); // Default expand first
   const [mergingEpisodes, setMergingEpisodes] = useState<Set<number>>(new Set());
   const [mergedVideoUrlMap, setMergedVideoUrlMap] = useState<Record<number, string>>({});
+  const [pendingStoryboardTasks, setPendingStoryboardTasks] = useState<Record<number, StoryboardPendingTaskState>>({});
+  const [customPromptModalEpisodeIndex, setCustomPromptModalEpisodeIndex] = useState<number | null>(null);
+  const [customStoryboardPrompt, setCustomStoryboardPrompt] = useState("");
+  const [customPromptSubmittingEpisodeIndex, setCustomPromptSubmittingEpisodeIndex] = useState<number | null>(null);
 
   const saveTimeoutRef = useRef<NodeJS.Timeout | null>(null);
   const lastSavedContentRef = useRef("");
@@ -433,6 +514,16 @@ export default function ScriptStoryboardPage() {
 
   useEffect(() => {
     if (!projectId) return;
+    setPendingStoryboardTasks(readStoryboardPendingTasks(projectId));
+  }, [projectId]);
+
+  useEffect(() => {
+    if (!projectId) return;
+    writeStoryboardPendingTasks(projectId, pendingStoryboardTasks);
+  }, [projectId, pendingStoryboardTasks]);
+
+  useEffect(() => {
+    if (!projectId) return;
     const key = `storyboard-video-audio-${projectId}`;
     localStorage.setItem(key, videoAudioMode);
   }, [projectId, videoAudioMode]);
@@ -455,6 +546,40 @@ export default function ScriptStoryboardPage() {
     } catch {}
   }, [projectId]);
 
+  useEffect(() => {
+    if (!projectId) return;
+    try {
+      const raw = window.localStorage.getItem(getManualPendingStorageKey(projectId));
+      if (!raw) return;
+      const parsed = JSON.parse(raw) as Record<string, ManualPendingRowState>;
+      if (!parsed || typeof parsed !== "object") return;
+      const now = Date.now();
+      const restored: Record<number, ManualPendingRowState> = {};
+      Object.entries(parsed).forEach(([rowIndexKey, item]) => {
+        const rowIndex = Number(rowIndexKey);
+        if (Number.isNaN(rowIndex)) return;
+        if (!item?.segmentId) return;
+        if (!item.submittedAt || now - Number(item.submittedAt) > 30 * 60 * 1000) return;
+        restored[rowIndex] = {
+          segmentId: String(item.segmentId),
+          baseVersionIds: Array.isArray(item.baseVersionIds) ? item.baseVersionIds.map((id) => String(id)) : [],
+          submittedAt: Number(item.submittedAt) || now,
+        };
+      });
+      setManualPendingRowMap(restored);
+    } catch {}
+  }, [projectId]);
+
+  useEffect(() => {
+    if (!projectId) return;
+    try {
+      window.localStorage.setItem(
+        getManualPendingStorageKey(projectId),
+        JSON.stringify(manualPendingRowMap)
+      );
+    } catch {}
+  }, [projectId, manualPendingRowMap]);
+
   // Load script
   useEffect(() => {
     if (!projectId) return;
@@ -467,7 +592,11 @@ export default function ScriptStoryboardPage() {
     getScript(token, projectId)
       .then(async (data) => {
         hydratingRef.current = true;
-        setContent(data.content ?? "");
+        const rawContent = data.content ?? "";
+        const originalContent = rawContent.includes(SEPARATOR)
+          ? String(rawContent.split(SEPARATOR)[1] || "")
+          : rawContent;
+        setContent(stripThinkingContent(originalContent));
         const initialStoryboard = stripThinkingContent(data.storyboard || "");
         setStoryboard(initialStoryboard);
         
@@ -502,8 +631,23 @@ export default function ScriptStoryboardPage() {
             setGeneratingEpisodes(() => {
               const next = new Set<number>();
               loadedEpisodes.forEach((ep, index) => {
-                if (ep.storyboardTaskStatus === "running" && ep.storyboardTaskId) {
+                if ((ep.storyboardTaskStatus === "running" || ep.storyboardTaskStatus === "pending") && ep.storyboardTaskId) {
                   next.add(index);
+                }
+              });
+              return next;
+            });
+            setPendingStoryboardTasks((prev) => {
+              const next = { ...prev };
+              loadedEpisodes.forEach((ep, index) => {
+                const taskId = String(ep.storyboardTaskId || "").trim();
+                if ((ep.storyboardTaskStatus === "running" || ep.storyboardTaskStatus === "pending") && taskId) {
+                  next[index] = {
+                    episodeIndex: index,
+                    episodeTitle: ep.title || `第${index + 1}集`,
+                    taskId,
+                    startedAt: Date.now(),
+                  };
                 }
               });
               return next;
@@ -756,14 +900,30 @@ export default function ScriptStoryboardPage() {
 
   useEffect(() => {
     if (!projectId) return;
-    const runningTasks = episodes
-      .map((episode, index) => ({
-        index,
-        title: episode.title || `第${index + 1}集`,
-        taskId: String(episode.storyboardTaskId || "").trim(),
-        status: episode.storyboardTaskStatus,
-      }))
-      .filter((item) => item.taskId && item.status === "running");
+    const runningTaskMap = new Map<number, { index: number; title: string; taskId: string }>();
+    episodes.forEach((episode, index) => {
+      const taskId = String(episode.storyboardTaskId || "").trim();
+      if ((episode.storyboardTaskStatus === "running" || episode.storyboardTaskStatus === "pending") && taskId) {
+        runningTaskMap.set(index, {
+          index,
+          title: episode.title || `第${index + 1}集`,
+          taskId,
+        });
+      }
+    });
+    const now = Date.now();
+    Object.values(pendingStoryboardTasks).forEach((item) => {
+      if (!item?.taskId) return;
+      if (now - Number(item.startedAt || 0) > STORYBOARD_TASK_PENDING_MAX_AGE_MS) return;
+      if (!runningTaskMap.has(item.episodeIndex)) {
+        runningTaskMap.set(item.episodeIndex, {
+          index: item.episodeIndex,
+          title: item.episodeTitle || `第${item.episodeIndex + 1}集`,
+          taskId: item.taskId,
+        });
+      }
+    });
+    const runningTasks = Array.from(runningTaskMap.values());
     if (storyboardPollTimerRef.current) {
       clearInterval(storyboardPollTimerRef.current);
       storyboardPollTimerRef.current = null;
@@ -781,7 +941,7 @@ export default function ScriptStoryboardPage() {
         runningTasks.map(async (item) => {
           try {
             const result = await getStoryboardTaskStatus(token, projectId, item.taskId);
-            if (result.status === "running") return;
+            if (result.status === "running" || result.status === "pending") return;
             if (result.status === "completed") {
               setEpisodes((prev) => {
                 if (!prev[item.index]) return prev;
@@ -797,6 +957,11 @@ export default function ScriptStoryboardPage() {
               });
               setExpandedEpisodes((prev) => new Set(prev).add(item.index));
               setMessage(`${item.title} 分镜生成完成`);
+              setPendingStoryboardTasks((prev) => {
+                const next = { ...prev };
+                delete next[item.index];
+                return next;
+              });
             } else if (result.status === "failed") {
               setEpisodes((prev) => {
                 if (!prev[item.index]) return prev;
@@ -810,6 +975,11 @@ export default function ScriptStoryboardPage() {
                 return next;
               });
               setMessage(`${item.title} 生成失败：${result.error || "未知错误"}`);
+              setPendingStoryboardTasks((prev) => {
+                const next = { ...prev };
+                delete next[item.index];
+                return next;
+              });
             }
             setGeneratingEpisodes((prev) => {
               const next = new Set(prev);
@@ -832,9 +1002,9 @@ export default function ScriptStoryboardPage() {
         storyboardPollTimerRef.current = null;
       }
     };
-  }, [episodes, projectId]);
+  }, [episodes, projectId, pendingStoryboardTasks]);
 
-  const handleGenerateEpisode = async (index: number) => {
+  const handleGenerateEpisode = async (index: number, extraInstruction?: string) => {
     if (!projectId) return;
     const token = getToken();
     if (!token) return;
@@ -852,12 +1022,20 @@ export default function ScriptStoryboardPage() {
     setMessage(`正在生成 ${episode.title} 的分镜...`);
 
     try {
+      const styleInstruction = STYLE_PROMPT_MAP[globalStyle] || `全局视觉风格：${globalStyle}`;
+      const customInstruction = String(extraInstruction || "").trim();
+      const mergedInstruction = [
+        styleInstruction,
+        customInstruction ? `【本次额外要求】\n${customInstruction}` : "",
+      ]
+        .filter(Boolean)
+        .join("\n\n");
       const result = await startStoryboardTask(token, projectId, {
         episode_index: index,
         episode_title: episode.title || `第${index + 1}集`,
         episode_content: episode.content,
         model: selectedModel,
-        instruction: STYLE_PROMPT_MAP[globalStyle] || `全局视觉风格：${globalStyle}`,
+        instruction: mergedInstruction,
       });
       setEpisodes((prev) => {
         if (!prev[index]) return prev;
@@ -871,9 +1049,25 @@ export default function ScriptStoryboardPage() {
         };
         return next;
       });
+      if (result.status === "running" || result.status === "pending") {
+        setPendingStoryboardTasks((prev) => ({
+          ...prev,
+          [index]: {
+            episodeIndex: index,
+            episodeTitle: episode.title || `第${index + 1}集`,
+            taskId: result.task_id,
+            startedAt: Date.now(),
+          },
+        }));
+      }
       if (result.status === "completed") {
         setMessage(`${episode.title} 分镜生成完成`);
         setExpandedEpisodes((prev) => new Set(prev).add(index));
+        setPendingStoryboardTasks((prev) => {
+          const next = { ...prev };
+          delete next[index];
+          return next;
+        });
         setGeneratingEpisodes((prev) => {
           const next = new Set(prev);
           next.delete(index);
@@ -881,6 +1075,11 @@ export default function ScriptStoryboardPage() {
         });
       } else if (result.status === "failed") {
         setMessage(`${episode.title} 生成失败：${result.error || "未知错误"}`);
+        setPendingStoryboardTasks((prev) => {
+          const next = { ...prev };
+          delete next[index];
+          return next;
+        });
         setGeneratingEpisodes((prev) => {
           const next = new Set(prev);
           next.delete(index);
@@ -892,6 +1091,11 @@ export default function ScriptStoryboardPage() {
     } catch (e) {
       console.error(e);
       setMessage(`${episode.title} 生成失败`);
+      setPendingStoryboardTasks((prev) => {
+        const next = { ...prev };
+        delete next[index];
+        return next;
+      });
       setEpisodes((prev) => {
         if (!prev[index]) return prev;
         const next = [...prev];
@@ -907,6 +1111,24 @@ export default function ScriptStoryboardPage() {
         next.delete(index);
         return next;
       });
+    }
+  };
+
+  const handleGenerateEpisodeWithCustomPrompt = async () => {
+    if (customPromptModalEpisodeIndex === null) return;
+    const prompt = customStoryboardPrompt.trim();
+    if (!prompt) {
+      setMessage("请输入按要求生成分镜的提示内容");
+      return;
+    }
+    const targetEpisodeIndex = customPromptModalEpisodeIndex;
+    setCustomPromptSubmittingEpisodeIndex(targetEpisodeIndex);
+    try {
+      await handleGenerateEpisode(targetEpisodeIndex, prompt);
+      setCustomPromptModalEpisodeIndex(null);
+      setCustomStoryboardPrompt("");
+    } finally {
+      setCustomPromptSubmittingEpisodeIndex(null);
     }
   };
 
@@ -1079,7 +1301,7 @@ export default function ScriptStoryboardPage() {
         const role = mapHeaderToAssetRole(header);
         if (!role) return;
         if (usePreviousSegmentEndFrame && role === "first_frame") return;
-        const ids = resolveAssetIdsFromCell(cell, projectAssets);
+        const ids = resolveAssetIdsFromCell(cell, projectAssets, role);
         if (ids.length > 0) {
           ids.forEach((id) => {
             pushBinding(id, role);
@@ -1097,13 +1319,18 @@ export default function ScriptStoryboardPage() {
         previousSegmentVideoUrl = rowVideoUrlMap[previousGlobalRowIndex] || getSelectedOrLatestSegmentVideoUrl(previousSegment);
       }
 
+      const sanitizeCellForPrompt = (text: string) =>
+        String(text || "")
+          .replace(/\[AssetID:\s*[^\]]+\]/gi, "")
+          .replace(/\n{3,}/g, "\n\n")
+          .trim();
       const consumedHeaderIndexSet = new Set<number>();
       VIDEO_FIELD_ORDER.forEach((field) => {
         const fieldIndex = findFieldIndex(headers, field);
         if (fieldIndex < 0) return;
         consumedHeaderIndexSet.add(fieldIndex);
         const fieldHeader = headers[fieldIndex];
-        const fieldCell = row[fieldIndex] || "（空）";
+        const fieldCell = sanitizeCellForPrompt(row[fieldIndex] || "") || "（空）";
         rowFieldMeaningLines.push(`- ${field}：${COLUMN_MEANING_MAP[field] || "该字段用于描述当前镜头的重要信息"}`);
         rowFieldValueLines.push(`${field}: ${fieldCell}`);
         if (fieldHeader !== field) {
@@ -1115,7 +1342,7 @@ export default function ScriptStoryboardPage() {
         if (consumedHeaderIndexSet.has(index)) return;
         if (isVideoGenerateHeader(header)) return;
         rowFieldMeaningLines.push(`- ${header}：${COLUMN_MEANING_MAP[header] || "该字段用于描述当前镜头的重要信息"}`);
-        rowFieldValueLines.push(`${header}: ${row[index] || "（空）"}`);
+        rowFieldValueLines.push(`${header}: ${sanitizeCellForPrompt(row[index] || "") || "（空）"}`);
       });
 
       const systemPrompt = [
@@ -1189,7 +1416,11 @@ export default function ScriptStoryboardPage() {
         const refreshedSegments = await getSegments(token, projectId);
         setSegments(refreshedSegments);
       } catch {}
-      const referenceCount = assetBindings.length > 0 ? assetBindings.length : imageUrl ? 1 : 0;
+      const referenceCount = assetBindings.length > 0
+        ? new Set(assetBindings.map((item) => item.asset_id)).size
+        : imageUrl
+          ? 1
+          : 0;
       setMessage(`视频任务已提交，正在生成中（本次参考图：${referenceCount}）`);
     } catch (error) {
       if (!submitted) {
@@ -1411,10 +1642,21 @@ export default function ScriptStoryboardPage() {
                                     e.stopPropagation();
                                     handleGenerateEpisode(index);
                                 }}
-                                disabled={generatingEpisodes.has(index) || episode.storyboardTaskStatus === "running"}
+                                disabled={generatingEpisodes.has(index) || episode.storyboardTaskStatus === "running" || episode.storyboardTaskStatus === "pending"}
                                 className="px-3 py-1 text-xs bg-blue-600 text-white rounded hover:bg-blue-700 disabled:opacity-50"
                             >
-                                {generatingEpisodes.has(index) || episode.storyboardTaskStatus === "running" ? "生成中..." : "生成分镜"}
+                                {generatingEpisodes.has(index) || episode.storyboardTaskStatus === "running" || episode.storyboardTaskStatus === "pending" ? "生成中..." : "生成分镜"}
+                            </button>
+                            <button
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  setCustomPromptModalEpisodeIndex(index);
+                                  setCustomStoryboardPrompt("");
+                                }}
+                                disabled={generatingEpisodes.has(index) || episode.storyboardTaskStatus === "running" || episode.storyboardTaskStatus === "pending"}
+                                className="px-3 py-1 text-xs bg-indigo-600 text-white rounded hover:bg-indigo-700 disabled:opacity-50"
+                            >
+                                按要求生成分镜
                             </button>
                             <button
                                 onClick={(e) => {
@@ -1497,6 +1739,46 @@ export default function ScriptStoryboardPage() {
              </button>
         </div>
       )}
+
+      {customPromptModalEpisodeIndex !== null ? (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4"
+          onClick={() => {
+            if (customPromptSubmittingEpisodeIndex !== null) return;
+            setCustomPromptModalEpisodeIndex(null);
+          }}
+        >
+          <div className="w-full max-w-2xl rounded-xl bg-white p-4 shadow-xl" onClick={(e) => e.stopPropagation()}>
+            <div className="mb-3 text-sm font-semibold text-slate-800">按要求生成分镜</div>
+            <textarea
+              value={customStoryboardPrompt}
+              onChange={(e) => setCustomStoryboardPrompt(e.target.value)}
+              placeholder="请输入本次额外要求（自然语言）"
+              className="h-40 w-full rounded-lg border border-slate-200 px-3 py-2 text-sm outline-none focus:border-indigo-500"
+            />
+            <div className="mt-3 flex justify-end gap-2">
+              <button
+                type="button"
+                onClick={() => setCustomPromptModalEpisodeIndex(null)}
+                disabled={customPromptSubmittingEpisodeIndex !== null}
+                className="rounded-lg border border-slate-200 px-4 py-2 text-sm text-slate-600 hover:bg-slate-50 disabled:opacity-50"
+              >
+                取消
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  void handleGenerateEpisodeWithCustomPrompt();
+                }}
+                disabled={customPromptSubmittingEpisodeIndex !== null || !customStoryboardPrompt.trim()}
+                className="rounded-lg bg-indigo-600 px-4 py-2 text-sm text-white hover:bg-indigo-700 disabled:opacity-50"
+              >
+                {customPromptSubmittingEpisodeIndex !== null ? "生成中..." : "生成分镜"}
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
     </div>
   );
 }
