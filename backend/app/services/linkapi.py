@@ -2067,6 +2067,9 @@ async def create_video(
     model_text = str(model or "").strip()
     model_text_lower = model_text.lower()
     is_kling_model = model_text_lower.startswith("kling")
+    is_seedance_model = ("seedance" in model_text_lower) or model_text_lower.startswith("doubao-seedance")
+    if is_seedance_model and model_text_lower in {"seedance2.0", "seedance2", "seedance"}:
+        model = "doubao-seedance-2-0-260128"
     is_kling_o1_model = model_text_lower == "kling-video-o1"
     is_video_edit_mode = bool(reference_video_url)
     system_prompt = str(payload.get("system_prompt", "") or "").strip()
@@ -2083,8 +2086,9 @@ async def create_video(
                 default_kling_endpoint = "https://api-beijing.klingai.com/v1/videos/text2video"
     
     default_video_endpoint = "https://api.magic666.cn/api/v1/video/generations"
+    default_seedance_endpoint = "https://ark.cn-beijing.volces.com/api/v3/contents/generations/tasks"
     configured_endpoint = str(settings.endpoint or "").strip()
-    endpoint = default_kling_endpoint if is_kling_model else default_video_endpoint
+    endpoint = default_kling_endpoint if is_kling_model else (default_seedance_endpoint if is_seedance_model else default_video_endpoint)
     use_configured_video_provider = False
     configured_key_normalized = str(configured_key or "").strip()
     use_official_kling = is_kling_model
@@ -2096,6 +2100,18 @@ async def create_video(
             parsed_conf = urllib.parse.urlparse(normalized_endpoint)
             parsed_def = urllib.parse.urlparse(default_kling_endpoint)
             endpoint = f"{parsed_conf.scheme}://{parsed_conf.netloc}{parsed_def.path}"
+    elif is_seedance_model and configured_endpoint:
+        normalized_endpoint = configured_endpoint.strip().rstrip("/")
+        normalized_lower = normalized_endpoint.lower()
+        if "contents/generations/tasks" in normalized_lower:
+            endpoint = normalized_endpoint
+        elif "volces.com" in normalized_lower or "ark." in normalized_lower:
+            endpoint = f"{normalized_endpoint}/api/v3/contents/generations/tasks"
+        else:
+            logger.warning(
+                "Configured endpoint is not seedance provider, fallback to default seedance endpoint. configured_endpoint=%s",
+                configured_endpoint,
+            )
     elif configured_endpoint:
         normalized_endpoint = configured_endpoint.strip().rstrip("/")
         normalized_lower = normalized_endpoint.lower()
@@ -2121,6 +2137,16 @@ async def create_video(
             key_source = kling_key_source
         else:
             raise RuntimeError("Kling 鉴权未配置，请联系管理员配置系统 Key（KLING_AK/KLING_SK 或 KLING_API_KEY）")
+    elif is_seedance_model:
+        env_seedance_key = str(os.getenv("ARK_API_KEY") or os.getenv("VOLCENGINE_ARK_API_KEY") or "").strip()
+        configured_seedance_key = configured_key_normalized
+        if configured_seedance_key.startswith("sk-") or configured_seedance_key.startswith("eyJ"):
+            configured_seedance_key = ""
+        seedance_key = env_seedance_key or configured_seedance_key
+        if not seedance_key:
+            raise RuntimeError("Seedance 鉴权未配置，请在设置页填写 API Key，或配置环境变量 ARK_API_KEY")
+        api_key = seedance_key
+        key_source = "env" if env_seedance_key else "configured"
     elif use_configured_video_provider and configured_key_normalized:
         if configured_key_normalized.startswith("sk-"):
             api_key = configured_key_normalized
@@ -2130,7 +2156,7 @@ async def create_video(
                 "Configured video key format is invalid for bearer token, fallback to default key. key_prefix=%s",
                 configured_key_normalized[:8],
             )
-    fallback_api_key = default_video_api_key if api_key != default_video_api_key else ""
+    fallback_api_key = default_video_api_key if (api_key != default_video_api_key and not is_seedance_model) else ""
     if is_kling_model:
         fallback_api_key = ""
     asset_bindings_raw = payload.get("asset_bindings")
@@ -2188,11 +2214,11 @@ async def create_video(
             data["prompt"] = f"{str(data.get('prompt', '')).strip()}\n" + "\n".join(prompt_lines)
 
     resolved_assets: list[dict[str, Any]] = []
-    if is_kling_model and project_id and asset_bindings:
+    if (is_kling_model or is_seedance_model) and project_id and asset_bindings:
         resolved_assets = await _resolve_asset_bindings(session, project_id, asset_bindings)
-        if resolved_assets:
+        if is_kling_model and resolved_assets:
             resolved_assets = await _attach_character_voice_ids(session, project_id, resolved_assets)
-        if not resolved_assets:
+        if is_kling_model and not resolved_assets:
             logger.warning(
                 "检测到素材绑定但未解析到可用素材图片，回退为无参考图生成。project_id=%s user_id=%s asset_count=%s",
                 project_id,
@@ -2365,6 +2391,7 @@ async def create_video(
                     "keep_original_sound": "yes" if reference_video_keep_original_sound == "yes" else "no",
                 }
             ]
+            data["mode"] = "pro"
             data["sound"] = "off"
             data.pop("duration", None)
             existing_refs = [item for item in existing_refs if str(item.get("type", "")).strip().lower() not in {"first_frame", "last_frame"}]
@@ -2379,10 +2406,108 @@ async def create_video(
             data["image_list"] = [single_image_ref]
 
     else:
-        data["size"] = payload.get("size", "1280x720")
-        data["seconds"] = payload.get("seconds", 5)
-        if image_url:
-            data["image_url"] = image_url
+        sound_value = str(payload.get("sound") or "").strip().lower()
+        if sound_value not in {"on", "off"}:
+            sound_value = "on" if bool(payload.get("with_audio", False)) else "off"
+        with_audio_value = sound_value == "on"
+
+        if is_seedance_model:
+            ratio = str(payload.get("aspect_ratio") or payload.get("ratio") or "16:9").strip() or "16:9"
+            duration_raw = payload.get("duration", payload.get("seconds", 5))
+            try:
+                duration_value = int(round(float(duration_raw)))
+            except (TypeError, ValueError):
+                duration_value = 5
+            duration_value = max(4, min(15, duration_value))
+
+            reference_images: list[dict[str, Any]] = []
+
+            async def _append_seedance_reference(image_src: str, role: str = "reference_image") -> None:
+                resolved = await _resolve_image_url(image_src)
+                if not resolved:
+                    return
+                reference_images.append({
+                    "type": "image_url",
+                    "image_url": {"url": str(resolved).strip()},
+                    "role": role,
+                })
+
+            if custom_first_frame_url:
+                await _append_seedance_reference(custom_first_frame_url, "reference_image")
+            if custom_last_frame_url:
+                await _append_seedance_reference(custom_last_frame_url, "reference_image")
+            if previous_segment_video_url and not custom_first_frame_url:
+                tail_frame_b64 = await _extract_video_tail_frame_base64(previous_segment_video_url)
+                if tail_frame_b64:
+                    await _append_seedance_reference(f"data:image/jpeg;base64,{tail_frame_b64}", "reference_image")
+            for item in resolved_assets:
+                image_ref = str(item.get("image_url") or "").strip()
+                if image_ref:
+                    await _append_seedance_reference(image_ref, "reference_image")
+
+            raw_reference_images = payload.get("reference_images")
+            if isinstance(raw_reference_images, list):
+                for item in raw_reference_images:
+                    if isinstance(item, dict):
+                        ref_url = str(item.get("image_url") or "").strip()
+                        if ref_url:
+                            await _append_seedance_reference(ref_url, "reference_image")
+                    elif isinstance(item, str) and item.strip():
+                        await _append_seedance_reference(item.strip(), "reference_image")
+
+            if image_url:
+                await _append_seedance_reference(str(image_url), "reference_image")
+
+            if reference_video_url:
+                resolved_video_url = await _resolve_image_url(reference_video_url)
+                if resolved_video_url:
+                    reference_images.append(
+                        {
+                            "type": "video_url",
+                            "video_url": {"url": str(resolved_video_url).strip()},
+                            "role": "reference_video",
+                        }
+                    )
+
+            dedup_content: list[dict[str, Any]] = []
+            seen_ref_keys: set[str] = set()
+            for item in reference_images:
+                item_type = str(item.get("type") or "").strip().lower()
+                role = str(item.get("role") or "").strip().lower()
+                if item_type == "image_url":
+                    ref_url = str((item.get("image_url") or {}).get("url") or "").strip()
+                    key = f"image|{role}|{ref_url}"
+                elif item_type == "video_url":
+                    ref_url = str((item.get("video_url") or {}).get("url") or "").strip()
+                    key = f"video|{role}|{ref_url}"
+                else:
+                    continue
+                if not ref_url or key in seen_ref_keys:
+                    continue
+                seen_ref_keys.add(key)
+                dedup_content.append(item)
+
+            content_items: list[dict[str, Any]] = [{"type": "text", "text": str(data.get("prompt") or "").strip()}]
+            content_items.extend(dedup_content)
+
+            data = {
+                "model": model,
+                "content": content_items,
+                "generate_audio": with_audio_value,
+                "ratio": ratio,
+                "duration": duration_value,
+                "watermark": False,
+            }
+            if bool(payload.get("return_last_frame", False)):
+                data["return_last_frame"] = True
+        else:
+            data["size"] = payload.get("size", "1280x720")
+            data["seconds"] = payload.get("seconds", 5)
+            data["with_audio"] = with_audio_value
+            data["generate_audio"] = with_audio_value
+            data["sound"] = sound_value
+            if image_url:
+                data["image_url"] = image_url
 
     async def _extract_video_url(result: dict[str, Any]) -> str:
         if "data" in result and isinstance(result["data"], list) and len(result["data"]) > 0:
@@ -2578,6 +2703,15 @@ async def create_video(
                                 task_id = _extract_kling_task_id(result)
                                 if task_id:
                                     result["_kling_endpoint"] = endpoint_try
+                            if is_seedance_model:
+                                task_id = str(result.get("id") or "").strip()
+                                if task_id:
+                                    return {
+                                        "data": {
+                                            "task_id": f"seedance|{task_id}",
+                                            "task_result": result,
+                                        }
+                                    }
                             return result
                 if attempt_errors:
                     last_error = RuntimeError(" | ".join(attempt_errors))

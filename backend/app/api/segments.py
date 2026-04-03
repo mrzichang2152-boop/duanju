@@ -3,6 +3,8 @@ import json
 import logging
 import os
 from uuid import uuid4
+
+import httpx
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -31,7 +33,7 @@ from app.services.segments import (
     list_segments,
     select_segment_version,
 )
-from app.services.settings import get_or_create_settings
+from app.services.settings import get_api_key, get_or_create_settings
 from app.services.kling_query import query_kling_task_status
 from app.services.async_tasks import (
     create_async_task,
@@ -74,6 +76,55 @@ def _is_kling_pending_status(value: str) -> bool:
     )
 
 
+def _is_seedance_task(task_id: str | None) -> bool:
+    return str(task_id or "").strip().lower().startswith("seedance|")
+
+
+async def _resolve_seedance_key(db: AsyncSession, user_id: str) -> str:
+    env_key = str(os.getenv("ARK_API_KEY") or os.getenv("VOLCENGINE_ARK_API_KEY") or "").strip()
+    if env_key:
+        return env_key
+    configured = str(await get_api_key(db, user_id) or "").strip()
+    if configured.startswith("sk-") or configured.startswith("eyJ"):
+        return ""
+    return configured
+
+
+async def _query_seedance_task_status(task_id: str, api_key: str) -> tuple[str, str, str]:
+    tid = str(task_id or "").strip()
+    if not tid:
+        return "FAILED", "", "任务ID为空"
+    url = f"https://ark.cn-beijing.volces.com/api/v3/contents/generations/tasks/{tid}"
+    headers = {"Authorization": f"Bearer {api_key}"}
+    async with httpx.AsyncClient(timeout=15.0, trust_env=True) as client:
+        resp = await client.get(url, headers=headers)
+    if resp.status_code != 200:
+        return "FAILED", "", f"状态查询失败（HTTP {resp.status_code}）"
+    try:
+        payload = resp.json()
+    except Exception:
+        return "FAILED", "", "状态查询返回非 JSON"
+    if not isinstance(payload, dict):
+        return "FAILED", "", "状态查询返回格式异常"
+    status_text = str(payload.get("status") or payload.get("task_status") or "").strip().lower()
+    task_result = payload.get("task_result") if isinstance(payload.get("task_result"), dict) else {}
+    content_obj = payload.get("content") if isinstance(payload.get("content"), dict) else {}
+    video_url = str(content_obj.get("video_url") or "").strip()
+    if not video_url:
+        videos = task_result.get("videos") if isinstance(task_result.get("videos"), list) else []
+        if videos and isinstance(videos[0], dict):
+            video_url = str(videos[0].get("url") or "").strip()
+    if not video_url:
+        video_url = str(task_result.get("url") or task_result.get("video_url") or "").strip()
+    if video_url or status_text in {"succeeded", "success", "completed"}:
+        return "COMPLETED", video_url, ""
+    if status_text in {"failed", "error", "canceled", "cancelled"}:
+        error_obj = payload.get("error") if isinstance(payload.get("error"), dict) else {}
+        fail_msg = str(error_obj.get("message") or payload.get("message") or "Seedance 任务失败").strip()
+        return "FAILED", "", fail_msg
+    return "SEEDANCE_PROCESSING", "", ""
+
+
 @router.get("/{project_id}/segments", response_model=list[SegmentResponse])
 async def fetch_segments(
     project_id: str,
@@ -96,10 +147,20 @@ async def fetch_segments(
         processing_versions = [v for v in all_versions if _is_kling_pending_status(v.status) and v.task_id and "|" in v.task_id]
         version_status_msg_map: dict[str, str] = {}
         if processing_versions:
+            seedance_key = await _resolve_seedance_key(db, user_id)
+
             async def check_and_update(v):
                 try:
-                    endpoint, tid = v.task_id.split("|", 1)
-                    new_status, video_url, task_status_msg = await query_kling_task_status(db, user_id, endpoint, tid)
+                    raw_task_id = str(v.task_id or "").strip()
+                    if _is_seedance_task(raw_task_id):
+                        _, tid = raw_task_id.split("|", 1)
+                        if not seedance_key:
+                            version_status_msg_map[str(v.id)] = "Seedance 鉴权未配置"
+                            return False
+                        new_status, video_url, task_status_msg = await _query_seedance_task_status(tid, seedance_key)
+                    else:
+                        endpoint, tid = raw_task_id.split("|", 1)
+                        new_status, video_url, task_status_msg = await query_kling_task_status(db, user_id, endpoint, tid)
                     if task_status_msg:
                         version_status_msg_map[str(v.id)] = task_status_msg
                     if not _is_kling_pending_status(new_status):
@@ -112,7 +173,7 @@ async def fetch_segments(
                         db.add(v)
                         return True
                 except Exception:
-                    logger.exception("查询 Kling 任务状态异常 version_id=%s", getattr(v, "id", ""))
+                    logger.exception("查询视频任务状态异常 version_id=%s", getattr(v, "id", ""))
                 return False
 
             results = await asyncio.gather(*(check_and_update(v) for v in processing_versions))
@@ -221,7 +282,7 @@ async def generate_segments(
         if video_url:
             video_url = await media_storage.mirror_http_url_to_cos(project_id, "segment_videos", video_url)
 
-        version_status = "KLING_PROCESSING" if not video_url and task_id else "COMPLETED"
+        version_status = "PROCESSING" if not video_url and task_id else "COMPLETED"
         await create_segment_version(db, target.id, video_url, prompt, task_id=task_id, status=version_status)
         return StatusResponse(status="ready")
     except HTTPException:

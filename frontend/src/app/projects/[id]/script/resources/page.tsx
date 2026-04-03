@@ -136,15 +136,35 @@ export default function ScriptResourcesPage() {
           setMessage("素材同步完成");
           return;
         }
+
+        const resultContent = typeof status.result?.content === "string" ? stripThinkingContent(status.result.content) : "";
+        if (resultContent.trim()) {
+          setResourcesContent(resultContent);
+          lastSavedContentRef.current = resultContent;
+          clearPendingTask();
+          setGenerating(false);
+          setIsModifying(false);
+          setMessage(pending.op === "modify" ? "AI 修改完成" : "提取完成");
+          return;
+        }
+
         const latest = await getScript(token, projectId);
         const fullContent = latest.content ?? "";
         if (!fullContent.includes(SEPARATOR)) {
+          clearPendingTask();
+          setGenerating(false);
+          setIsModifying(false);
+          setMessage("任务已完成，但未读取到提取结果，请重试");
           return;
         }
         const [res, orig] = fullContent.split(SEPARATOR);
         const cleanedResources = stripThinkingContent(res || "");
         const cleanedOriginal = stripThinkingContent(orig || "");
         if (!cleanedResources.trim()) {
+          clearPendingTask();
+          setGenerating(false);
+          setIsModifying(false);
+          setMessage("任务已完成，但提取结果为空，请重试");
           return;
         }
         setResourcesContent(cleanedResources);
@@ -155,7 +175,11 @@ export default function ScriptResourcesPage() {
         setGenerating(false);
         setIsModifying(false);
         setMessage(pending.op === "modify" ? "AI 修改完成" : "提取完成");
-      } catch {
+      } catch (error) {
+        clearPendingTask();
+        setGenerating(false);
+        setIsModifying(false);
+        setMessage(error instanceof Error ? error.message : "任务状态查询失败");
       }
     };
     void poll();

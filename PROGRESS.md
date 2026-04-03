@@ -1094,3 +1094,40 @@
 - 2026-04-01 - Step4 - 将测试文件中的分镜提示升级为 `PROMPT_STORYBOARD_V3.2`：为抽象描述与非人物主体补充示例；放宽时间轴切分条件并删除 7~8 秒限制；恢复 `过程` 按 `1.0-3.1s` 这类秒段拆写，要求每小段都写运镜；将动作、惯性、可见物理反馈、表情微动作合并描述；明确只有画面不连贯时才需要重写 `起始/画面描述/场景`，并将“场景切换”统一改为“画面切换”。
 - 2026-04-01 - 验证 - `测试文件/step4 分镜脚本系统prompt` lint 0 错误；已确认文件包含新增示例、秒段格式 `1.0-3.1s`、`硬切到某画面` 等规则，并移除了正文中的 7~8 秒限制。
 - 2026-04-01 - Step4 - 在 `测试文件/step4 分镜脚本系统prompt_仅镜头调度与内容融合` 新建仅保留“镜头调度与内容融合”的测试版 prompt，去掉时间轴、画面描述、角色形象、道具、场景相关输出要求。
+- 2026-04-02 - Step4 - 支持分镜视频模型手动选择：在 `frontend/src/app/projects/[id]/script/storyboard/page.tsx` 新增 Step4 视频模型下拉（`klingv3omni` / `seedance2.0`），并将“生成视频/修改视频”请求按所选模型下发（`klingv3omni` 映射为 `kling-v3-omni`）。
+- 2026-04-02 - 验证 - `read_lints frontend/src/app/projects/[id]/script/storyboard/page.tsx` 0 错误；本地执行 `npm run dev` 启动成功（Next.js Ready，Local: http://localhost:3000）；未执行任何服务器部署与推送。
+- 2026-04-02 - Step4 - 统一 Kling/Seedance 音频开关：Step4 视频生成与视频修改均使用同一 `音频` 选择（有声/无声）；默认值调整为 `有声`。
+- 2026-04-02 - 后端 - 非 Kling 视频请求补齐音频参数透传：在 `backend/app/services/linkapi.py` 非 Kling 分支增加 `with_audio/generate_audio/sound` 字段，跟随前端统一开关。
+- 2026-04-02 - 验证 - `read_lints`(storyboard/page.tsx, linkapi.py) 0 错误；`python3 -m py_compile backend/app/services/linkapi.py` 通过；本地 `npm run dev` 启动成功（Ready，Local: http://localhost:3000）；未执行服务器部署与推送。
+- 2026-04-02 - Step4/后端 - Seedance 2.0 增强：在 `backend/app/services/linkapi.py` 新增 `is_seedance_model` 分支，支持把 Step4 的素材绑定（角色/场景/道具）、首帧/尾帧、自定义参考图、参考视频统一组装到 Seedance `content`（text/image_url/video_url）请求体，并透传 `generate_audio/ratio/duration`。
+- 2026-04-02 - Step4/后端 - Seedance 任务回传：创建任务返回 `id` 时，转换为 `data.task_id=seedance|{id}` 供分镜任务链路记录。
+- 2026-04-02 - 验证 - `read_lints`(linkapi.py, storyboard/page.tsx) 0 错误；`python3 -m py_compile backend/app/services/linkapi.py` 通过；`npm run dev` 本地启动成功（Ready, http://localhost:3000）；本地 `docker compose up -d --build backend` 后健康检查 `{"status":"ok"}`。
+- 2026-04-02 - 联通性测试 - 使用包含台词+参考图+素材绑定（角色/场景/道具）+首尾帧的 `seedance2.0` 6s 有声请求进行实测，已发到官方 Seedance 端点，但返回 `401 AuthenticationError: API key format is incorrect`，当前阻塞点为 Seedance 可用 Key 缺失/格式不符。
+- 2026-04-02 - Step4/前端 - Step4 Seedance 映射更新：`seedance2.0` 选项下发时统一映射到官方模型 `doubao-seedance-2-0-260128`。
+- 2026-04-02 - 后端 - Seedance 鉴权优先级调整：`backend/app/services/linkapi.py` 中 Seedance 分支优先使用 `ARK_API_KEY`/`VOLCENGINE_ARK_API_KEY`，并忽略明显非 Seedance 格式的配置 Key（如 `sk-`/`eyJ`）。
+- 2026-04-02 - 联通性测试 - 使用你提供的 Key `4c852244-b8ac-4d24-ba6a-7c0352fef0a2`，以 `seedance2.0`（映射后官方模型）+ 带参考图 + 有台词 + 6s + 有声发起实测成功，返回任务：`seedance|cgt-20260402211346-qqkhx`。
+- 2026-04-02 - 验证 - `read_lints`(linkapi.py, storyboard/page.tsx) 0 错误；`python3 -m py_compile backend/app/services/linkapi.py` 通过；本地 `npm run dev` 启动成功（Ready, http://localhost:3000）；未推送服务器。
+- 2026-04-02 - 部署 - 按用户要求使用 `duanjutest.pem` 连接 `81.70.235.208`（ubuntu），先清空该机现有 Docker 项目（容器/镜像/网络）与历史部署目录，再上传本地最新代码包并在 `/home/ubuntu/video_gen_app` 以 `docker compose up -d --build` 重新部署。
+- 2026-04-02 - 验证 - 远端容器 `duanju-nginx-1/duanju-backend-1/duanju-frontend-1` 均为 Up；`http://81.70.235.208:8003/health` 返回 `{"status":"ok"}`；`http://81.70.235.208` 返回 200。
+- 2026-04-02 - 测试环境 - 在 `81.70.235.208` 创建测试账号：`svgn@qq.com/123456`、`1123@qq.com/1123`，并通过 `POST /api/auth/login` 实测登录成功。
+- 2026-04-02 - 测试环境 - 修复 `81.70.235.208` Step3 Kling 鉴权：为测试环境 `backend/.env` 注入系统级 `KLING_AK/KLING_SK`，并重启 `duanju-backend-1`。
+- 2026-04-02 - 验证 - 测试服后端容器环境已包含 `KLING_AK/KLING_SK`；`resolve_kling_auth_token` 对 `svgn@qq.com` 返回 `token_ok=True`（`system_aksk_jwt`）；健康检查 `http://81.70.235.208:8003/health` 返回 `{"status":"ok"}`。
+- 2026-04-02 - 正式环境修复 - 定位 `82.156.124.215` Step4 视频修改 400（`Video duration can not longer than 10s`）：Kling 视频编辑在 `mode=std` 下会触发 10s 限制。已在 `backend/app/services/linkapi.py` 的 `is_video_edit_mode` 分支强制 `data["mode"]="pro"`，避免编辑场景走 lower model 限制。
+- 2026-04-02 - 正式环境发布 - 已将修复版 `linkapi.py` 同步至 `82.156.124.215:/root/video-gen` 并执行 `docker compose up -d --build backend` 重建后端；容器健康检查（机内）`http://127.0.0.1:8003/health` 返回 `{"status":"ok"}`。
+- 2026-04-02 - 本地环境 - 修复 Step4 Seedance 401：为本地 `backend/.env` 增加 `ARK_API_KEY`，并重建 `duanju-backend-1` 使环境变量生效。
+- 2026-04-02 - 验证 - 本地后端 `http://127.0.0.1:8003/health` 返回 `{"status":"ok"}`；使用同一 Key 调用 Ark 任务查询接口成功返回任务详情（非 key 格式错误）。
+- 2026-04-02 - 本地修复 - 修复 Step4 长时间“生成中”：`backend/app/api/segments.py` 仅轮询 Kling 任务导致 `seedance|task_id` 无法回写状态，现已增加 Seedance 任务轮询与状态回写。
+- 2026-04-02 - 本地验证 - 重建本地后端后，历史卡住任务 `seedance|cgt-20260402225841-bpnv7` 已从 `KLING_PROCESSING` 正确更新为 `FAILED`；失败原因为上游内容安全拦截（`OutputVideoSensitiveContentDetected`）。
+- 2026-04-02 - 正式环境配置 - 按要求将 `82.156.124.215` 统一切换为系统级 Kling 鉴权：在 `/root/video-gen/backend/.env` 配置 `KLING_AK/KLING_SK`，并重建重启 `duanju-backend-1`。
+- 2026-04-02 - 正式环境验证 - 账号 `red@apple.fun`、`blue@banana.fun`、`mint@orange.fun`、`sun@lemon.fun` 调用 `resolve_kling_auth_token` 均返回 `token_ok=True`，来源 `system_aksk_jwt`（不再依赖各账号单独配置）；机内健康检查 `http://127.0.0.1:8003/health` 返回 `{"status":"ok"}`。
+- 2026-04-02 - 本地前端修复 - 修复 Step4 Seedance 失败后仍长期显示“生成中”：`storyboard/page.tsx` 中 `pendingRowIndexSet` 不再无条件把 `manualPendingRowMap` 行标记为 pending，改为仅在分镜/版本真实处于 pending 时标记；无匹配分镜时仅保留 2 分钟兜底。
+- 2026-04-02 - 验证 - `read_lints`(storyboard/page.tsx) 0 错误；本地 `npm run dev` 启动成功（Ready, http://localhost:3000）。
+- 2026-04-03 - 测试环境配置 - 将 `81.70.235.208` 统一切换为系统级 Kling 鉴权：在 `/home/ubuntu/video_gen_app/backend/.env` 配置 `KLING_AK/KLING_SK`，并重启 `duanju-backend-1`。
+- 2026-04-03 - 测试环境验证 - 容器内环境变量已生效（`KLING_AK/KLING_SK` 可见），机内健康检查 `http://127.0.0.1:8003/health` 返回 `{"status":"ok"}`，抽样账号 `resolve_kling_auth_token` 来源为 `system_aksk_jwt`。
+- 2026-04-03 - 测试环境配置 - 修复 `81.70.235.208` Seedance 鉴权未配置：在 `/home/ubuntu/video_gen_app/backend/.env` 增加系统级 `ARK_API_KEY`，并重建重启 `duanju-backend-1`。
+- 2026-04-03 - 测试环境验证 - 容器内 `ARK_API_KEY` 已生效；日志显示 Seedance 请求 `key_source=env`，`POST /projects/5a0564bf-31a5-4b04-8c14-7a9cf04af86a/segments/generate` 返回 `200 OK`。
+- 2026-04-03 - 测试环境修复 - `81.70.235.208` 同步并部署 Step4 修复：后端 `backend/app/api/segments.py` 增加 Seedance 任务轮询回写与通用 `PROCESSING` 状态；前端 `storyboard/page.tsx` 修复 manual pending 长驻导致“生成中”假象。
+- 2026-04-03 - 测试环境验证 - 重新构建 `backend/frontend` 后健康检查正常；容器内代码已包含修复点；项目 `5a0564bf-31a5-4b04-8c14-7a9cf04af86a` 最近任务状态已回写为 `COMPLETED`（含可用 `video_url`）。
+- 2026-04-03 - 本地前端修复 - 修复 Step2 提取素材静默失败：`resources/page.tsx` 在任务已完成时优先使用任务返回 `result.content`，并在结果缺失/异常时显式结束 pending 且提示错误，不再吞异常导致长期无反馈。
+- 2026-04-03 - 本地鉴权配置 - 本地 `backend/.env` 统一启用系统级鉴权：配置 `KLING_AK/KLING_SK`，并确保 `ARK_API_KEY` 存在；重建本地 `backend` 后，鉴权来源验证为 `system_aksk_jwt`。
+- 2026-04-03 - 本地验证 - `read_lints`(resources/page.tsx) 0 错误；`npm run dev` 启动成功（Ready, http://localhost:3000）；后端健康检查 `http://127.0.0.1:8003/health` 正常。

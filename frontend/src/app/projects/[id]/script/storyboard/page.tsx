@@ -20,8 +20,16 @@ const STYLE_PROMPT_MAP: Record<string, string> = Object.fromEntries(
 );
 const KLING_COLUMN = "视频生成";
 const LEGACY_KLING_COLUMN = "Kling视频生成";
-const KLING_MODEL_SILENT = "kling-v3-omni";
-const KLING_MODEL_WITH_AUDIO = "kling-v3-omni";
+const STEP4_VIDEO_MODEL_OPTIONS = [
+  { value: "klingv3omni", label: "Kling v3 Omni" },
+  { value: "seedance2.0", label: "Seedance 2.0" },
+] as const;
+type Step4VideoModel = (typeof STEP4_VIDEO_MODEL_OPTIONS)[number]["value"];
+
+function resolveStep4VideoModel(model: Step4VideoModel): string {
+  if (model === "klingv3omni") return "kling-v3-omni";
+  return "doubao-seedance-2-0-260128";
+}
 const TABLE_HEADER_KEYWORDS = ["时间轴", "镜头", "景别", "机位", "运镜", "内容", "台词", "画面", "提示词", "prompt", "角色", "场景", "道具", "备注"];
 const COLUMN_MEANING_MAP: Record<string, string> = {
   时间轴: "镜头在整段视频中的时间位置与节奏",
@@ -374,7 +382,8 @@ export default function ScriptStoryboardPage() {
   const [isScriptCollapsed, setIsScriptCollapsed] = useState(false);
   const [videoResolution, setVideoResolution] = useState<"720p" | "1080p">("720p");
   const [videoAspectRatio, setVideoAspectRatio] = useState<"9:16" | "16:9" | "1:1">("9:16");
-  const [videoAudioMode, setVideoAudioMode] = useState<"silent" | "with_audio">("silent");
+  const [videoAudioMode, setVideoAudioMode] = useState<"silent" | "with_audio">("with_audio");
+  const [selectedVideoModel, setSelectedVideoModel] = useState<Step4VideoModel>("klingv3omni");
   const [segments, setSegments] = useState<Segment[]>([]);
   const [projectAssets, setProjectAssets] = useState<Asset[]>([]);
   const [generatingGlobalRowIndex, setGeneratingGlobalRowIndex] = useState<number | null>(null);
@@ -461,6 +470,15 @@ export default function ScriptStoryboardPage() {
 
   useEffect(() => {
     if (!projectId) return;
+    const key = `storyboard-video-model-${projectId}`;
+    const saved = localStorage.getItem(key);
+    if (saved === "klingv3omni" || saved === "seedance2.0") {
+      setSelectedVideoModel(saved);
+    }
+  }, [projectId]);
+
+  useEffect(() => {
+    if (!projectId) return;
     setPendingStoryboardTasks(readStoryboardPendingTasks(projectId));
   }, [projectId]);
 
@@ -474,6 +492,12 @@ export default function ScriptStoryboardPage() {
     const key = `storyboard-video-audio-${projectId}`;
     localStorage.setItem(key, videoAudioMode);
   }, [projectId, videoAudioMode]);
+
+  useEffect(() => {
+    if (!projectId) return;
+    const key = `storyboard-video-model-${projectId}`;
+    localStorage.setItem(key, selectedVideoModel);
+  }, [projectId, selectedVideoModel]);
 
   useEffect(() => {
     if (!projectId) return;
@@ -627,9 +651,21 @@ export default function ScriptStoryboardPage() {
 
   const pendingRowIndexSet = useMemo(() => {
     const set = new Set<number>();
-    Object.keys(manualPendingRowMap).forEach((rowIndexKey) => {
+    const now = Date.now();
+    Object.entries(manualPendingRowMap).forEach(([rowIndexKey, rowState]) => {
       const rowIndex = Number(rowIndexKey);
-      if (!Number.isNaN(rowIndex)) {
+      if (Number.isNaN(rowIndex)) return;
+      const segment = segments.find((item) => item.id === rowState?.segmentId);
+      if (!segment) {
+        const submittedAt = Number(rowState?.submittedAt || 0);
+        if (!submittedAt || now - submittedAt < 2 * 60 * 1000) {
+          set.add(rowIndex);
+        }
+        return;
+      }
+      const segmentStatus = String(segment.task_status || "").toUpperCase();
+      const versionPending = (segment.versions || []).some((version) => isKlingPendingStatus(version.status));
+      if (isKlingPendingStatus(segmentStatus) || versionPending) {
         set.add(rowIndex);
       }
     });
@@ -1296,6 +1332,7 @@ export default function ScriptStoryboardPage() {
       ].join("\n");
 
       const usePreviousTailFrame = Boolean(previousSegmentVideoUrl) && !customFirstFrameUrl;
+      const modelToUse = resolveStep4VideoModel(selectedVideoModel);
       const withAudio = videoAudioMode === "with_audio";
 
       const prompt = [
@@ -1305,6 +1342,7 @@ export default function ScriptStoryboardPage() {
         "【字段取值】",
         ...rowFieldValueLines,
         "【生成要求】",
+        `模型：${modelToUse}`,
         `模式：${mode}`,
         `分辨率：${videoResolution}`,
         `画幅比例：${videoAspectRatio}`,
@@ -1312,7 +1350,6 @@ export default function ScriptStoryboardPage() {
         `首帧来源：${usePreviousTailFrame ? "上一条分镜已选视频尾帧" : "默认首帧"}`,
         `音频：${withAudio ? "有声" : "无声"}`,
       ].join("\n");
-      const modelToUse = withAudio ? KLING_MODEL_WITH_AUDIO : KLING_MODEL_SILENT;
       const options: Record<string, unknown> = {
         model: modelToUse,
         mode,
@@ -1488,16 +1525,18 @@ export default function ScriptStoryboardPage() {
         instruction,
       ].join("\n");
 
+      const modelToUse = resolveStep4VideoModel(selectedVideoModel);
+      const withAudio = videoAudioMode === "with_audio";
       await generateSegment(token, projectId, {
         segment_id: segment.id,
         prompt,
-        model: KLING_MODEL_SILENT,
+        model: modelToUse,
         options: {
-          model: KLING_MODEL_SILENT,
+          model: modelToUse,
           mode: videoResolution === "1080p" ? "pro" : "std",
           aspect_ratio: videoAspectRatio,
-          with_audio: false,
-          sound: "off",
+          with_audio: withAudio,
+          sound: withAudio ? "on" : "off",
           system_prompt: systemPrompt,
           reference_video_url: currentVideoUrl,
           refer_type: "base",
@@ -1649,6 +1688,16 @@ export default function ScriptStoryboardPage() {
                         <option value="9:16">竖屏</option>
                         <option value="16:9">横屏</option>
                         <option value="1:1">方幕</option>
+                    </select>
+                    <span className="text-xs text-slate-500">视频模型：</span>
+                    <select
+                        value={selectedVideoModel}
+                        onChange={(e) => setSelectedVideoModel(e.target.value as Step4VideoModel)}
+                        className="rounded-lg border border-slate-200 px-3 py-1.5 text-xs"
+                    >
+                        {STEP4_VIDEO_MODEL_OPTIONS.map((item) => (
+                          <option key={item.value} value={item.value}>{item.label}</option>
+                        ))}
                     </select>
                     <span className="text-xs text-slate-500">音频：</span>
                     <select
