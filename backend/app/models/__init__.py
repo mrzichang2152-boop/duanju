@@ -9,6 +9,7 @@ from app.models.segment_version import SegmentVersion
 from app.models.settings import UserSettings
 from app.models.user import User
 from app.models.character_voice import CharacterVoice
+from app.models.character_image_binding import CharacterImageBinding
 from app.models.async_task import AsyncTask
 from app.models.kling_subject import KlingSubject
 
@@ -24,6 +25,7 @@ __all__ = [
     "Segment",
     "SegmentVersion",
     "CharacterVoice",
+    "CharacterImageBinding",
     "AsyncTask",
     "KlingSubject",
     "ElevenLabsClonedVoice",

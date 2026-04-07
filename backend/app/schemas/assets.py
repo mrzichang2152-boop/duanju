@@ -19,6 +19,7 @@ class AssetResponse(BaseModel):
     model: Optional[str] = None
     size: Optional[str] = None
     style: Optional[str] = None
+    base_character_name: Optional[str] = None
     versions: list[AssetVersionResponse]
 
 

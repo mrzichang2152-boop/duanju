@@ -18,36 +18,59 @@ const STYLE_OPTIONS = [
 const STYLE_PROMPT_MAP: Record<string, string> = Object.fromEntries(
   STYLE_OPTIONS.map((style) => [style, `全局视觉风格：${style}。请保持整集分镜在美术气质、光影语气、镜头审美上的统一。`])
 );
-const KLING_COLUMN = "视频生成";
+const KLING_COLUMN = "生成视频";
 const LEGACY_KLING_COLUMN = "Kling视频生成";
 const STEP4_VIDEO_MODEL_OPTIONS = [
   { value: "klingv3omni", label: "Kling v3 Omni" },
   { value: "seedance2.0", label: "Seedance 2.0" },
 ] as const;
+const MAX_VIDEO_REFERENCE_IMAGES = 8;
 type Step4VideoModel = (typeof STEP4_VIDEO_MODEL_OPTIONS)[number]["value"];
 
 function resolveStep4VideoModel(model: Step4VideoModel): string {
   if (model === "klingv3omni") return "kling-v3-omni";
   return "doubao-seedance-2-0-260128";
 }
-const TABLE_HEADER_KEYWORDS = ["时间轴", "镜头", "景别", "机位", "运镜", "内容", "台词", "画面", "提示词", "prompt", "角色", "场景", "道具", "备注"];
+const TABLE_HEADER_KEYWORDS = ["时间轴", "分镜", "分段时长", "镜头", "景别", "机位", "运镜", "内容", "台词", "画面", "提示词", "prompt", "角色", "场景", "道具", "备注"];
 const COLUMN_MEANING_MAP: Record<string, string> = {
+  分镜: "当前连续镜头的起始画面与场景基底说明",
+  分段时长: "当前分段的时长与节奏控制信息",
   时间轴: "镜头在整段视频中的时间位置与节奏",
+  镜头调度与内容: "按秒段拆分的运镜、动作、台词、表情与定格画面指令",
   镜头调度与内容融合: "起始、过程、定格画面一体化的镜头与内容指令",
   镜头景别与机位: "镜头远近、视角和机位关系",
   运镜手法: "镜头运动方式与运动路径",
   "内容/台词": "该镜头中人物动作、对白与叙事信息",
   画面描述: "画面主体、环境、构图、光影与氛围",
   定格画面: "镜头结束瞬间的画面终态与下镜头衔接锚点",
+  角色: "角色外观与服装造型的视觉约束（兼容旧表头）",
   角色形象: "角色外观与服装造型的视觉约束",
   形象: "角色或主体参考形象信息",
   道具: "需要出现并保持一致的道具元素",
   场景: "拍摄场景、空间结构与环境状态",
+  远景位置关系图: "远景构图、空间层次与主体位置关系参考图信息",
+  首帧图片: "当前镜头首帧参考图或首帧图片链接",
+  生成视频: "当前行的视频生成与素材管理操作列",
   备注: "补充的导演要求与约束条件",
 };
-const VIDEO_FIELD_ORDER = ["时间轴", "镜头调度与内容融合", "画面描述", "角色形象", "道具", "场景", "备注", "镜头景别与机位", "运镜手法", "内容/台词", "定格画面"] as const;
+const VIDEO_FIELD_ORDER = ["分镜", "分段时长", "镜头调度与内容", "角色形象", "场景", "道具", "远景位置关系图", "首帧图片", "备注", "时间轴", "镜头调度与内容融合", "画面描述", "镜头景别与机位", "运镜手法", "内容/台词", "定格画面"] as const;
 
 type KlingAssetRole = "character" | "scene" | "prop" | "first_frame";
+type VideoGenerateRowPayload = {
+  globalRowIndex: number;
+  previousGlobalRowIndex?: number;
+  headers: string[];
+  row: string[];
+  usePreviousSegmentEndFrame?: boolean;
+  customFirstFrameUrl?: string;
+  customLastFrameUrl?: string;
+};
+const VIDEO_ASSET_ROLE_PRIORITY: Record<KlingAssetRole, number> = {
+  first_frame: 4,
+  character: 3,
+  scene: 2,
+  prop: 1,
+};
 type EpisodeWithVersions = Episode & {
   versions?: Array<{ id?: string; content?: string }>;
   currentVersionId?: string;
@@ -153,10 +176,41 @@ function resolveAssetIdsFromCell(cell: string, assets: Asset[], _role?: KlingAss
 function mapHeaderToAssetRole(header: string): KlingAssetRole | null {
   const normalized = header.replace(/\s/g, "");
   if (normalized.includes("首帧") || normalized.includes("首位帧") || normalized.includes("起始帧")) return "first_frame";
+  if (normalized.includes("远景位置关系图")) return "scene";
   if (normalized.includes("角色") || normalized === "形象") return "character";
   if (normalized.includes("场景")) return "scene";
   if (normalized.includes("道具")) return "prop";
   return null;
+}
+
+function extractInlineMaterialBindingsFromCell(cell: string, role: KlingAssetRole) {
+  const blockRegex = /<!--\s*MATERIAL_REF_START\s*-->[\s\S]*?<!--\s*MATERIAL_REF_END\s*-->/g;
+  const blocks = String(cell || "").match(blockRegex) || [];
+  const bindings: Array<{ role: KlingAssetRole; image_url: string; name?: string; description?: string; base_character_name?: string }> = [];
+  const seen = new Set<string>();
+  blocks.forEach((block) => {
+    if (extractAssetTokensFromCell(block).length > 0) return;
+    const imageUrl = String(block.match(/!\[[^\]]*\]\(([^)]+)\)/)?.[1] || "").trim();
+    if (!imageUrl) return;
+    const name = String(block.match(/素材名\s*[：:]\s*([^\n]+)/)?.[1] || "").trim();
+    const description = String(block.match(/素材描述\s*[：:]\s*([^\n]+)/)?.[1] || "").trim();
+    const baseCharacterName = String(block.match(/基础角色\s*[：:]\s*([^\n]+)/)?.[1] || "").trim();
+    const key = `${role}|${imageUrl}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    bindings.push({
+      role,
+      image_url: imageUrl,
+      name: name || undefined,
+      description: description || undefined,
+      base_character_name: role === "character" && baseCharacterName ? baseCharacterName : undefined,
+    });
+  });
+  return bindings;
+}
+
+function findSegmentForRow(segments: Segment[], globalRowIndex: number) {
+  return segments.find((item) => Number(item.order_index) === globalRowIndex + 1) || segments[globalRowIndex];
 }
 
 function getSelectedOrLatestSegmentVideoUrl(segment?: Segment) {
@@ -197,8 +251,14 @@ function isVideoGenerateHeader(header: string) {
 
 function findFieldIndex(headers: string[], field: string) {
   const normalizedHeaders = headers.map((h) => normalizeHeaderForMatch(h));
-  if (field === "时间轴") {
-    return normalizedHeaders.findIndex((h) => h.includes("时间轴") || h.includes("时长"));
+  if (field === "分镜") {
+    return normalizedHeaders.findIndex((h) => h.includes("分镜"));
+  }
+  if (field === "分段时长" || field === "时间轴") {
+    return normalizedHeaders.findIndex((h) => h.includes("分段时长") || h.includes("时间轴") || h.includes("时长"));
+  }
+  if (field === "镜头调度与内容") {
+    return normalizedHeaders.findIndex((h) => h.includes("镜头调度与内容") || (h.includes("镜头") && h.includes("内容")));
   }
   if (field === "镜头景别与机位") {
     return normalizedHeaders.findIndex((h) => (h.includes("镜头") || h.includes("景别")) && h.includes("机位"));
@@ -212,7 +272,7 @@ function findFieldIndex(headers: string[], field: string) {
   if (field === "画面描述") {
     return normalizedHeaders.findIndex((h) => h.includes("画面") || h.includes("提示词") || h.includes("prompt"));
   }
-  if (field === "角色形象") {
+  if (field === "角色" || field === "角色形象") {
     return normalizedHeaders.findIndex((h) => h.includes("角色形象") || h === "形象" || h.includes("角色"));
   }
   if (field === "道具") {
@@ -220,6 +280,12 @@ function findFieldIndex(headers: string[], field: string) {
   }
   if (field === "场景") {
     return normalizedHeaders.findIndex((h) => h.includes("场景"));
+  }
+  if (field === "远景位置关系图") {
+    return normalizedHeaders.findIndex((h) => h.includes("远景位置关系图"));
+  }
+  if (field === "首帧图片") {
+    return normalizedHeaders.findIndex((h) => h.includes("首帧") || h.includes("首位帧") || h.includes("起始帧"));
   }
   if (field === "备注") {
     return normalizedHeaders.findIndex((h) => h.includes("备注"));
@@ -300,6 +366,69 @@ function countStoryboardRows(markdown: string) {
   return rowCount;
 }
 
+function sanitizeVideoPromptCell(text: string) {
+  return String(text || "")
+    .replace(/\[AssetID:\s*[^\]]+\]/gi, "")
+    .replace(/<!--\s*MATERIAL_REF_START\s*-->/gi, "")
+    .replace(/<!--\s*MATERIAL_REF_END\s*-->/gi, "")
+    .replace(/!\[[^\]]*\]\(([^)]+)\)/g, "")
+    .replace(/^\s*素材类型\s*[：:].*$/gim, "")
+    .replace(/^\s*素材名\s*[：:].*$/gim, "")
+    .replace(/^\s*素材描述\s*[：:].*$/gim, "")
+    .replace(/^\s*基础角色\s*[：:].*$/gim, "")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
+function splitFreezeFrameInstruction(text: string) {
+  const sanitized = sanitizeVideoPromptCell(text);
+  if (!sanitized) {
+    return { motionText: "", freezeFrameText: "" };
+  }
+  const motionLines: string[] = [];
+  const freezeFrameLines: string[] = [];
+  sanitized.split("\n").forEach((line) => {
+    const trimmed = line.trim();
+    if (/^定格画面\s*[：:]/i.test(trimmed)) {
+      const value = trimmed.replace(/^定格画面\s*[：:]\s*/i, "").trim();
+      if (value) freezeFrameLines.push(value);
+      return;
+    }
+    motionLines.push(line);
+  });
+  return {
+    motionText: motionLines.join("\n").trim(),
+    freezeFrameText: freezeFrameLines.join("\n").trim(),
+  };
+}
+
+function resolveRowMotionText(headers: string[], row: string[]) {
+  const motionIndex = findFieldIndex(headers, "镜头调度与内容");
+  if (motionIndex >= 0) {
+    return splitFreezeFrameInstruction(row[motionIndex] || "");
+  }
+  const fusionIndex = findFieldIndex(headers, "镜头调度与内容融合");
+  if (fusionIndex >= 0) {
+    return splitFreezeFrameInstruction(row[fusionIndex] || "");
+  }
+  return { motionText: "", freezeFrameText: "" };
+}
+
+function resolveRowFreezeFrameText(headers: string[], row: string[]) {
+  const explicitFreezeIndex = findFieldIndex(headers, "定格画面");
+  const explicitFreezeText = explicitFreezeIndex >= 0 ? sanitizeVideoPromptCell(row[explicitFreezeIndex] || "") : "";
+  if (explicitFreezeText) return explicitFreezeText;
+  return resolveRowMotionText(headers, row).freezeFrameText;
+}
+
+function formatDurationLabel(seconds: number) {
+  const safe = Number.isFinite(seconds) ? seconds : 0;
+  if (Math.abs(safe - Math.round(safe)) < 0.001) {
+    return `${Math.round(safe)}s`;
+  }
+  return `${safe.toFixed(1).replace(/\.0$/, "")}s`;
+}
+
 function isKlingPendingStatus(value: string) {
   const normalized = String(value || "").toUpperCase();
   if (!normalized) return false;
@@ -357,10 +486,13 @@ function stripThinkingContent(text: string) {
   if (/<think>/i.test(cleaned) && !/<\/think>/i.test(cleaned)) {
     const thinkStart = cleaned.search(/<think>/i);
     const tail = cleaned.slice(thinkStart);
-    const firstContentOffset = tail.search(/^\s*(\|.+\||###\s+.+)$/m);
+    const firstContentOffset = tail.search(/^\s*(\|.+\||#{1,6}\s+.+)$/m);
+    const fallbackOffset = tail.search(/\S/m);
     if (thinkStart >= 0) {
       if (firstContentOffset >= 0) {
         cleaned = `${cleaned.slice(0, thinkStart)}${tail.slice(firstContentOffset)}`;
+      } else if (fallbackOffset >= 0) {
+        cleaned = `${cleaned.slice(0, thinkStart)}${tail.slice(fallbackOffset)}`;
       } else {
         cleaned = cleaned.slice(0, thinkStart);
       }
@@ -377,6 +509,7 @@ export default function ScriptStoryboardPage() {
   const [storyboard, setStoryboard] = useState("");
   const [loading, setLoading] = useState(true);
   const [message, setMessage] = useState<string | null>(null);
+  const [actionToast, setActionToast] = useState<{ type: "error" | "success" | "info"; text: string } | null>(null);
   const [selectedModel, setSelectedModel] = useState("gemini-3.1-pro");
   const [globalStyle, setGlobalStyle] = useState("真人电影写实");
   const [isScriptCollapsed, setIsScriptCollapsed] = useState(false);
@@ -458,6 +591,12 @@ export default function ScriptStoryboardPage() {
     }
     setSelectedEpisodeIndex((prev) => Math.min(Math.max(prev, 0), episodes.length - 1));
   }, [episodes.length]);
+
+  useEffect(() => {
+    if (!actionToast) return;
+    const timer = window.setTimeout(() => setActionToast(null), 2600);
+    return () => window.clearTimeout(timer);
+  }, [actionToast]);
 
   useEffect(() => {
     if (!projectId) return;
@@ -935,6 +1074,7 @@ export default function ScriptStoryboardPage() {
                   storyboardTaskId: result.task_id,
                   storyboardTaskStatus: "completed",
                   storyboardTaskError: "",
+                  storyboardTaskThinking: String(result.thinking || ""),
                 };
                 return next;
               });
@@ -954,6 +1094,7 @@ export default function ScriptStoryboardPage() {
                   storyboardTaskId: result.task_id,
                   storyboardTaskStatus: "failed",
                   storyboardTaskError: result.error || "生成失败",
+                  storyboardTaskThinking: String(result.thinking || ""),
                 };
                 return next;
               });
@@ -1028,6 +1169,7 @@ export default function ScriptStoryboardPage() {
           storyboardTaskId: result.task_id,
           storyboardTaskStatus: result.status,
           storyboardTaskError: result.error || "",
+          storyboardTaskThinking: String(result.thinking || ""),
           storyboard: result.status === "completed" ? (result.content || next[index].storyboard || "") : next[index].storyboard,
         };
         return next;
@@ -1204,6 +1346,21 @@ export default function ScriptStoryboardPage() {
     }
   };
 
+  const flushStoryboardChangesBeforeVideoGenerate = async (token: string) => {
+    if (!projectId) return;
+    const episodesChanged = JSON.stringify(episodes) !== JSON.stringify(lastSavedEpisodesRef.current);
+    const storyboardChanged = storyboard !== lastSavedStoryboardRef.current;
+    if (!episodesChanged && !storyboardChanged) return;
+    if (saveTimeoutRef.current) {
+      clearTimeout(saveTimeoutRef.current);
+      saveTimeoutRef.current = null;
+    }
+    const saved = await saveScript(token, projectId, undefined, undefined, storyboard, undefined, episodes);
+    const nextStoryboard = stripThinkingContent(saved.storyboard || storyboard);
+    lastSavedStoryboardRef.current = nextStoryboard;
+    lastSavedEpisodesRef.current = episodes;
+  };
+
   const handleGenerateKlingRow = async ({
     globalRowIndex,
     previousGlobalRowIndex,
@@ -1212,18 +1369,11 @@ export default function ScriptStoryboardPage() {
     usePreviousSegmentEndFrame,
     customFirstFrameUrl,
     customLastFrameUrl,
-  }: {
-    globalRowIndex: number;
-    previousGlobalRowIndex?: number;
-    headers: string[];
-    row: string[];
-    usePreviousSegmentEndFrame?: boolean;
-    customFirstFrameUrl?: string;
-    customLastFrameUrl?: string;
-  }) => {
+  }: VideoGenerateRowPayload) => {
     setGeneratingGlobalRowIndex(globalRowIndex);
     setMessage("正在提交视频生成请求...");
     let submitted = false;
+    let pendingRowIndex = globalRowIndex;
     try {
       if (!projectId) {
         throw new Error("项目 ID 无效，请刷新页面后重试");
@@ -1233,123 +1383,122 @@ export default function ScriptStoryboardPage() {
         router.push("/login");
         throw new Error("登录状态已失效，请重新登录后重试");
       }
-      let segment = segments[globalRowIndex];
-      if (!segment) {
-        const refreshedSegments = await getSegments(token, projectId);
-        setSegments(refreshedSegments);
-        segment = refreshedSegments[globalRowIndex];
-      }
-      if (!segment) {
-        throw new Error("当前行还未同步到分段，请等待自动保存后重试");
-      }
-      setManualPendingRowMap((prev) => ({
-        ...prev,
-        [globalRowIndex]: {
-          segmentId: segment.id,
-          baseVersionIds: (segment.versions || []).map((version) => version.id),
-          submittedAt: Date.now(),
-        },
-      }));
-      const mode = videoResolution === "1080p" ? "pro" : "std";
+
       const timelineIndex = findFieldIndex(headers, "时间轴");
       const timelineText = timelineIndex >= 0 ? (row[timelineIndex] || "") : "";
-      const duration = normalizeKlingDuration(parseDurationFromTimeline(timelineText));
-      const rowFieldValueLines: string[] = [];
-      const rowFieldMeaningLines: string[] = [];
-      const assetBindings: Array<{
+      const totalDurationSeconds = parseDurationFromTimeline(timelineText);
+      const mode = videoResolution === "1080p" ? "pro" : "std";
+      const duration = normalizeKlingDuration(totalDurationSeconds);
+      const modelToUse = resolveStep4VideoModel(selectedVideoModel);
+      const withAudio = videoAudioMode === "with_audio";
+      const targetRowIndex = globalRowIndex;
+      pendingRowIndex = targetRowIndex;
+
+      await flushStoryboardChangesBeforeVideoGenerate(token);
+      const refreshedSegments = await getSegments(token, projectId);
+      setSegments(refreshedSegments);
+      const segment = findSegmentForRow(refreshedSegments, targetRowIndex);
+      if (!segment) {
+        throw new Error("当前分镜还未同步到分段，请稍后重试");
+      }
+
+      const assetBindingMap = new Map<string, {
         asset_id: string;
         role: KlingAssetRole;
         name?: string;
         description?: string;
-      }> = [];
-      const bindingKeySet = new Set<string>();
+      }>();
       let firstFrameAssetId = "";
-      const pushBinding = (assetId: string, role: KlingAssetRole) => {
-        const key = `${role}:${assetId}`;
-        if (bindingKeySet.has(key)) return;
-        bindingKeySet.add(key);
-        const asset = projectAssets.find((item) => item.id === assetId);
-        assetBindings.push({
-          asset_id: assetId,
-          role,
-          name: asset?.name || undefined,
-          description: asset?.description || undefined,
-        });
-      };
-
-      headers.forEach((header, index) => {
-        const cell = row[index] || "";
+      headers.forEach((header, columnIndex) => {
+        const cell = row[columnIndex] || "";
         if (!cell) return;
         const role = mapHeaderToAssetRole(header);
         if (!role) return;
-        if (usePreviousSegmentEndFrame && role === "first_frame") return;
+        if (role === "first_frame" && usePreviousSegmentEndFrame) return;
         const ids = resolveAssetIdsFromCell(cell, projectAssets, role);
-        if (ids.length > 0) {
-          ids.forEach((id) => {
-            pushBinding(id, role);
-            if (role === "first_frame" && !firstFrameAssetId) firstFrameAssetId = id;
-          });
-        }
+        ids.forEach((assetId) => {
+          const asset = projectAssets.find((projectAsset) => projectAsset.id === assetId);
+          const nextBinding = {
+            asset_id: assetId,
+            role,
+            name: asset?.name || undefined,
+            description: asset?.description || undefined,
+          };
+          const existingBinding = assetBindingMap.get(assetId);
+          if (!existingBinding || VIDEO_ASSET_ROLE_PRIORITY[role] > VIDEO_ASSET_ROLE_PRIORITY[existingBinding.role]) {
+            assetBindingMap.set(assetId, nextBinding);
+          }
+          if (role === "first_frame" && !firstFrameAssetId) {
+            firstFrameAssetId = assetId;
+          }
+        });
       });
+      const assetBindings = Array.from(assetBindingMap.values());
+      const inlineAssetBindings = headers.flatMap((header, columnIndex) => {
+        const role = mapHeaderToAssetRole(header);
+        if (!role || role === "first_frame") return [];
+        return extractInlineMaterialBindingsFromCell(row[columnIndex] || "", role);
+      });
+
+      const firstFrameColumnIndex = findFieldIndex(headers, "首帧图片");
+      const firstFrameCellUrls = firstFrameColumnIndex >= 0 ? extractImageUrlsFromCell(row[firstFrameColumnIndex] || "") : [];
+      const effectiveCustomFirstFrameUrl = customFirstFrameUrl || firstFrameCellUrls[0] || "";
       let previousSegmentVideoUrl = "";
-      if (usePreviousSegmentEndFrame && typeof previousGlobalRowIndex === "number" && previousGlobalRowIndex >= 0) {
-        const previousSegment = segments[previousGlobalRowIndex];
+      if (!effectiveCustomFirstFrameUrl && usePreviousSegmentEndFrame && typeof previousGlobalRowIndex === "number" && previousGlobalRowIndex >= 0) {
+        const previousSegment = findSegmentForRow(refreshedSegments, previousGlobalRowIndex);
         previousSegmentVideoUrl = rowVideoUrlMap[previousGlobalRowIndex] || getSelectedOrLatestSegmentVideoUrl(previousSegment);
       }
+      const usePreviousTailFrame = Boolean(previousSegmentVideoUrl) && !effectiveCustomFirstFrameUrl;
 
-      const sanitizeCellForPrompt = (text: string) =>
-        String(text || "")
-          .replace(/\[AssetID:\s*[^\]]+\]/gi, "")
-          .replace(/\n{3,}/g, "\n\n")
-          .trim();
-      const consumedHeaderIndexSet = new Set<number>();
-      VIDEO_FIELD_ORDER.forEach((field) => {
-        const fieldIndex = findFieldIndex(headers, field);
-        if (fieldIndex < 0) return;
-        consumedHeaderIndexSet.add(fieldIndex);
-        const fieldHeader = headers[fieldIndex];
-        const fieldCell = sanitizeCellForPrompt(row[fieldIndex] || "") || "（空）";
-        rowFieldMeaningLines.push(`- ${field}：${COLUMN_MEANING_MAP[field] || "该字段用于描述当前镜头的重要信息"}`);
-        rowFieldValueLines.push(`${field}: ${fieldCell}`);
-        if (fieldHeader !== field) {
-          rowFieldValueLines.push(`字段别名: ${fieldHeader}`);
-        }
-      });
+      const referenceKeySet = new Set<string>();
+      assetBindings.forEach((item) => referenceKeySet.add(`asset:${item.asset_id}`));
+      inlineAssetBindings.forEach((item) => referenceKeySet.add(`inline:${item.role}:${item.image_url}`));
+      if (effectiveCustomFirstFrameUrl) referenceKeySet.add(`url:${effectiveCustomFirstFrameUrl}`);
+      if (customLastFrameUrl) referenceKeySet.add(`url:${customLastFrameUrl}`);
+      const referenceCount = referenceKeySet.size;
+      if (referenceCount > MAX_VIDEO_REFERENCE_IMAGES) {
+        const text = `参考素材最多只能传 ${MAX_VIDEO_REFERENCE_IMAGES} 张`;
+        setActionToast({ type: "error", text });
+        throw new Error(text);
+      }
 
-      headers.forEach((header, index) => {
-        if (consumedHeaderIndexSet.has(index)) return;
-        if (isVideoGenerateHeader(header)) return;
-        rowFieldMeaningLines.push(`- ${header}：${COLUMN_MEANING_MAP[header] || "该字段用于描述当前镜头的重要信息"}`);
-        rowFieldValueLines.push(`${header}: ${sanitizeCellForPrompt(row[index] || "") || "（空）"}`);
-      });
+      const motionText = resolveRowMotionText(headers, row).motionText || "";
+      const freezeFrameText = resolveRowFreezeFrameText(headers, row);
 
       const systemPrompt = [
         "你是短剧分镜视频生成模型的执行器。",
         `全局视觉风格：${globalStyle}。`,
-        "严格遵循用户提供的每个字段，不得丢失字段信息，不得擅自改写剧情事实。",
-        "优先保证人物动作、表情、台词、道具、场景与时间轴一致。",
+        "只根据【镜头调度与内容】和参考素材生成，不要额外引用“分镜”列或其他表格说明文本。",
+        "当前任务是单段生成：严格执行当前段的镜头调度与内容。",
+        "仅保留当前段的定格画面描述。",
+        "角色形象、场景、道具、远景位置关系图、首帧图片只作为视觉一致性参考，重复素材只使用一次。",
         `目标分辨率：${videoResolution}，画幅：${videoAspectRatio}，模式：${mode}。`,
       ].join("\n");
 
-      const usePreviousTailFrame = Boolean(previousSegmentVideoUrl) && !customFirstFrameUrl;
-      const modelToUse = resolveStep4VideoModel(selectedVideoModel);
-      const withAudio = videoAudioMode === "with_audio";
-
       const prompt = [
-        "请基于当前分镜行生成单镜头视频，严格融合所有字段语义。",
-        "【字段定义】",
-        ...rowFieldMeaningLines,
-        "【字段取值】",
-        ...rowFieldValueLines,
+        "请根据以下镜头调度与内容生成单条视频。",
+        "【镜头调度与内容】",
+        motionText || "（空）",
+        freezeFrameText ? `【定格画面】\n${freezeFrameText}` : "",
         "【生成要求】",
         `模型：${modelToUse}`,
         `模式：${mode}`,
         `分辨率：${videoResolution}`,
         `画幅比例：${videoAspectRatio}`,
-        `时长：${duration}s`,
-        `首帧来源：${usePreviousTailFrame ? "上一条分镜已选视频尾帧" : "默认首帧"}`,
+        `总时长：${formatDurationLabel(totalDurationSeconds)}`,
+        `首帧来源：${effectiveCustomFirstFrameUrl ? "首帧图片/素材管理结果" : usePreviousTailFrame ? "上一条分镜已选视频尾帧" : "默认首帧"}`,
         `音频：${withAudio ? "有声" : "无声"}`,
-      ].join("\n");
+      ].filter(Boolean).join("\n");
+
+      setManualPendingRowMap((prev) => ({
+        ...prev,
+        [targetRowIndex]: {
+          segmentId: segment.id,
+          baseVersionIds: (segment.versions || []).map((version) => version.id),
+          submittedAt: Date.now(),
+        },
+      }));
+
       const options: Record<string, unknown> = {
         model: modelToUse,
         mode,
@@ -1362,14 +1511,17 @@ export default function ScriptStoryboardPage() {
       if (usePreviousTailFrame) {
         options.previous_segment_video_url = previousSegmentVideoUrl;
       }
-      if (customFirstFrameUrl) {
-        options.custom_first_frame_url = customFirstFrameUrl;
+      if (effectiveCustomFirstFrameUrl) {
+        options.custom_first_frame_url = effectiveCustomFirstFrameUrl;
       }
       if (customLastFrameUrl) {
         options.custom_last_frame_url = customLastFrameUrl;
       }
       if (assetBindings.length > 0) {
         options.asset_bindings = assetBindings;
+      }
+      if (inlineAssetBindings.length > 0) {
+        options.inline_asset_bindings = inlineAssetBindings;
       }
       if (firstFrameAssetId) {
         options.first_frame_asset_id = firstFrameAssetId;
@@ -1385,26 +1537,24 @@ export default function ScriptStoryboardPage() {
           with_audio: withAudio,
           sound: withAudio ? "on" : "off",
         },
-        user_selected_row_index: globalRowIndex,
       });
       submitted = true;
       try {
-        const refreshedSegments = await getSegments(token, projectId);
-        setSegments(refreshedSegments);
+        const nextSegments = await getSegments(token, projectId);
+        setSegments(nextSegments);
       } catch {}
-      const referenceCount = assetBindings.length > 0
-        ? new Set(assetBindings.map((item) => item.asset_id)).size
-        : 0;
       setMessage(`视频任务已提交，正在生成中（本次参考图：${referenceCount}）`);
     } catch (error) {
       if (!submitted) {
         setManualPendingRowMap((prev) => {
           const next = { ...prev };
-          delete next[globalRowIndex];
+          delete next[pendingRowIndex];
           return next;
         });
       }
-      setMessage(error instanceof Error ? error.message : "视频生成失败");
+      const text = error instanceof Error ? error.message : "视频生成失败";
+      setMessage(text);
+      setActionToast({ type: "error", text });
     } finally {
       setGeneratingGlobalRowIndex(null);
     }
@@ -1438,11 +1588,11 @@ export default function ScriptStoryboardPage() {
         throw new Error("登录状态已失效，请重新登录后重试");
       }
       if (!currentVideoUrl) throw new Error("当前行没有可修改的视频，请先生成视频");
-      let segment = segments[globalRowIndex];
+      let segment = findSegmentForRow(segments, globalRowIndex);
       if (!segment) {
         const refreshedSegments = await getSegments(token, projectId);
         setSegments(refreshedSegments);
-        segment = refreshedSegments[globalRowIndex];
+        segment = findSegmentForRow(refreshedSegments, globalRowIndex);
       }
       if (!segment) throw new Error("当前行还未同步到分段，请等待自动保存后重试");
 
@@ -1480,12 +1630,13 @@ export default function ScriptStoryboardPage() {
         const ids = resolveAssetIdsFromCell(cell, projectAssets, role);
         ids.forEach((id) => pushBinding(id, role));
       });
+      const inlineAssetBindings = headers.flatMap((header, index) => {
+        const role = mapHeaderToAssetRole(header);
+        if (!role || role === "first_frame") return [];
+        return extractInlineMaterialBindingsFromCell(row[index] || "", role);
+      });
 
-      const sanitizeCellForPrompt = (text: string) =>
-        String(text || "")
-          .replace(/\[AssetID:\s*[^\]]+\]/gi, "")
-          .replace(/\n{3,}/g, "\n\n")
-          .trim();
+      const sanitizeCellForPrompt = (text: string) => sanitizeVideoPromptCell(text);
 
       const consumedHeaderIndexSet = new Set<number>();
       VIDEO_FIELD_ORDER.forEach((field) => {
@@ -1543,6 +1694,7 @@ export default function ScriptStoryboardPage() {
           keep_original_sound: keepOriginalSound ? "yes" : "no",
           reference_images: references,
           asset_bindings: assetBindings,
+          inline_asset_bindings: inlineAssetBindings,
         },
       });
       submitted = true;
@@ -1569,7 +1721,7 @@ export default function ScriptStoryboardPage() {
     if (!projectId) return;
     const token = getToken();
     if (!token) return;
-    const segment = segments[globalRowIndex];
+    const segment = findSegmentForRow(segments, globalRowIndex);
     if (!segment?.id || !versionId) return;
     applySelectedVersionForRow(globalRowIndex, versionId);
     try {
@@ -1589,7 +1741,7 @@ export default function ScriptStoryboardPage() {
     if (!projectId) return;
     const token = getToken();
     if (!token) return;
-    const segment = segments[globalRowIndex];
+    const segment = findSegmentForRow(segments, globalRowIndex);
     if (!segment?.id || !versionId) return;
     const confirmed = window.confirm("确认删除该视频版本吗？删除后不可恢复。");
     if (!confirmed) return;
@@ -1666,6 +1818,19 @@ export default function ScriptStoryboardPage() {
         </select>
         {message && <span className="text-gray-500 text-sm">{message}</span>}
       </div>
+      {actionToast ? (
+        <div
+          className={`fixed right-6 top-20 z-50 max-w-md rounded-lg border px-4 py-3 text-sm shadow-lg ${
+            actionToast.type === "error"
+              ? "border-red-200 bg-red-50 text-red-700"
+              : actionToast.type === "success"
+                ? "border-emerald-200 bg-emerald-50 text-emerald-700"
+                : "border-sky-200 bg-sky-50 text-sky-700"
+          }`}
+        >
+          {actionToast.text}
+        </div>
+      ) : null}
 
       {episodes.length > 0 ? (
         <div className="flex-1 overflow-y-auto space-y-4 pb-10">
@@ -1820,6 +1985,14 @@ export default function ScriptStoryboardPage() {
                     {episode.storyboardTaskStatus === "failed" && episode.storyboardTaskError ? (
                       <div className="px-4 py-2 border-t border-red-100 bg-red-50 text-xs text-red-600">
                         分镜生成失败：{episode.storyboardTaskError}
+                      </div>
+                    ) : null}
+                    {String(episode.storyboardTaskThinking || "").trim() ? (
+                      <div className="px-4 py-2 border-t border-amber-100 bg-amber-50">
+                        <details>
+                          <summary className="cursor-pointer text-xs font-medium text-amber-700">查看模型 thinking（默认收起）</summary>
+                          <pre className="mt-2 max-h-56 overflow-y-auto whitespace-pre-wrap rounded border border-amber-200 bg-white p-2 text-[11px] text-amber-900">{String(episode.storyboardTaskThinking || "")}</pre>
+                        </details>
                       </div>
                     ) : null}
                     

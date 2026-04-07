@@ -25,6 +25,7 @@ from app.schemas.script import (
     StoryboardTaskStatusResponse,
     AsyncTaskStatusResponse,
     Step2TaskStartRequest,
+    Step2TaskTarget,
 )
 from app.services.projects import get_project
 from app.services.script_validation import validate_script_with_model as run_validation
@@ -36,7 +37,8 @@ from app.services.scripts import (
     get_script_history,
     delete_script,
 )
-from app.services.assets import list_assets, extract_assets_from_script
+from app.services.assets import extract_assets_from_script
+from app.services import media_storage
 from app.services.settings import get_or_create_settings
 from app.services.linkapi import create_chat_completion, create_chat_completion_stream
 from app.services.file_parsing import read_file_content
@@ -59,6 +61,12 @@ from app.core.script_prompts import (
     PROMPT_EXTRACT_OUTLINE,
     PROMPT_SPLIT_SCRIPT,
     PROMPT_STORYBOARD,
+    PROMPT_EXTRACT_RESOURCES,
+    PROMPT_EXTRACT_PROPS,
+    PROMPT_EXTRACT_SCENES,
+    PROMPT_STEP2_MERGE_CHARACTERS,
+    PROMPT_STEP2_MERGE_PROPS,
+    PROMPT_STEP2_MERGE_SCENES,
 )
 
 router = APIRouter()
@@ -70,6 +78,201 @@ _OPENROUTER_TEXT_MODEL = "gemini-3.1-pro"
 
 def _build_storyboard_text_from_episodes(episodes: list[dict[str, Any]]) -> str:
     return "\n\n".join([f"### {str(item.get('title') or '').strip()}\n\n{str(item.get('storyboard') or '').strip()}" for item in episodes])
+
+
+def _build_script_response(
+    script: Any,
+    project_id: str,
+    state_url: Optional[str] = None,
+    markdown_url: Optional[str] = None,
+) -> ScriptResponse:
+    episodes = json.loads(script.episodes) if getattr(script, "episodes", None) else None
+    version = getattr(script, "version", None)
+    if state_url is None and version:
+        state_url = media_storage.build_script_state_public_url(project_id, int(version))
+    if markdown_url is None and version:
+        markdown_url = media_storage.build_script_markdown_public_url(project_id, int(version))
+    return ScriptResponse(
+        id=script.id,
+        project_id=project_id,
+        content=script.content,
+        thinking=script.thinking,
+        storyboard=script.storyboard,
+        outline=script.outline,
+        episodes=episodes,
+        version=version,
+        is_active=script.is_active,
+        created_at=script.created_at.isoformat() if script.created_at else None,
+        state_url=state_url or None,
+        markdown_url=markdown_url or None,
+    )
+
+
+_STORYBOARD_SYSTEM_COLUMNS = ["场景", "道具", "远景位置关系图", "首帧图片", "生成视频"]
+
+
+def _split_markdown_table_line(line: str) -> list[str]:
+    parts: list[str] = []
+    current = ""
+    bracket_depth = 0
+    escaped = False
+    for ch in str(line or ""):
+        if escaped:
+            current += ch
+            escaped = False
+            continue
+        if ch == "\\":
+            escaped = True
+            current += ch
+            continue
+        if ch == "[":
+            bracket_depth += 1
+            current += ch
+            continue
+        if ch == "]":
+            bracket_depth = max(0, bracket_depth - 1)
+            current += ch
+            continue
+        if ch == "|" and bracket_depth == 0:
+            parts.append(current)
+            current = ""
+            continue
+        current += ch
+    parts.append(current)
+    if parts and parts[0].strip() == "":
+        parts.pop(0)
+    if parts and parts[-1].strip() == "":
+        parts.pop()
+    return parts
+
+
+def _ensure_storyboard_system_columns(markdown: str) -> str:
+    lines = str(markdown or "").splitlines()
+    if not lines:
+        return str(markdown or "")
+
+    def _normalized(text: str) -> str:
+        return str(text or "").replace(" ", "").replace("\t", "")
+
+    result: list[str] = []
+    i = 0
+    while i < len(lines):
+        current = lines[i]
+        next_line = lines[i + 1] if i + 1 < len(lines) else ""
+        stripped = current.strip()
+        next_stripped = next_line.strip()
+        is_table_header = stripped.startswith("|") and "|" in stripped and next_stripped.startswith("|") and set(next_stripped.replace("|", "").replace("-", "").replace(":", "").replace(" ", "")) == set()
+        if not is_table_header:
+            result.append(current)
+            i += 1
+            continue
+
+        header_cells = [cell.strip() for cell in _split_markdown_table_line(current)]
+        normalized_header_cells = [_normalized(cell) for cell in header_cells]
+        if "角色形象" not in normalized_header_cells:
+            role_index = next((index for index, cell in enumerate(header_cells) if _normalized(cell) == "角色"), -1)
+            if role_index >= 0:
+                header_cells[role_index] = "角色形象"
+        row_lines: list[str] = []
+        j = i + 2
+        while j < len(lines):
+            candidate = lines[j]
+            candidate_stripped = candidate.strip()
+            if not candidate_stripped.startswith("|") or "|" not in candidate_stripped:
+                break
+            row_lines.append(candidate)
+            j += 1
+
+        existing_headers = [_normalized(cell) for cell in header_cells]
+        for required in _STORYBOARD_SYSTEM_COLUMNS:
+            required_normalized = _normalized(required)
+            if required_normalized not in existing_headers:
+                header_cells.append(required)
+                existing_headers.append(required_normalized)
+
+        result.append(f"| {' | '.join(header_cells)} |")
+        result.append(f"| {' | '.join(['---'] * len(header_cells))} |")
+        for row_line in row_lines:
+            row_cells = [cell.strip() for cell in _split_markdown_table_line(row_line)]
+            if len(row_cells) < len(header_cells):
+                row_cells.extend([""] * (len(header_cells) - len(row_cells)))
+            elif len(row_cells) > len(header_cells):
+                row_cells = row_cells[:len(header_cells)]
+            result.append(f"| {' | '.join(row_cells)} |")
+        i = j
+
+    return "\n".join(result)
+
+
+def _strip_storyboard_thinking_content(text: str) -> str:
+    source = str(text or "")
+    cleaned = re.sub(r"<think>[\s\S]*?</think>", "", source, flags=re.IGNORECASE)
+    return re.sub(r"</?think>", "", cleaned, flags=re.IGNORECASE).strip()
+
+
+def _contains_markdown_table(text: str) -> bool:
+    source = str(text or "")
+    return bool(re.search(r"^\s*\|.+\|\s*$\n\s*\|\s*[-: ]+\|", source, flags=re.MULTILINE))
+
+
+def _extract_first_markdown_table(text: str) -> str:
+    lines = str(text or "").splitlines()
+    i = 0
+    while i + 1 < len(lines):
+        header = lines[i].strip()
+        divider = lines[i + 1].strip()
+        is_header = header.startswith("|") and "|" in header
+        is_divider = divider.startswith("|") and set(divider.replace("|", "").replace("-", "").replace(":", "").replace(" ", "")) == set()
+        if not (is_header and is_divider):
+            i += 1
+            continue
+        block = [lines[i], lines[i + 1]]
+        j = i + 2
+        while j < len(lines):
+            row = lines[j].strip()
+            if not row.startswith("|") or "|" not in row:
+                break
+            block.append(lines[j])
+            j += 1
+        return "\n".join(block).strip()
+    return ""
+
+
+def _sanitize_storyboard_markdown(text: str) -> str:
+    source = str(text or "")
+    if not source.strip():
+        return ""
+    direct_table = _extract_first_markdown_table(source)
+    if direct_table:
+        return direct_table
+    cleaned = _strip_storyboard_thinking_content(source)
+    if not cleaned:
+        return ""
+    fenced_blocks = re.findall(r"```(?:markdown|md)?\s*([\s\S]*?)```", cleaned, flags=re.IGNORECASE)
+    for block in fenced_blocks:
+        candidate = str(block or "").strip()
+        table = _extract_first_markdown_table(candidate)
+        if table:
+            return table
+    table = _extract_first_markdown_table(cleaned)
+    if table:
+        return table
+    return cleaned
+
+
+def _extract_storyboard_thinking_text(content_text: str, reasoning_text: str) -> str:
+    parts: list[str] = []
+    direct_reasoning = str(reasoning_text or "").strip()
+    if direct_reasoning:
+        parts.append(direct_reasoning)
+    source = str(content_text or "")
+    think_blocks = re.findall(r"<think>([\s\S]*?)</think>", source, flags=re.IGNORECASE)
+    for block in think_blocks:
+        value = str(block or "").strip()
+        if value:
+            parts.append(value)
+    merged = "\n\n".join(parts).strip()
+    return re.sub(r"</?think>", "", merged, flags=re.IGNORECASE).strip()
 
 
 def _normalize_mode_model(mode: str, model: Optional[str]) -> str:
@@ -175,6 +378,365 @@ def _strip_thinking_content(text: str) -> str:
     return cleaned.strip()
 
 
+_STEP2_TARGET_LABELS: dict[Step2TaskTarget, str] = {
+    "character": "角色",
+    "prop": "道具",
+    "scene": "场景",
+}
+_STEP2_SECTION_ALIASES: dict[Step2TaskTarget, tuple[str, ...]] = {
+    "character": ("角色", "角色列表"),
+    "prop": ("道具", "道具列表"),
+    "scene": ("场景", "场景列表"),
+}
+_STEP2_TARGET_PROMPTS: dict[str, str] = {
+    "character": PROMPT_EXTRACT_RESOURCES,
+    "prop": PROMPT_EXTRACT_PROPS,
+    "scene": PROMPT_EXTRACT_SCENES,
+}
+_STEP2_TARGET_MERGE_PROMPTS: dict[str, str] = {
+    "character": PROMPT_STEP2_MERGE_CHARACTERS,
+    "prop": PROMPT_STEP2_MERGE_PROPS,
+    "scene": PROMPT_STEP2_MERGE_SCENES,
+}
+_STEP2_MAX_GROUP_CHARS = 24000
+_STEP2_MAX_SINGLE_EPISODE_CHARS = 18000
+_STEP2_MAX_MERGE_INPUT_CHARS = 90000
+_step2_save_locks: dict[str, asyncio.Lock] = {}
+
+
+def _normalize_step2_target(value: Any) -> str:
+    raw = str(value or "").strip().lower()
+    return raw if raw in _STEP2_TARGET_LABELS else ""
+
+
+def _split_step2_resources_sections(text: str) -> dict[str, str]:
+    sections = {key: "" for key in _STEP2_TARGET_LABELS}
+    source = str(text or "").replace("\r\n", "\n").replace("\r", "\n")
+    if not source.strip():
+        return sections
+
+    alias_to_target: dict[str, str] = {}
+    for target, aliases in _STEP2_SECTION_ALIASES.items():
+        for alias in aliases:
+            alias_to_target[alias] = target
+
+    current_target = ""
+    buffer: list[str] = []
+    found_section = False
+
+    def _flush() -> None:
+        nonlocal buffer, current_target
+        if current_target:
+            sections[current_target] = "\n".join(buffer).strip()
+        buffer = []
+
+    for raw_line in source.split("\n"):
+        normalized = raw_line.strip().lstrip("#").strip()
+        normalized = normalized.rstrip("：:").strip()
+        target = alias_to_target.get(normalized, "")
+        if target:
+            found_section = True
+            _flush()
+            current_target = target
+            continue
+        if current_target:
+            buffer.append(raw_line)
+    _flush()
+
+    if found_section:
+        return sections
+    sections["character"] = source.strip()
+    return sections
+
+
+def _compose_step2_resources_sections(sections: dict[str, str]) -> str:
+    if not any(str(sections.get(target) or "").strip() for target in _STEP2_TARGET_LABELS):
+        return ""
+    blocks: list[str] = []
+    for target in ("character", "prop", "scene"):
+        label = _STEP2_TARGET_LABELS[target]
+        body = str(sections.get(target) or "").strip()
+        blocks.append(f"## {label}\n\n{body}".rstrip())
+    return "\n\n".join(blocks).strip()
+
+
+def _split_long_text_by_paragraphs(text: str, title: str, max_chars: int) -> list[dict[str, str]]:
+    normalized = str(text or "").strip()
+    if not normalized:
+        return []
+    paragraphs = [item.strip() for item in re.split(r"\n\s*\n", normalized) if item.strip()]
+    if not paragraphs:
+        paragraphs = [normalized]
+    chunks: list[str] = []
+    current = ""
+    for paragraph in paragraphs:
+        candidate = f"{current}\n\n{paragraph}".strip() if current else paragraph
+        if current and len(candidate) > max_chars:
+            chunks.append(current)
+            current = paragraph
+            continue
+        if len(paragraph) <= max_chars:
+            current = candidate
+            continue
+        lines = [line for line in paragraph.splitlines() if line.strip()]
+        if not lines:
+            lines = [paragraph]
+        line_buffer = ""
+        for line in lines:
+            line_candidate = f"{line_buffer}\n{line}".strip() if line_buffer else line
+            if line_buffer and len(line_candidate) > max_chars:
+                chunks.append(line_buffer)
+                line_buffer = line
+                continue
+            if len(line) <= max_chars:
+                line_buffer = line_candidate
+                continue
+            for start in range(0, len(line), max_chars):
+                piece = line[start : start + max_chars].strip()
+                if piece:
+                    if line_buffer:
+                        chunks.append(line_buffer)
+                        line_buffer = ""
+                    chunks.append(piece)
+        if line_buffer:
+            if current:
+                chunks.append(current)
+                current = ""
+            chunks.append(line_buffer)
+    if current:
+        chunks.append(current)
+    return [
+        {"title": f"{title}（片段{index}）", "content": chunk}
+        for index, chunk in enumerate(chunks, start=1)
+        if str(chunk or "").strip()
+    ]
+
+
+def _split_script_into_episode_units(text: str) -> list[dict[str, str]]:
+    source = str(text or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+    if not source:
+        return []
+    pattern = re.compile(r"(?m)^[ \t]*[【\[]?\s*第\s*[0-9一二三四五六七八九十百零〇两]+\s*集(?:[^\n\r]*)$")
+    matches = list(pattern.finditer(source))
+    if not matches:
+        return [{"title": "全文剧本", "content": source}]
+
+    units: list[dict[str, str]] = []
+    prefix = source[: matches[0].start()].strip()
+    if prefix:
+        units.append({"title": "剧本前置信息", "content": prefix})
+    for index, match in enumerate(matches):
+        start = match.start()
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(source)
+        block = source[start:end].strip()
+        title = match.group(0).strip() or f"第{index + 1}集"
+        if not block:
+            continue
+        if len(block) > _STEP2_MAX_SINGLE_EPISODE_CHARS:
+            units.extend(_split_long_text_by_paragraphs(block, title, _STEP2_MAX_SINGLE_EPISODE_CHARS))
+        else:
+            units.append({"title": title, "content": block})
+    return units or [{"title": "全文剧本", "content": source}]
+
+
+def _build_step2_episode_groups(text: str, max_chars: int = _STEP2_MAX_GROUP_CHARS) -> list[str]:
+    units = _split_script_into_episode_units(text)
+    if not units:
+        return []
+    groups: list[str] = []
+    current_parts: list[str] = []
+    current_len = 0
+    for unit in units:
+        piece = str(unit.get("content") or "").strip()
+        if not piece:
+            continue
+        estimated = len(piece) + 2
+        if current_parts and current_len + estimated > max_chars:
+            groups.append("\n\n".join(current_parts).strip())
+            current_parts = []
+            current_len = 0
+        current_parts.append(piece)
+        current_len += estimated
+    if current_parts:
+        groups.append("\n\n".join(current_parts).strip())
+    return groups
+
+
+async def _call_text_generation_once(
+    db: AsyncSession,
+    user_id: str,
+    model: str,
+    system_prompt: str,
+    user_prompt: str,
+    temperature: float = 0.1,
+    max_tokens: int = 48000,
+) -> str:
+    response = await create_chat_completion(
+        db,
+        user_id,
+        {
+            "model": model,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            "stream": False,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+            "thinking": {"type": "disabled"},
+        },
+    )
+    content = ""
+    if isinstance(response, dict):
+        choices = response.get("choices") if isinstance(response, dict) else None
+        if isinstance(choices, list) and choices:
+            first_choice = choices[0] if isinstance(choices[0], dict) else {}
+            message_obj = first_choice.get("message") if isinstance(first_choice, dict) else None
+            if isinstance(message_obj, dict):
+                content = str(message_obj.get("content") or "")
+    cleaned = _strip_thinking_content(content)
+    if not cleaned:
+        raise RuntimeError("模型未返回可用内容")
+    return cleaned
+
+
+async def _generate_step2_target_content(
+    db: AsyncSession,
+    user_id: str,
+    target: str,
+    original_content: str,
+    model: str,
+) -> str:
+    groups = _build_step2_episode_groups(original_content)
+    if not groups:
+        raise RuntimeError("剧本内容为空")
+    system_prompt = _STEP2_TARGET_PROMPTS[target]
+    merge_prompt = _STEP2_TARGET_MERGE_PROMPTS[target]
+    chunk_outputs: list[str] = []
+    total = len(groups)
+    for index, group_text in enumerate(groups, start=1):
+        user_prompt = (
+            f"以下是剧本分片 {index}/{total}。请严格依据原文执行提取，保持格式稳定。"
+            f"\n\n【剧本分片】\n{group_text}"
+        )
+        chunk_outputs.append(
+            await _call_text_generation_once(
+                db,
+                user_id,
+                model,
+                system_prompt,
+                user_prompt,
+                temperature=0.1,
+                max_tokens=36000,
+            )
+        )
+
+    merge_blocks: list[str] = []
+    current_len = 0
+    merge_round_inputs = chunk_outputs
+    force_single_merge = target == "prop"
+    while True:
+        if len(merge_round_inputs) == 1 and not force_single_merge:
+            return merge_round_inputs[0].strip()
+        force_single_merge = False
+        next_round_outputs: list[str] = []
+        merge_blocks = []
+        current_len = 0
+        for index, item in enumerate(merge_round_inputs, start=1):
+            piece = f"=== 分片结果 {index} ===\n{item.strip()}"
+            estimated = len(piece) + 4
+            if merge_blocks and current_len + estimated > _STEP2_MAX_MERGE_INPUT_CHARS:
+                merge_user_prompt = "\n\n".join(merge_blocks).strip()
+                next_round_outputs.append(
+                    await _call_text_generation_once(
+                        db,
+                        user_id,
+                        model,
+                        merge_prompt,
+                        merge_user_prompt,
+                        temperature=0.0,
+                        max_tokens=36000,
+                    )
+                )
+                merge_blocks = []
+                current_len = 0
+            merge_blocks.append(piece)
+            current_len += estimated
+        if merge_blocks:
+            merge_user_prompt = "\n\n".join(merge_blocks).strip()
+            next_round_outputs.append(
+                await _call_text_generation_once(
+                    db,
+                    user_id,
+                    model,
+                    merge_prompt,
+                    merge_user_prompt,
+                    temperature=0.0,
+                    max_tokens=36000,
+                )
+            )
+        merge_round_inputs = next_round_outputs
+
+
+async def _modify_step2_target_content(
+    db: AsyncSession,
+    user_id: str,
+    target: str,
+    resources_content: str,
+    instruction: str,
+    model: str,
+) -> str:
+    label = _STEP2_TARGET_LABELS[target]
+    system_prompt = (
+        f"你是专业的短剧{label}整理助手。请根据用户的修改要求，直接改写当前{label}提取结果。"
+        f"保持当前{label}结果的结构化格式，不要输出解释。"
+    )
+    user_prompt = f"【当前{label}提取结果】\n{resources_content}\n\n【修改要求】\n{instruction}"
+    return await _call_text_generation_once(
+        db,
+        user_id,
+        model,
+        system_prompt,
+        user_prompt,
+        temperature=0.1,
+        max_tokens=24000,
+    )
+
+
+def _get_step2_save_lock(project_id: str) -> asyncio.Lock:
+    lock = _step2_save_locks.get(project_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _step2_save_locks[project_id] = lock
+    return lock
+
+
+async def _save_step2_target_result(
+    db: AsyncSession,
+    project_id: str,
+    target: str,
+    target_content: str,
+    original_content: str,
+) -> int:
+    async with _get_step2_save_lock(project_id):
+        latest = await get_active_script(db, project_id)
+        latest_full_content = str(latest.content or "") if latest else ""
+        latest_resources = ""
+        latest_original = str(original_content or "")
+        if _STEP2_SEPARATOR in latest_full_content:
+            latest_resources, latest_original = latest_full_content.split(_STEP2_SEPARATOR, 1)
+        elif latest_full_content.strip() and not latest_original.strip():
+            latest_original = latest_full_content
+        sections = _split_step2_resources_sections(latest_resources)
+        sections[target] = str(target_content or "").strip()
+        resources_text = _compose_step2_resources_sections(sections)
+        full_content = f"{resources_text}{_STEP2_SEPARATOR}{latest_original}"
+        if latest and full_content == latest_full_content:
+            return int(latest.version or 0)
+        saved = await save_script(db, project_id, full_content, None, None, None, None)
+        return int(saved.version) if saved else int(latest.version or 0) if latest else 0
+
+
 async def _generate_script_once(
     db: AsyncSession,
     user_id: str,
@@ -199,12 +761,13 @@ async def _run_step2_task(task_id: str) -> None:
             await mark_async_task_running(db, task)
             payload = json.loads(task.payload_json or "{}") if task.payload_json else {}
             op = str(payload.get("op") or "").strip().lower()
+            target = _normalize_step2_target(payload.get("target"))
             project_id = str(task.project_id)
             user_id = str(task.user_id)
             original_content = str(payload.get("original_content") or "")
             resources_content = str(payload.get("resources_content") or "")
             model = str(payload.get("model") or "").strip() or _OPENROUTER_TEXT_MODEL
-            instruction = str(payload.get("instruction") or "")
+            instruction = str(payload.get("instruction") or "").strip()
 
             if op == "sync":
                 if original_content or resources_content:
@@ -222,35 +785,52 @@ async def _run_step2_task(task_id: str) -> None:
                 )
                 return
 
-            mode = "extract_resources" if op == "extract" else "step2_modify"
-            base_content = original_content if op == "extract" else resources_content
-            if not base_content.strip():
-                raise RuntimeError("内容为空")
+            if not target:
+                raise RuntimeError("缺少提取目标")
 
-            generated = await _generate_script_once(
-                db,
-                user_id,
-                ScriptGenerateRequest(
-                    mode=mode,
-                    content=base_content,
-                    model=model,
-                    instruction=instruction or None,
-                    stream=False,
-                ),
-                project_id,
-            )
-            cleaned_resources = _strip_thinking_content(generated.get("content") or "")
-            if not cleaned_resources:
+            if op == "extract":
+                if not original_content.strip():
+                    raise RuntimeError("内容为空")
+                cleaned_resources = await _generate_step2_target_content(
+                    db,
+                    user_id,
+                    target,
+                    original_content,
+                    model,
+                )
+            elif op == "modify":
+                if not resources_content.strip():
+                    raise RuntimeError("内容为空")
+                if not instruction:
+                    raise RuntimeError("修改要求为空")
+                cleaned_resources = await _modify_step2_target_content(
+                    db,
+                    user_id,
+                    target,
+                    resources_content,
+                    instruction,
+                    model,
+                )
+            else:
+                raise RuntimeError("不支持的任务操作")
+
+            if not cleaned_resources.strip():
                 raise RuntimeError("模型未返回可用内容")
-            full_content = f"{cleaned_resources}{_STEP2_SEPARATOR}{original_content}"
-            saved = await save_script(db, project_id, full_content, None, None, None, None)
+            version = await _save_step2_target_result(
+                db,
+                project_id,
+                target,
+                cleaned_resources,
+                original_content,
+            )
             await mark_async_task_completed(
                 db,
                 task,
                 {
                     "op": op,
+                    "target": target,
                     "content": cleaned_resources,
-                    "version": int(saved.version) if saved else 0,
+                    "version": version,
                 },
             )
         except Exception as exc:
@@ -264,110 +844,8 @@ async def _build_storyboard_prompt_user_content(
     instruction: Optional[str],
     episode_index: Optional[int] = None,
 ) -> str:
-    assets = await list_assets(db, project_id)
-    asset_context = ""
-    if assets:
-        valid_asset_types = ["CHARACTER_LOOK", "PROP", "SCENE"]
-        all_candidate_assets = [a for a in assets if a.type in valid_asset_types]
-        filtered_assets = list(all_candidate_assets)
-        if episode_index is not None and episode_index >= 0:
-            target_episode_no = episode_index + 1
-            episode_assets = []
-            for item in all_candidate_assets:
-                desc_text = str(item.description or "")
-                if _episode_text_mentions_all(desc_text):
-                    episode_assets.append(item)
-                    continue
-                episodes = _extract_episode_numbers(desc_text)
-                if target_episode_no in episodes:
-                    episode_assets.append(item)
-            filtered_assets = episode_assets
-            if not filtered_assets and all_candidate_assets:
-                logger.warning(
-                    "No episode-scoped assets matched by 出场集数, fallback to all whitelisted assets. project_id=%s episode=%s total_assets=%s",
-                    project_id,
-                    target_episode_no,
-                    len(all_candidate_assets),
-                )
-                filtered_assets = list(all_candidate_assets)
-
-        if filtered_assets:
-            asset_context = "【可用素材库】\n请在生成分镜时，严格只使用以下素材。若名称不在下方白名单中，视为非法虚构，禁止输出。\n"
-            type_mapping = {
-                "CHARACTER_LOOK": "角色形象",
-                "PROP": "道具",
-                "SCENE": "场景"
-            }
-            for asset in filtered_assets:
-                desc = asset.description or "无描述"
-                type_display = type_mapping.get(asset.type, asset.type)
-                asset_context += f"- [{type_display}] {asset.name} (ID: {asset.id}): {desc}\n"
-
-            look_assets = [a for a in filtered_assets if a.type == "CHARACTER_LOOK"]
-            prop_assets = [a for a in filtered_assets if a.type == "PROP"]
-            scene_assets = [a for a in filtered_assets if a.type == "SCENE"]
-
-            asset_context += "\n【素材白名单（强制）】\n"
-            if look_assets:
-                asset_context += "可用角色形象（仅可从以下选择，禁止新增/改写/简称）：\n"
-                for look_asset in look_assets:
-                    look_full_name = str(look_asset.name or "").strip()
-                    asset_context += f"- {look_full_name}[AssetID:{look_asset.id}]\n"
-            else:
-                asset_context += "可用角色形象：无\n"
-
-            if prop_assets:
-                asset_context += "可用道具（仅可从以下选择，禁止新增/改写/别名）：\n"
-                for prop_asset in prop_assets:
-                    prop_name = str(prop_asset.name or "").strip()
-                    asset_context += f"- {prop_name}[AssetID:{prop_asset.id}]\n"
-            else:
-                asset_context += "可用道具：无\n"
-
-            if scene_assets:
-                asset_context += "可用场景（仅可从以下选择，禁止新增/改写/别名）：\n"
-                for scene_asset in scene_assets:
-                    scene_name = str(scene_asset.name or "").strip()
-                    asset_context += f"- {scene_name}[AssetID:{scene_asset.id}]\n"
-            else:
-                asset_context += "可用场景：无\n"
-
-            asset_context += (
-                "\n【强制约束】\n"
-                "1) 角色形象列、镜头调度与内容融合列、台词角色标识中，凡涉及角色主体，必须直接使用“角色形象全名”，禁止使用“汪老板/冯硕”等简称。\n"
-                "2) 角色形象列只允许填写白名单中的角色形象全名及其AssetID；若该镜头无角色，填“无”。\n"
-                "3) 道具列只允许填写白名单道具及其AssetID；若无道具填“无”；若剧情需要但白名单缺失，填“缺失道具:xxx（待补素材）”，且不得附AssetID。\n"
-                "4) 场景列只允许填写白名单场景及其AssetID；若剧情需要但白名单缺失，填“缺失场景:xxx（待补素材）”，且不得附AssetID。\n"
-                "5) 禁止输出任何白名单之外的角色形象/道具/场景名称；一旦出现即判定为错误输出。\n"
-            )
-            asset_context += "\n"
-            logger.info(f"Attached {len(filtered_assets)} assets to storyboard prompt (filtered from {len(assets)})")
-        elif episode_index is not None and episode_index >= 0:
-            logger.info("No assets available for storyboard prompt. project_id=%s episode=%s", project_id, episode_index + 1)
-
-    style_instruction = (instruction or "").strip()
-    style_block = f"【全局风格要求】\n{style_instruction}\n\n" if style_instruction else ""
-
-    base_prompt = (
-        f"{style_block}"
-        f"{asset_context}"
-        f"请将以下剧本转换为分镜脚本：\n\n{content}\n\n"
-    )
-    if not asset_context:
-        return base_prompt
-
-    return (
-        f"{base_prompt}"
-        "【再次提醒】\n"
-        "时间轴单行时长必须在3~15秒，禁止把7~8秒作为默认折中值；"
-        "同画面与同场景的连续动作优先在15秒范围内合并成长镜头，接近15秒再切分。\n"
-        "只要有台词，必须逐句标注角色名与起止秒（开始秒-结束秒），并在该句中写清说话时的表情变化、眼神指向和语气/音量/语速。\n"
-        "请务必使用素材库中的AssetID标记角色、道具和场景。严禁省略。"
-        "如果某个角色/道具/场景在素材库中存在，必须附带 `[AssetID:xxx]`，否则视为错误。"
-        "如果同一镜头出现多个角色，角色形象列必须逐个列出所有角色形象，且每个角色都要附带各自的 `[AssetID:xxx]`。"
-        "角色形象列只允许输出“角色形象全名[AssetID:xxx]”列表，不允许追加任何外观长描述、出场集数或解释性文本。"
-        "镜头调度与内容融合中的台词角色标识也必须直接使用“角色形象全名”。"
-    )
+    del db, project_id, instruction, episode_index
+    return str(content or "").strip()
 
 
 async def _run_storyboard_task(task_id: str) -> None:
@@ -387,6 +865,7 @@ async def _run_storyboard_task(task_id: str) -> None:
                 int(task.get("episode_index") or 0),
             )
             content_chunks: list[str] = []
+            reasoning_chunks: list[str] = []
             async for chunk in create_chat_completion_stream(
                 session,
                 task["user_id"],
@@ -398,6 +877,7 @@ async def _run_storyboard_task(task_id: str) -> None:
                     ],
                     "temperature": 0.2,
                     "max_tokens": 120000,
+                    "thinking": {"type": "disabled"},
                 },
             ):
                 if isinstance(chunk, str):
@@ -412,17 +892,51 @@ async def _run_storyboard_task(task_id: str) -> None:
                 first_choice = choices[0] if isinstance(choices[0], dict) else {}
                 delta = first_choice.get("delta") if isinstance(first_choice, dict) else None
                 piece = None
+                reason_piece = None
                 if isinstance(delta, dict):
-                    piece = delta.get("content") or delta.get("reasoning_content")
-                if not piece and isinstance(first_choice.get("message"), dict):
+                    piece = delta.get("content")
+                    reason_piece = delta.get("reasoning_content")
+                if isinstance(first_choice.get("message"), dict):
                     msg_obj = first_choice.get("message")
-                    piece = msg_obj.get("content") or msg_obj.get("reasoning_content")
+                    if not piece:
+                        piece = msg_obj.get("content")
+                    if not reason_piece:
+                        reason_piece = msg_obj.get("reasoning_content")
                 if piece:
                     content_chunks.append(str(piece))
-            generated = "".join(content_chunks).strip()
+                if reason_piece:
+                    reasoning_chunks.append(str(reason_piece))
+
+            raw_content = "".join(content_chunks)
+            raw_reasoning = "".join(reasoning_chunks)
+            thinking_text = _extract_storyboard_thinking_text(raw_content, raw_reasoning)
+            generated = _sanitize_storyboard_markdown(raw_content)
+            if (not generated or not _contains_markdown_table(generated)) and thinking_text:
+                combined_candidate = _sanitize_storyboard_markdown(f"{raw_content}\n\n{thinking_text}")
+                if _contains_markdown_table(combined_candidate):
+                    generated = combined_candidate
             if not generated:
+                if raw_content.strip() or thinking_text.strip():
+                    logger.warning(
+                        "Storyboard empty after sanitize task_id=%s episode_index=%s raw_content_head=%s raw_reasoning_head=%s",
+                        task_id,
+                        task.get("episode_index"),
+                        raw_content[:300].replace("\n", "\\n"),
+                        thinking_text[:300].replace("\n", "\\n"),
+                    )
+                    raise RuntimeError("分镜生成失败：上游仅返回思考内容，未返回可用表格，请重试")
                 raise RuntimeError("分镜生成结果为空（上游返回空内容）")
-            logger.info("Storyboard task completed task_id=%s project_id=%s episode_index=%s content_len=%s", task_id, task["project_id"], task["episode_index"], len(generated))
+            if not _contains_markdown_table(generated):
+                logger.warning(
+                    "Storyboard non-table task_id=%s episode_index=%s content_head=%s reasoning_head=%s",
+                    task_id,
+                    task.get("episode_index"),
+                    generated[:300].replace("\n", "\\n"),
+                    thinking_text[:300].replace("\n", "\\n"),
+                )
+                raise RuntimeError("分镜生成失败：模型返回非表格内容，请重试")
+            generated = _ensure_storyboard_system_columns(generated)
+            logger.info("Storyboard task completed task_id=%s project_id=%s episode_index=%s content_len=%s thinking_len=%s", task_id, task["project_id"], task["episode_index"], len(generated), len(thinking_text))
 
             script = await get_active_script(session, task["project_id"])
             episodes: list[dict[str, Any]] = []
@@ -438,6 +952,7 @@ async def _run_storyboard_task(task_id: str) -> None:
             target["storyboardTaskId"] = task_id
             target["storyboardTaskStatus"] = "completed"
             target["storyboardTaskError"] = ""
+            target["storyboardTaskThinking"] = thinking_text
             episodes[index] = target
             storyboard_text = _build_storyboard_text_from_episodes(episodes)
             await save_script(
@@ -453,6 +968,7 @@ async def _run_storyboard_task(task_id: str) -> None:
                 latest = _storyboard_tasks.get(task_id) or {}
                 latest["status"] = "completed"
                 latest["content"] = generated
+                latest["thinking"] = thinking_text
                 latest["error"] = ""
                 latest["finished_at"] = datetime.utcnow().isoformat()
                 _storyboard_tasks[task_id] = latest
@@ -478,6 +994,7 @@ async def _run_storyboard_task(task_id: str) -> None:
                     target["storyboardTaskId"] = task_id
                     target["storyboardTaskStatus"] = "failed"
                     target["storyboardTaskError"] = str(exc)
+                    target["storyboardTaskThinking"] = str((latest.get("thinking") if isinstance(latest, dict) else "") or "")
                     episodes[index] = target
                     await save_script(session, task["project_id"], None, None, None, None, episodes)
         except Exception:
@@ -494,6 +1011,8 @@ async def start_step2_task(
     project = await get_project(db, user_id, project_id)
     if not project:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="项目不存在")
+    if payload.op in {"extract", "modify"} and not payload.target:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="缺少提取目标")
 
     task = await create_async_task(
         db,
@@ -502,6 +1021,7 @@ async def start_step2_task(
         task_type=_STEP2_TASK_TYPE,
         payload={
             "op": payload.op,
+            "target": payload.target,
             "original_content": payload.original_content,
             "resources_content": payload.resources_content,
             "model": payload.model,
@@ -597,8 +1117,7 @@ async def update_script(
         payload.outline,
         payload.episodes
     )
-    from app.services.media_storage import upload_script_snapshot_to_cos
-
+    episodes_payload = json.loads(script.episodes) if script.episodes else None
     snapshot = "\n\n".join(
         part
         for part in (
@@ -608,19 +1127,21 @@ async def update_script(
         )
         if (part or "").strip()
     )
-    await upload_script_snapshot_to_cos(project_id, script.version, snapshot or (script.content or ""))
-    return ScriptResponse(
-        id=script.id,
-        project_id=project_id,
-        content=script.content,
-        thinking=script.thinking,
-        storyboard=script.storyboard,
-        outline=script.outline,
-        episodes=json.loads(script.episodes) if script.episodes else None,
-        version=script.version,
-        is_active=script.is_active,
-        created_at=script.created_at.isoformat() if script.created_at else None,
-    )
+    state_payload = {
+        "id": script.id,
+        "project_id": project_id,
+        "content": script.content,
+        "thinking": script.thinking,
+        "storyboard": script.storyboard,
+        "outline": script.outline,
+        "episodes": episodes_payload,
+        "version": script.version,
+        "is_active": script.is_active,
+        "created_at": script.created_at.isoformat() if script.created_at else None,
+    }
+    state_url = await media_storage.upload_script_state_to_cos(project_id, script.version, state_payload)
+    markdown_url = await media_storage.upload_script_snapshot_to_cos(project_id, script.version, snapshot or (script.content or ""))
+    return _build_script_response(script, project_id, state_url=state_url, markdown_url=markdown_url)
 
 
 @router.get("/{project_id}/script/history", response_model=ScriptHistoryResponse)
@@ -732,6 +1253,7 @@ async def start_storyboard_task(
                 "model": model,
                 "status": "pending",
                 "content": None,
+                "thinking": None,
                 "error": None,
                 "created_at": datetime.utcnow().isoformat(),
                 "started_at": None,
@@ -761,6 +1283,7 @@ async def start_storyboard_task(
         target["storyboardTaskId"] = str(existing_task["task_id"])
         target["storyboardTaskStatus"] = status_value
         target["storyboardTaskError"] = ""
+        target["storyboardTaskThinking"] = str(existing_task.get("thinking") or "")
         episodes[episode_index] = target
         await save_script(db, project_id, None, None, None, None, episodes)
 
@@ -771,6 +1294,7 @@ async def start_storyboard_task(
         episode_title=episode_title,
         status=status_value if status_value in {"pending", "running", "completed", "failed"} else "running",
         content=existing_task.get("content"),
+        thinking=existing_task.get("thinking"),
         error=existing_task.get("error"),
     )
 
@@ -807,6 +1331,7 @@ async def get_storyboard_task_status(
                 episode_title=str(episode.get("title") or f"第{index + 1}集"),
                 status=status_value,
                 content=str(episode.get("storyboard") or "") if status_value == "completed" else None,
+                thinking=str(episode.get("storyboardTaskThinking") or "") if status_value in {"completed", "failed"} else None,
                 error=str(episode.get("storyboardTaskError") or "") if status_value == "failed" else None,
             )
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="任务不存在")
@@ -820,6 +1345,7 @@ async def get_storyboard_task_status(
         episode_title=str(task.get("episode_title") or ""),
         status=status_value,
         content=str(task.get("content") or "") if status_value == "completed" else None,
+        thinking=str(task.get("thinking") or "") if status_value in {"completed", "failed"} else None,
         error=str(task.get("error") or "") if status_value == "failed" else None,
     )
 
@@ -946,6 +1472,8 @@ async def generate_script(
                     thinking = str(message_obj.get("reasoning_content") or "").strip()
         if not content:
             raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="模型未返回可用内容，请稍后重试")
+        if payload.mode == "generate_storyboard":
+            content = _ensure_storyboard_system_columns(content)
         return {"content": content, "thinking": thinking}
 
     async def event_generator():

@@ -33,6 +33,8 @@ class ScriptResponse(BaseModel):
     version: Optional[int] = None
     is_active: Optional[bool] = None
     created_at: Optional[str] = None
+    state_url: Optional[str] = None
+    markdown_url: Optional[str] = None
 
 
 class ScriptValidationResponse(BaseModel):
@@ -73,6 +75,7 @@ class StoryboardTaskStatusResponse(BaseModel):
     episode_title: str
     status: Literal["pending", "running", "completed", "failed"]
     content: Optional[str] = None
+    thinking: Optional[str] = None
     error: Optional[str] = None
 
 
@@ -85,8 +88,12 @@ class AsyncTaskStatusResponse(BaseModel):
     error: Optional[str] = None
 
 
+Step2TaskTarget = Literal["character", "prop", "scene"]
+
+
 class Step2TaskStartRequest(BaseModel):
     op: Literal["extract", "modify", "sync"]
+    target: Optional[Step2TaskTarget] = None
     original_content: Optional[str] = None
     resources_content: Optional[str] = None
     model: Optional[str] = None

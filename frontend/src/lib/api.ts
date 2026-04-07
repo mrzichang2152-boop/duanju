@@ -278,6 +278,7 @@ export interface Episode {
   storyboardTaskId?: string;
   storyboardTaskStatus?: "pending" | "running" | "completed" | "failed";
   storyboardTaskError?: string;
+  storyboardTaskThinking?: string;
   dialogueCellAudioMap?: Record<string, Array<{ text: string; audioUrl: string }>>;
   isThinkingCollapsed?: boolean;
 }
@@ -294,19 +295,53 @@ export type ScriptResponse = {
   version?: number;
   is_active?: boolean;
   created_at?: string;
+  state_url?: string;
+  markdown_url?: string;
 };
 
-export const getScript = (token: string, id: string) =>
-  request<ScriptResponse>(`/projects/${id}/script`, {}, token);
+const hydrateScriptResponseFromStateUrl = async (payload: ScriptResponse): Promise<ScriptResponse> => {
+  const stateUrl = String(payload?.state_url || "").trim();
+  if (!stateUrl) {
+    return payload;
+  }
+  try {
+    const response = await fetch(stateUrl, { cache: "no-store" });
+    if (!response.ok) {
+      return payload;
+    }
+    const remote = (await response.json()) as Partial<ScriptResponse>;
+    return {
+      ...payload,
+      ...remote,
+      state_url: payload.state_url,
+      markdown_url: payload.markdown_url,
+    };
+  } catch {
+    return payload;
+  }
+};
 
-export const saveScript = (token: string, id: string, content?: string, thinking?: string, storyboard?: string, outline?: string, episodes?: ScriptEpisodePayload[]) =>
-  request<ScriptResponse>(
-    `/projects/${id}/script`,
-    {
-      method: "POST",
-      body: JSON.stringify({ content, thinking, storyboard, outline, episodes }),
-    },
-    token
+export const getScript = async (token: string, id: string) =>
+  hydrateScriptResponseFromStateUrl(await request<ScriptResponse>(`/projects/${id}/script`, {}, token));
+
+export const saveScript = async (
+  token: string,
+  id: string,
+  content?: string,
+  thinking?: string,
+  storyboard?: string,
+  outline?: string,
+  episodes?: ScriptEpisodePayload[]
+) =>
+  hydrateScriptResponseFromStateUrl(
+    await request<ScriptResponse>(
+      `/projects/${id}/script`,
+      {
+        method: "POST",
+        body: JSON.stringify({ content, thinking, storyboard, outline, episodes }),
+      },
+      token
+    )
   );
 
 export type ScriptValidation = {
@@ -358,6 +393,7 @@ export type StoryboardTaskStatusResponse = {
   episode_title: string;
   status: "pending" | "running" | "completed" | "failed";
   content?: string | null;
+  thinking?: string | null;
   error?: string | null;
 };
 
@@ -370,8 +406,11 @@ export type AsyncTaskStatusResponse = {
   error?: string | null;
 };
 
+export type Step2TaskTarget = "character" | "prop" | "scene";
+
 export type Step2TaskStartPayload = {
   op: "extract" | "modify" | "sync";
+  target?: Step2TaskTarget;
   original_content?: string;
   resources_content?: string;
   model?: string;
@@ -582,6 +621,7 @@ export type Asset = {
   model?: string | null;
   size?: string | null;
   style?: string | null;
+  base_character_name?: string | null;
   versions: AssetVersion[];
 };
 
@@ -641,6 +681,27 @@ export const generateAssetSubject = (
     {
       method: "POST",
       body: payload ? JSON.stringify(payload) : undefined,
+    },
+    token,
+    SUBJECT_GENERATE_TIMEOUT_MS
+  );
+
+export const generateImageSubject = (
+  token: string,
+  projectId: string,
+  payload: {
+    image_url: string;
+    character_name: string;
+    material_name?: string;
+    material_description?: string;
+    allow_without_voice?: boolean;
+  }
+) =>
+  request<{ status: string; subject_id: string }>(
+    `/projects/${projectId}/kling-subjects/from-image`,
+    {
+      method: "POST",
+      body: JSON.stringify(payload),
     },
     token,
     SUBJECT_GENERATE_TIMEOUT_MS
@@ -1008,7 +1069,7 @@ export const getSegments = (token: string, id: string) =>
 export const generateSegment = (
   token: string,
   projectId: string,
-  payload: { segment_id?: string; prompt?: string; model?: string; options?: Record<string, unknown>; user_selected_row_index?: number }
+  payload: { segment_id?: string; prompt?: string; model?: string; options?: Record<string, unknown> }
 ) =>
   request<{ status: string }>(
     `/projects/${projectId}/segments/generate`,
@@ -1023,7 +1084,7 @@ export const generateSegment = (
 export const generateSegmentFrameImage = (
   token: string,
   projectId: string,
-  payload: { prompt: string; references?: string[]; frame_type?: "first" | "last"; aspect_ratio?: string; model?: string }
+  payload: { prompt: string; references?: string[]; frame_type?: string; aspect_ratio?: string; model?: string }
 ) =>
   request<AsyncTaskStatusResponse>(
     `/projects/${projectId}/segments/frame-images/generate`,
@@ -1040,6 +1101,17 @@ export const getSegmentFrameImageTaskStatus = (token: string, projectId: string,
     `/projects/${projectId}/segments/frame-images/tasks/${taskId}`,
     {},
     token
+  );
+
+export const deleteSegmentFrameImage = (token: string, projectId: string, imageUrl: string) =>
+  request<{ status: string }>(
+    `/projects/${projectId}/segments/frame-images/delete`,
+    {
+      method: "POST",
+      body: JSON.stringify({ image_url: imageUrl }),
+    },
+    token,
+    REQUEST_TIMEOUT_MS
   );
 
 export const selectSegmentVersion = (

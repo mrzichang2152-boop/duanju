@@ -5,6 +5,7 @@ import logging
 import base64
 import uuid
 import asyncio
+import hashlib
 import httpx
 from pydantic import BaseModel
 from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File
@@ -37,6 +38,12 @@ from app.services.assets import (
     _sanitize_step2_metadata,
 )
 from app.services import media_storage
+from app.services.character_image_bindings import (
+    derive_base_character_name_from_asset,
+    list_character_image_bindings_by_urls,
+    resolve_image_bound_base_character_name,
+    upsert_character_image_binding,
+)
 from app.services.linkapi import (
     _get_or_create_character_subject_id,
     _normalize_role_key,
@@ -158,11 +165,21 @@ async def fetch_assets(
     assets = await list_assets(db, project_id)
     character_names = [str(item.name or "").strip() for item in assets if item.type == "CHARACTER"]
 
+    all_versions_by_asset_id: dict[str, list[AssetVersion]] = {}
+    binding_image_candidates: list[str] = []
+    for asset in assets:
+        versions = await list_asset_versions(db, asset.id)
+        all_versions_by_asset_id[str(asset.id)] = versions
+        binding_image_candidates.extend(
+            [str(item.image_url or "").strip() for item in versions if str(item.image_url or "").strip()]
+        )
+    binding_map = await list_character_image_bindings_by_urls(db, project_id, binding_image_candidates)
+
     responses: list[AssetResponse] = []
     has_version_url_updated = False
     has_asset_meta_updated = False
     for asset in assets:
-        versions = await list_asset_versions(db, asset.id)
+        versions = list(all_versions_by_asset_id.get(str(asset.id), []))
         if len(versions) > 30:
             selected_version = next((item for item in versions if item.is_selected), None)
             tail_versions = versions[-30:]
@@ -175,9 +192,19 @@ async def fetch_assets(
             image_url = str(version.image_url or "").strip()
             if image_url.startswith("data:image"):
                 try:
-                    image_url = await download_image_as_local_file(
-                        image_url, filename_base=f"{asset.id}_{version.id}"
-                    )
+                    if media_storage.cos_enabled():
+                        image_bytes, content_type = media_storage.decode_data_image_url(image_url)
+                        image_url = await media_storage.upload_bytes_under_project_to_cos(
+                            project_id,
+                            "assets",
+                            image_bytes,
+                            content_type,
+                            filename_hint=f"{asset.id}_{version.id}.png",
+                        )
+                    else:
+                        image_url = await download_image_as_local_file(
+                            image_url, filename_base=f"{asset.id}_{version.id}"
+                        )
                     if image_url != version.image_url:
                         version.image_url = image_url
                         has_version_url_updated = True
@@ -267,6 +294,17 @@ async def fetch_assets(
                 asset.description = normalized_desc
                 has_asset_meta_updated = True
 
+        selected_or_latest_version = next((item for item in versions if item.is_selected and str(item.image_url or "").strip()), None)
+        if not selected_or_latest_version:
+            selected_or_latest_version = next((item for item in versions if str(item.image_url or "").strip()), None)
+        representative_image_url = str(selected_or_latest_version.image_url or "").strip() if selected_or_latest_version else ""
+        binding_row = binding_map.get(representative_image_url)
+        response_base_character_name = ""
+        if binding_row and str(binding_row.base_character_name or "").strip():
+            response_base_character_name = str(binding_row.base_character_name or "").strip()
+        elif asset.type in {"CHARACTER", "CHARACTER_LOOK"}:
+            response_base_character_name = derive_base_character_name_from_asset(asset.type, response_name)
+
         responses.append(
             AssetResponse(
                 id=asset.id,
@@ -277,6 +315,7 @@ async def fetch_assets(
                 model=asset.model,
                 size=asset.size,
                 style=asset.style,
+                base_character_name=response_base_character_name or None,
                 versions=version_payloads,
                 created_at=asset.created_at,
             )
@@ -393,6 +432,7 @@ async def update_asset(
         model=updated_asset.model,
         size=updated_asset.size,
         style=updated_asset.style,
+        base_character_name=(derive_base_character_name_from_asset(updated_asset.type, updated_asset.name) or None),
         versions=[
             {
                 "id": version.id,
@@ -419,6 +459,11 @@ async def _generate_asset_sync(
     asset = await get_asset(db, asset_id)
     if not asset or asset.project_id != project_id:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="素材不存在")
+    if not media_storage.cos_enabled():
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="未配置腾讯云 COS，已禁止将生成图片落盘到服务器",
+        )
     if payload.prompt:
         prompt = payload.prompt
     else:
@@ -749,42 +794,78 @@ async def _generate_asset_sync(
     if not image_url:
         raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="生成失败")
 
-    # Download image to local static file
-    # Use asset_id + random suffix as filename base to ensure uniqueness and preserve history
-    # This satisfies "name by ID" (ID is part of filename) while allowing versioning
     filename_base = f"{asset_id}_{uuid.uuid4().hex[:8]}"
     image_url_text = str(image_url or "").strip()
     version_image_url = image_url_text
-    if image_url_text.startswith(("http://", "https://")):
-        try:
-            # 优先落本地静态文件，避免第三方图床防盗链导致前端白图/无法预览
-            version_image_url = await download_image_as_local_file(image_url_text, filename_base=filename_base)
-        except Exception as exc:
-            logger.warning(f"Image download skipped, keep remote URL for version: {exc}")
-    else:
-        try:
-            version_image_url = await download_image_as_local_file(image_url_text, filename_base=filename_base)
-        except Exception as exc:
-            logger.error(f"Image download failed after generation: {exc}", exc_info=True)
-            raise HTTPException(
-                status_code=status.HTTP_502_BAD_GATEWAY,
-                detail=f"图片下载失败，请重试: {exc}",
-            ) from exc
     if media_storage.cos_enabled():
         try:
-            if version_image_url.startswith("/static/"):
-                rel = version_image_url.replace("/static/", "", 1).lstrip("/")
-                abs_img = os.path.join(media_storage.backend_static_dir(), rel)
-                version_image_url = await media_storage.publish_local_file_under_static(project_id, abs_img)
-            elif version_image_url.startswith(("http://", "https://")):
-                version_image_url = await media_storage.mirror_http_url_to_cos(
-                    project_id, "assets", version_image_url
+            if image_url_text.startswith("data:image"):
+                image_bytes, content_type = media_storage.decode_data_image_url(image_url_text)
+                version_image_url = await media_storage.upload_bytes_under_project_to_cos(
+                    project_id,
+                    "assets",
+                    image_bytes,
+                    content_type,
+                    filename_hint=f"{filename_base}.png",
                 )
+            elif image_url_text.startswith(("http://", "https://")):
+                version_image_url = await media_storage.mirror_http_url_to_cos(
+                    project_id,
+                    "assets",
+                    image_url_text,
+                    strict=True,
+                )
+            elif image_url_text.startswith("/static/"):
+                rel = image_url_text.replace("/static/", "", 1).lstrip("/")
+                abs_img = os.path.join(media_storage.backend_static_dir(), rel)
+                version_image_url = await media_storage.publish_local_file_under_static(
+                    project_id,
+                    abs_img,
+                    strict=True,
+                    delete_local=True,
+                )
+            else:
+                raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="生成失败：图片地址格式不支持")
+        except HTTPException:
+            raise
         except Exception as exc:
-            # 镜像/发布失败不应让整次生成报错，保留原始可访问 URL 继续落库
-            logger.warning(f"COS mirror/publish skipped, keep original image URL: {exc}")
+            logger.error(f"Generated asset image upload to COS failed: {exc}", exc_info=True)
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail=f"图片上传 COS 失败，请重试: {exc}",
+            ) from exc
+        if not media_storage.is_cos_public_url(version_image_url):
+            raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="图片上传 COS 失败：未返回 COS 地址")
+    else:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="未配置腾讯云 COS，已禁止将生成图片落盘到服务器",
+        )
     await create_asset_version(db, asset_id, version_image_url, prompt)
-    
+
+    base_character_name = derive_base_character_name_from_asset(str(asset.type or ""), str(asset.name or ""))
+    if asset.type == "CHARACTER_LOOK" and ref_image_url:
+        bound_base_character_name = await resolve_image_bound_base_character_name(
+            db,
+            project_id,
+            ref_image_url,
+            asset_id=asset_id,
+            asset_type=str(asset.type or ""),
+            asset_name=str(asset.name or ""),
+        )
+        if bound_base_character_name:
+            base_character_name = bound_base_character_name
+    if base_character_name:
+        await upsert_character_image_binding(
+            db,
+            project_id,
+            version_image_url,
+            base_character_name,
+            asset_id=asset_id,
+            source_image_url=str(ref_image_url or "").strip(),
+        )
+        await db.commit()
+
     return StatusResponse(status="ready")
 
 
@@ -826,6 +907,11 @@ async def generate_asset(
     asset = await get_asset(db, asset_id)
     if not asset or asset.project_id != project_id:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="素材不存在")
+    if not media_storage.cos_enabled():
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="未配置腾讯云 COS，已禁止将生成图片落盘到服务器",
+        )
     task = await create_async_task(
         db,
         project_id=project_id,
@@ -910,17 +996,39 @@ async def upload_asset_image(
         ext = os.path.splitext(file.filename)[1].lower()
     if ext not in {".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp"}:
         ext = ".png"
-    current_dir = os.path.dirname(os.path.abspath(__file__))
-    static_dir = os.path.join(os.path.dirname(os.path.dirname(current_dir)), "static", "assets")
-    os.makedirs(static_dir, exist_ok=True)
     filename = f"{asset_id}_{uuid.uuid4().hex[:8]}{ext}"
-    filepath = os.path.join(static_dir, filename)
-    with open(filepath, "wb") as out:
-        out.write(raw)
-    upload_url = f"/static/assets/{filename}"
     if media_storage.cos_enabled():
-        upload_url = await media_storage.publish_local_file_under_static(project_id, filepath)
+        try:
+            upload_url = await media_storage.upload_bytes_under_project_to_cos(
+                project_id,
+                "assets",
+                raw,
+                file.content_type or "application/octet-stream",
+                filename_hint=filename,
+            )
+        except Exception as exc:
+            raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=f"上传 COS 失败: {exc}") from exc
+        if not media_storage.is_cos_public_url(upload_url):
+            raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="上传 COS 失败：未返回 COS 地址")
+    else:
+        current_dir = os.path.dirname(os.path.abspath(__file__))
+        static_dir = os.path.join(os.path.dirname(os.path.dirname(current_dir)), "static", "assets")
+        os.makedirs(static_dir, exist_ok=True)
+        filepath = os.path.join(static_dir, filename)
+        with open(filepath, "wb") as out:
+            out.write(raw)
+        upload_url = f"/static/assets/{filename}"
     await create_asset_version(db, asset_id, upload_url, f"upload:{file.filename or ''}")
+    base_character_name = derive_base_character_name_from_asset(str(asset.type or ""), str(asset.name or ""))
+    if base_character_name:
+        await upsert_character_image_binding(
+            db,
+            project_id,
+            upload_url,
+            base_character_name,
+            asset_id=asset_id,
+        )
+        await db.commit()
     await file.close()
     return StatusResponse(status="ready")
 
@@ -931,6 +1039,141 @@ class GenerateSubjectResponse(StatusResponse):
 
 class GenerateSubjectRequest(BaseModel):
     allow_without_voice: bool = False
+
+
+class GenerateImageSubjectRequest(BaseModel):
+    image_url: str
+    character_name: str
+    material_name: str | None = None
+    material_description: str | None = None
+    allow_without_voice: bool = False
+
+
+@router.post("/{project_id}/kling-subjects/from-image", response_model=GenerateSubjectResponse)
+async def generate_image_subject(
+    project_id: str,
+    payload: GenerateImageSubjectRequest,
+    user_id: str = Depends(get_current_user_id),
+    db: AsyncSession = Depends(get_db),
+) -> GenerateSubjectResponse:
+    project = await get_project(db, user_id, project_id)
+    if not project:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="项目不存在")
+
+    raw_image_url = str(payload.image_url or "").strip()
+    if not raw_image_url:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="角色形象图片地址不能为空")
+    resolved_role_name = _normalize_role_key(str(payload.character_name or "").strip())
+    if not resolved_role_name:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="基础角色名称不能为空")
+
+    image_url = ""
+    if media_storage.cos_enabled():
+        try:
+            normalized_raw = raw_image_url
+            if normalized_raw.startswith("data:image"):
+                localized = await download_image_as_local_file(
+                    normalized_raw,
+                    filename_base=f"frame_subject_{uuid.uuid4().hex[:8]}",
+                )
+                normalized_raw = localized
+            if normalized_raw.startswith("/static/"):
+                rel = normalized_raw.replace("/static/", "", 1).lstrip("/")
+                abs_img = os.path.join(media_storage.backend_static_dir(), rel)
+                image_url = await media_storage.publish_local_file_under_static(project_id, abs_img)
+            elif normalized_raw.startswith(("http://", "https://")):
+                if "myqcloud.com" in normalized_raw:
+                    image_url = normalized_raw
+                else:
+                    image_url = await media_storage.mirror_http_url_to_cos(project_id, "assets", normalized_raw)
+        except Exception as exc:
+            logger.warning(f"Step4 主体参考图自动发布 COS 失败，回退公共 URL 解析: {exc}")
+
+    if not image_url:
+        image_url = str(await _resolve_image_url(raw_image_url)).strip()
+    if not image_url.startswith(("http://", "https://")):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="主体参考图未解析为可公网访问 URL，请检查 COS 配置或重试",
+        )
+
+    voice_rows = await db.execute(select(CharacterVoice).where(CharacterVoice.project_id == project_id))
+    voices = list(voice_rows.scalars().all())
+    matched_voice = None
+    compact_role_name = resolved_role_name.replace(" ", "")
+    for voice in voices:
+        voice_name = str(voice.character_name or "").strip()
+        if not voice_name:
+            continue
+        if voice_name == resolved_role_name:
+            matched_voice = voice
+            break
+        if _normalize_role_key(voice_name) == _normalize_role_key(resolved_role_name):
+            matched_voice = voice
+            break
+        compact_voice_name = voice_name.replace(" ", "")
+        compact_voice_role = _normalize_role_key(voice_name).replace(" ", "")
+        if compact_voice_name and compact_role_name.startswith(compact_voice_name):
+            matched_voice = voice
+            break
+        if compact_voice_role and compact_role_name.startswith(compact_voice_role):
+            matched_voice = voice
+            break
+
+    if not matched_voice or not str(matched_voice.voice_id or "").strip():
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"请先为角色“{resolved_role_name}”上传音频并创建 Kling 音色，再生成主体",
+        )
+    if str(matched_voice.voice_type or "").strip().upper() != "KLING_CUSTOM":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"角色“{resolved_role_name}”尚未完成 Kling 自定义音色创建，请先在 Step3 上传角色音频",
+        )
+
+    kling_jwt, _kling_key_source = await resolve_kling_auth_token(db, user_id)
+    if not kling_jwt:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="系统未配置 Kling 鉴权 Key，请联系管理员配置",
+        )
+
+    allow_without_voice = bool(payload.allow_without_voice)
+    synthetic_asset_id = "frame-image:" + hashlib.sha1(
+        f"{resolved_role_name}|{image_url}".encode("utf-8")
+    ).hexdigest()
+    subject_item = {
+        "asset_id": synthetic_asset_id,
+        "role": "character",
+        "name": str(payload.material_name or "").strip() or resolved_role_name,
+        "description": str(payload.material_description or "").strip(),
+        "image_url": image_url,
+        "voice_id": "" if allow_without_voice else str(matched_voice.voice_id or "").strip(),
+    }
+    async with httpx.AsyncClient(timeout=120.0, trust_env=True) as client:
+        subject_id = await _get_or_create_character_subject_id(
+            db,
+            client,
+            kling_jwt,
+            project_id,
+            subject_item,
+            force_create=True,
+            allow_voice_fallback=False,
+        )
+
+    if not subject_id and not allow_without_voice:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "code": "VOICE_BIND_OPTIONAL_CONFIRM",
+                "message": "当前角色图未通过“音色绑定主体”检测。你可以继续生成“不绑定音色”的主体（成功率更高），或先更换更清晰的角色图后再试。",
+            },
+        )
+    if not subject_id:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="不绑定音色生成主体仍失败，请更换更清晰的角色图后重试")
+
+    await db.commit()
+    return GenerateSubjectResponse(status="ready", subject_id=subject_id)
 
 
 @router.post("/{project_id}/assets/{asset_id}/generate-subject", response_model=GenerateSubjectResponse)

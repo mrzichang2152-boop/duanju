@@ -8,6 +8,8 @@
 
 同步约定：`RULES.md`、`.trae/rules/project_rules.md`、`.codebuddy/rules/project_rules.md` 三处规则需保持语义一致，规则变更需同步更新。
 
+补充说明：项目执行细则以 `.codebuddy/rules/project_rules.md` 为基准（含“自动执行脚本”与“云实例识别”规则），并同步到 `.trae/rules/project_rules.md`。
+
 ## 1. 核心原则 (Core Principles)
 
 1.  **AI 友好 (AI-Friendly)**：

@@ -232,6 +232,10 @@
 - 2026-03-19 - 验证 - 后端执行 `python3 -m py_compile backend/app/services/linkapi.py` 通过；前端执行 `npm run lint && npm run typecheck` 通过（0 error，存在历史 warning）。
 - 2026-03-19 - 前后端 - 收敛为仅首帧链路：前端移除尾帧列识别与 `end_frame_asset_id` 透传；后端移除 `end_frame_asset_id` 与 `end_frame` 类型处理，素材引用仅保留 `first_frame` 与角色/场景/道具。
 - 2026-03-19 - 验证 - 后端执行 `python3 -m py_compile backend/app/services/linkapi.py` 通过；前端执行 `npm run lint && npm run typecheck` 通过（0 error，存在历史 warning）。
+- 2026-04-06 - 后端 - 重写 Step4 分段同步表格解析，支持从“镜头调度与内容/融合、画面描述、分镜、定格画面”等列稳定提取分段，修复“当前分镜还未同步到分段”前置报错。
+- 2026-04-06 - 前后端 - Step4 视频生成新增无 AssetID 的 inline 素材解析，角色/场景/道具图片可直接随分镜单元格一并透传到视频请求。
+- 2026-04-06 - 前后端 - 新增 Step4 角色形象图片创建 Kling 主体入口，并在 Kling 视频生成时优先复用已创建主体绑定音色，未创建主体时回退为图片参考。
+- 2026-04-06 - 验证 - 前端执行 `npm run lint` 通过（0 error / 26 warning）、`npm run typecheck` 通过；后端执行 `python3 -m py_compile backend/app/services/segments.py backend/app/services/linkapi.py backend/app/api/assets.py` 通过；执行 `npm run dev` 时检测到现有 Next 开发实例占用锁，进一步确认 `http://localhost:3000` 返回 200。
 - 2026-03-19 - 后端 - 强化分镜空间参照规则：在“镜头调度与内容融合”中新增坐标原点与轴线强制说明，禁止“左侧2米/右侧8米”无参照写法，要求量化距离绑定参照物并补充可执行坐标示例。
 - 2026-03-19 - 验证 - 后端执行 `python3 -m py_compile backend/app/core/script_prompts.py` 通过；前端执行 `npm run lint && npm run typecheck` 通过（0 error，存在历史 warning）。
 - 2026-03-19 - 后端 - 强化分镜时长策略：明确禁止将7~8秒作为默认折中时长，要求同场景连续内容优先合并为10~15秒长镜头，并在连续7~8秒分段时强制备注切分原因；同时在分镜生成接口追加同规则提醒。
@@ -313,6 +317,9 @@
 - 2026-03-20 - 后端 - 修复 Step5 重复“应用分割点”后分段音频未刷新：分段切片文件名改为携带区间毫秒戳（`segId_start_end.wav`），每次应用区间生成新静态 URL，避免浏览器复用旧缓存导致看似仅首次生效。
 - 2026-03-20 - 前端 - Step5 分段播放器增加基于音频 URL 的重建键，确保分段原音/提取人声/S2S 结果在 URL 变化时立即重建播放器并刷新时长与波形状态。
 - 2026-03-20 - 验证 - 后端执行 `python3 -m py_compile app/api/final.py` 通过；前端执行 `npm run lint`（0 error，17 warnings）与 `npm run typecheck` 通过。
+- 2026-04-04 - 前端 - 调整 Step4 素材管理弹窗：素材区新增“基础角色”并改正“角色形象”来源；上方素材卡片支持“应用至剧本”；生成区域默认折叠；所有首尾帧/场景/道具/远景生成图同步回流到上方素材区；下方生成图新增 COS 删除按钮。
+- 2026-04-04 - 后端 - Step4 帧图生成改为直接镜像上传腾讯云 COS，不再落地服务器；新增生成帧图 COS 删除接口与 COS URL 识别/删除能力。
+- 2026-04-04 - 验证 - 前端执行 `npm run lint -- src/app/components/ScriptEditor.tsx src/lib/api.ts`（0 error，保留 6 条历史/框架 warning）与 `npm run typecheck` 通过；后端执行 `python3 -m py_compile app/api/segments.py app/services/media_storage.py app/schemas/segments.py` 通过；执行 `npm run dev` 后 `http://127.0.0.1:3000` 返回 `200`。
 - 2026-03-20 - 后端 - Step5 调整“应用分割点”为追加模式：每次应用当前双线区间都会新建一条分段记录（递增 `seg-xxx`），不再覆盖已有分段；并保留历史分段的人声提取与 S2S 结果。
 - 2026-03-20 - 后端 - Step5 初次提取配音不再预置默认分段，分段列表仅在用户点击“应用分割点”后开始生成，避免首次即出现占位分段导致后续追加语义不一致。
 - 2026-03-20 - 验证 - 后端执行 `python3 -m py_compile app/api/final.py` 通过；前端执行 `npm run lint`（0 error，17 warnings）与 `npm run typecheck` 通过。
@@ -334,6 +341,44 @@
 - 2026-03-20 - 验证 - 前端执行 `npm run lint`（0 error，17 warnings）与 `npm run typecheck` 通过。
 - 2026-03-20 - 前后端 - Step3 音色库接入 Library 与官方标签筛选：后端合并 My Voices 与 Shared Voices 并保持分页，新增语言/口音/性别/年龄/质量筛选参数与筛选项回传；前端音色选择弹窗改为按官方标签筛选并展示对应标签信息。
 - 2026-03-20 - 验证 - 后端执行 `python3 -m py_compile backend/app/api/eleven_labs.py backend/app/services/eleven_labs.py` 通过；前端执行 `npm run lint`（0 error，17 warnings）与 `npm run typecheck` 通过。
+- 2026-04-04 - 前端 - 修复 Step4 分镜表素材图片溢出遮挡：单元格 Markdown 图片改为 `max-w-full` 约束，避免覆盖“素材管理”按钮与相邻列内容。
+- 2026-04-04 - 前端 - Step4 素材管理弹窗“应用至剧本”支持切换为“取消”，并改为同列可叠加多张引用图片（不再覆盖之前已应用图片）。
+- 2026-04-04 - 前端 - Step4 生成区域新增“素材名/素材描述”两个必填单行输入；应用到剧本时写入素材类型/名称/描述文本，用于分镜列表可读展示。
+- 2026-04-04 - 前端 - Step4 视频生成前清洗素材描述行，仅向模型透传素材类型与素材名（保留 AssetID 语义绑定）。
+- 2026-04-04 - 验证 - 在 `frontend` 执行 `npm run dev` 成功启动（Next.js，端口自动切换到 `3002`）。
+- 2026-04-04 - 前端 - Step4 分镜表“素材管理”按钮防遮挡增强：素材管理入口增加“角色”列，按钮改为 `sticky + z-index` 置顶，避免角色图覆盖入口。
+- 2026-04-04 - 前端 - Step4 分镜单元格图片渲染改为 `block + w-full + object-contain`，进一步约束图片布局，避免遮挡操作按钮。
+- 2026-04-04 - 验证 - 在 `frontend` 执行 `npm run dev` 成功启动（Next.js，端口 `3002`）。
+- 2026-04-04 - 前端 - Step4 生成区域新增“角色形象”生成 tab，支持按角色提示词直接生成人物形象图并进入素材管理可应用到剧本。
+- 2026-04-04 - 前端 - Step4 分镜单元格素材信息展示优化：隐藏 `素材类型` 与 `MATERIAL_REF_*` 标记行；图片下方仅以灰色小字展示素材名/素材描述内容本身（不再显示“素材名/素材描述”前缀）。
+- 2026-04-04 - 验证 - 在 `frontend` 执行 `npm run dev` 成功启动（Next.js，端口 `3002`）。
+- 2026-04-04 - 前端 - Step4 素材展示精简：分镜脚本渲染与解析阶段均隐藏 `素材描述` 行，图片下方仅展示素材名称内容（示例：`冯硕法探社 白天`）。
+- 2026-04-04 - 前端 - Step4 生成前校验增强：角色形象/首帧/尾帧/场景/道具生成及图片修改统一要求先填写“素材名称”，未填写时直接提示“请先输入素材名称”。
+- 2026-04-04 - 前端 - Step4 生成区表单调整：移除“素材描述”输入框，仅保留“素材名称（必填）”输入，避免误填与展示冗余。
+- 2026-04-04 - 验证 - 在 `frontend` 执行 `npm run dev` 成功启动（Next.js，端口 `3002`）。
+- 2026-04-04 - 前端 - Step4 素材管理卡片交互优化：点击上方素材图片改为直接打开大图预览，不再误触发“引用到提示词”。
+- 2026-04-04 - 前端 - Step4 分镜素材文案展示修复：素材名与素材描述在解析阶段自动合并为同一行展示（如“冯硕法探社 白天”），避免仅显示素材名。
+- 2026-04-04 - 验证 - 在 `frontend` 执行 `npm run dev` 成功启动（Next.js，端口 `3002`）。
+- 2026-04-04 - 前端 - Step4 分镜素材显示回归修复：恢复“素材描述”输入并写入生成元数据；自动带出关闭弹窗时首选图的名称/描述，避免只显示“场景/角色形象”或不显示素材名。
+- 2026-04-04 - 前端 - Step4 素材管理卡片补充交互：卡片上方图片点击始终走大图预览，保留底部按钮用于“引用到提示词/应用至剧本”。
+- 2026-04-04 - 验证 - 在 `frontend` 执行 `npm run dev` 成功启动（Next.js，端口 `3002`）。
+- 2026-04-04 - 前端 - Step4 自动回填素材文案修复：关闭素材弹窗自动写回剧本时，优先按已选图片 URL 回查真实素材条目，避免场景/道具列退回为通用占位名（如“场景”）。
+- 2026-04-04 - 验证 - 在 `frontend` 执行 `npm run dev` 成功启动（Next.js，端口 `3002`）。
+- 2026-04-04 - 前端 - Step4 素材列交互修复：含素材块的单元格改为单击不直接进入原始 Markdown 编辑，双击才编辑，避免误点后看到 `MATERIAL_REF_*` 原始标记。
+- 2026-04-04 - 前端 - Step4 素材图预览补齐：分镜单元格内 Markdown 图片支持直接点击大图预览，避免点击图片误触编辑态。
+- 2026-04-04 - 前端 - Step4 素材名称兜底修复：当历史剧本里仅写入通用占位名（如“场景”）时，渲染阶段会按图片 URL 回查真实素材名称/描述并展示。
+- 2026-04-04 - 前端 - Step4 生成表单默认值修正：打开素材弹窗时不再自动预填“场景/道具/角色形象”等通用名称，避免生成后灰字被写成占位名。
+- 2026-04-04 - 验证 - 在 `frontend` 执行 `npm run dev` 成功启动（Next.js，端口 `3002`）。
+- 2026-04-04 - 前端 - Step4 生成素材持久化增强：生成图片的名称/描述元数据同步写入本地持久状态，刷新后仍可用于灰字展示与素材弹窗回显。
+- 2026-04-04 - 前端 - Step4 素材弹窗回填修复：素材管理弹窗会从当前单元格脚本块回补已应用图片，避免历史已生成场景/道具图在弹窗中丢失。
+- 2026-04-04 - 前端 - Step4 分镜灰字兜底修复：当脚本块里只剩通用占位名（如“场景”）时，优先按图片 URL 回查已保存元数据/素材信息并展示真实名称与描述。
+- 2026-04-04 - 验证 - 在 `frontend` 执行 `npm run dev` 成功启动（Next.js，端口 `3002`）。
+- 2026-04-04 - 后端 - 媒体存储链路统一到 COS：Step3 素材生成/上传在已配置 COS 时改为直接上传到 COS 并落库公网 COS 地址，不再先写本地 `static/assets` 再回传前端。
+- 2026-04-04 - 后端 - Step4 剧本状态上云：保存剧本时同步上传 Markdown 快照与完整 JSON 状态到 COS，并在脚本接口返回 `state_url` / `markdown_url`。
+- 2026-04-04 - 前端 - Step4 剧本读取改为优先走 COS：`getScript` / `saveScript` 在拿到 `state_url` 后优先直接读取 COS JSON 状态，失败时再回退接口体。
+- 2026-04-04 - 后端 - Step4 视频返回收紧：分镜视频接口在拿到直出视频 URL 时要求先镜像到 COS，再写入版本记录。
+- 2026-04-04 - 验证 - 执行 `python3 -m py_compile backend/app/services/media_storage.py backend/app/api/assets.py backend/app/api/script.py backend/app/api/segments.py backend/app/schemas/script.py` 通过。
+- 2026-04-04 - 验证 - 在 `frontend` 执行 `npm run dev` 成功启动（Next.js，端口 `3002`）。
 - 2026-03-20 - 前端 - Step3 音色筛选交互优化：语言筛选项统一展示中文名称（如“汉语”“英语”）；口音筛选改为先选语言后展示对应口音，未选语言时不平铺口音标签。
 - 2026-03-20 - 验证 - 前端执行 `npm run lint`（0 error，17 warnings）与 `npm run typecheck` 通过。
 - 2026-03-20 - 前后端 - Step3 音色选择进一步优化：语言统一展示为中文（“中文”“英语”等），年龄统一为“青年/中年/老年”；中文口音补齐为官方口音集合并按“先选语言再选口音”联动；后端改为单页拉取 Shared Voices 并回传 has_more，显著降低初次加载时延，同时在列表中显式标识 Library 音色。
@@ -385,6 +430,8 @@
 - 2026-03-21 - 前端 - 移除 Step5 “一键合并视频”按钮、服务端分集合并调用与自动合并入口，Step5 不再承担合并动作。
 - 2026-03-21 - 前端 - Step5 视频播放与配音提取改为仅使用 `mergedVideoUrlMap`；未在 Step4 合并时本集显示为空并禁用提取。
 - 2026-03-21 - 验证 - 前端执行 `npm run lint`（0 error，19 warnings）与 `npm run typecheck` 通过。
+- 2026-04-06 - 后端 - 强化 COS 落盘约束：Step3 素材生成、Step4 分镜视频/帧图生成改为无 COS 直接拒绝；分镜轮询回写视频 URL 改为强制 `strict=True` 镜像到 COS；`publish_local_file_under_static` 新增严格模式与上传成功后删除本地 static 文件能力，Step5 合并/提取链路同步改为上传后清理本地文件，并支持按 `merge_key` 回退读取 COS 合并视频。
+- 2026-04-06 - 验证 - 后端执行 `python3 -m py_compile backend/app/api/assets.py backend/app/api/segments.py backend/app/api/final.py backend/app/services/media_storage.py` 通过；`read_lints` 检查上述文件 0 错误；执行 `cd frontend && npm run dev` 时检测到既有 Next 实例占用锁，现有 `http://127.0.0.1:3000` 返回 `200 OK`。
 - 2026-03-21 - 前端 - 调整 Step5 分集卡片布局：将“提取音轨与分割点”完整区域从剧本上方移动到视频播放器下方。
 - 2026-03-21 - 验证 - 前端执行 `npm run lint`（0 error，19 warnings）与 `npm run typecheck` 通过。
 - 2026-03-21 - 前端 - 调整 Step5 音频编辑区文案与按钮布局：标题改为“原始音轨”，移除重复“原始音轨”小标题，并将“提取人声”按钮置于标题行最右侧。
@@ -1131,3 +1178,115 @@
 - 2026-04-03 - 本地前端修复 - 修复 Step2 提取素材静默失败：`resources/page.tsx` 在任务已完成时优先使用任务返回 `result.content`，并在结果缺失/异常时显式结束 pending 且提示错误，不再吞异常导致长期无反馈。
 - 2026-04-03 - 本地鉴权配置 - 本地 `backend/.env` 统一启用系统级鉴权：配置 `KLING_AK/KLING_SK`，并确保 `ARK_API_KEY` 存在；重建本地 `backend` 后，鉴权来源验证为 `system_aksk_jwt`。
 - 2026-04-03 - 本地验证 - `read_lints`(resources/page.tsx) 0 错误；`npm run dev` 启动成功（Ready, http://localhost:3000）；后端健康检查 `http://127.0.0.1:8003/health` 正常。
+- 2026-04-03 - Prompt调整 - 精简 `PROMPT_EXTRACT_RESOURCES`：Step2 仅提取关键角色，移除角色形象、道具、场景与出场集数相关要求，输出改为“关键角色列表”结构化字段。
+- 2026-04-03 - 验证 - `read_lints`(backend/app/core/script_prompts.py) 0 错误；本地 `npm run dev` 启动成功（Ready, http://localhost:3000）。
+- 2026-04-03 - 本地排障 - 定位本地 Prompt 未生效原因为 backend 容器代码未更新（compose 未挂载源码）；执行 `docker compose up -d --build backend` 后容器内 Prompt 与本地一致。
+- 2026-04-03 - 本地验证 - 容器内 `PROMPT_EXTRACT_RESOURCES == PROMPT_MODIFY_RESOURCES` 为 `True`，健康检查 `http://127.0.0.1:8003/health` 返回 `{"status":"ok"}`。
+- 2026-04-03 - 本地开发配置 - 调整 `docker-compose.yml`：`backend` 增加源码热挂载 `./backend/app:/app/app` 并启用 `uvicorn --reload`，避免本地改 Prompt 需重复重建镜像。
+- 2026-04-03 - 本地验证 - `docker compose up -d backend` 后日志显示 `WatchFiles` 热重载已启用；`npm run dev` 启动成功（Ready, http://localhost:3000）。
+- 2026-04-03 - 规则同步 - 按 `.codebuddy/rules/project_rules.md` 同步更新 `.trae/rules/project_rules.md`（第8条改为自动执行脚本、第9条云实例识别），并在 `RULES.md` 增加规则基准说明。
+- 2026-04-03 - Prompt调整 - 更新 `测试文件/step1生成分镜prompt`：改为4列表格输出（分镜/分段/镜头调度与内容/角色），并加入连续镜头同分镜、3-15s分段与四条分段判定算法（语音气口/动量闭环/情绪突变/因果闭环）。
+- 2026-04-03 - Prompt调整 - 补充 `测试文件/step1生成分镜prompt` 的“分镜描述”规范：分镜首行一次性描述起始画面（场景名称与结构、起始机位、光源参数、角色/道具前中后景与遮挡比例、初始表情姿态目光），同分镜后续分段不重复描述。
+- 2026-04-03 - 验证 - `npm run dev` 启动成功（Ready, http://localhost:3000）。
+- 2026-04-03 - Prompt修正 - 恢复并强化 `测试文件/step1生成分镜prompt` 中“镜头调度与内容”细节要求：逐秒段运镜、动作因果链、受力与惯性、表情百分比+微动作、逐句台词状态、定格画面；并补充说明分镜描述不替代分段细节。
+- 2026-04-03 - Prompt微调 - 更新 `测试文件/step1生成分镜prompt`：分镜后续分段列仅留空不写“同上”；在镜头调度规则中增加去AI感的轻微真实拍摄瑕疵要求（如手持镜头微微晃动、轻微对焦迟滞、衣角发丝滞后摆动）。
+- 2026-04-03 - Step4 Prompt同步 - 将 `step1` 测试版分镜规则同步到系统级 `PROMPT_STORYBOARD`：补充分段切分底层算法（语音气口/动量闭环/情绪拐点/因果闭环），强化表情百分比+微动作约束，并增加轻微真实拍摄瑕疵以降低AI感。
+- 2026-04-03 - 验证 - `read_lints`(backend/app/core/script_prompts.py) 0 错误；本地 `npm run dev` 启动成功（Ready, http://localhost:3000）；后端健康检查 `http://127.0.0.1:8003/health` 返回 `{"status":"ok"}`。
+- 2026-04-03 - Step4 Prompt替换 - 按用户要求将 `backend/app/core/script_prompts.py` 中 `PROMPT_STORYBOARD` 直接替换为 `测试文件/step1生成分镜prompt` 的4列表格版分镜 prompt，暂不处理与现有链路的功能冲突。
+- 2026-04-03 - 验证 - `read_lints`(backend/app/core/script_prompts.py) 0 错误；容器内 `get_system_prompt("generate_storyboard")` 已返回新的4列表格 prompt；`npm run dev` 已执行。
+- 2026-04-03 - Step4链路调整 - 修改 `backend/app/api/script.py`：分镜生成不再向模型附带提取资源/素材白名单/额外说明，`generate_storyboard` 仅提交“该集剧本”作为 user prompt，并在系统层统一补充分镜表格列：`场景`、`道具`、`远景位置关系图`、`首帧图片`、`生成视频`。
+- 2026-04-03 - Step4前端改造 - 修改 `frontend/src/app/components/ScriptEditor.tsx` 与 `frontend/src/app/projects/[id]/script/storyboard/page.tsx`：分镜表格自动补齐上述 5 列；`场景/道具/远景位置关系图/首帧图片/生成视频` 列增加 `素材管理` 按钮并复用首尾帧素材弹窗；`首帧图片` 列支持作为视频生成首帧来源。
+- 2026-04-03 - 验证 - `read_lints` 检查 `backend/app/api/script.py`、`frontend/src/app/components/ScriptEditor.tsx`、`frontend/src/app/projects/[id]/script/storyboard/page.tsx` 均为 0 错误；`npm run dev` 启动成功并返回 `GET /projects/.../script/storyboard 200`；容器内验证 `_build_storyboard_prompt_user_content` 仅返回剧本文本，且系统列补全函数输出符合预期。
+- 2026-04-04 - 测试环境账号 - 在 `81.70.235.208` 创建/重置测试账号 `hello@world.com/123456`。
+- 2026-04-04 - 验证 - 调用 `POST http://81.70.235.208/api/auth/login`，账号 `hello@world.com` 登录成功并返回 bearer token。
+- 2026-04-04 - Step4视频生成修复 - 修正 `backend/app/services/linkapi.py` 中 `_backend_static_dir()` 路径，从错误的 `backend/app/static` 改为实际静态目录 `backend/static`，解决 Step4 将首帧/参考图保存到未挂载目录导致公网 `/static/assets/...` 404、Seedance 报 `content[n].image_url resource not found` 的问题。
+- 2026-04-04 - 测试环境修复 - 已在 `81.70.235.208` 将旧容器错误目录 `/app/app/static/assets` 下的历史 `i2i_ref_*` 文件迁移到实际静态目录，并重建 `duanju-backend-1`。
+- 2026-04-04 - 验证 - 本地 `read_lints`(`backend/app/services/linkapi.py`) 0 错误，`python -m py_compile app/services/linkapi.py` 通过，`npm run dev` 启动成功并返回 `http://127.0.0.1:3000` 200；测试环境 `http://127.0.0.1:8003/health` 返回 `{"status":"ok"}`，此前报错的静态资源 `i2i_ref_1775292130916_ed0ce4ba00.jpg` 现已返回 200。
+- 2026-04-04 - Step4 Seedance连续性修复 - 调整 `backend/app/services/linkapi.py`：当 Step4 使用“前一条分镜视频尾帧作为首帧”或显式首/尾帧图时，后端在 Seedance 请求中会根据去重后的媒体顺序生成明确提示，强制约束“首帧必须使用图片N作为起始画面，其他参考图仅作一致性参考，尾帧尽量收束到图片N”。
+- 2026-04-04 - 测试环境发布 - 已同步修复后的 `linkapi.py` 到 `81.70.235.208:/home/ubuntu/video_gen_app` 并重建 `duanju-backend-1`。
+- 2026-04-04 - 验证 - 本地 `read_lints`(`backend/app/services/linkapi.py`) 0 错误，`python -m py_compile app/services/linkapi.py` 通过，`npm run dev` 启动成功且 `http://127.0.0.1:3000` 返回 200；测试环境 `http://127.0.0.1:8003/health` 返回 `{"status":"ok"}`。
+- 2026-04-04 - Step4 Seedance场景引用修复 - 调整 `backend/app/services/linkapi.py` 的 Seedance 2.0 请求构造：为 Step4 的素材绑定保留 `scene/character/prop/first_frame/last_frame` 语义，在去重后为 `content` 中的图片生成明确的“参考图语义映射”与约束提示，重点强制场景参考图参与场景空间、布局、层次与布光约束，避免场景素材被当成普通无语义参考图。
+- 2026-04-04 - 测试环境发布 - 已同步修复后的 `backend/app/services/linkapi.py` 到 `81.70.235.208:/home/ubuntu/video_gen_app` 并重建 `duanju-backend-1`。
+- 2026-04-04 - 验证 - 本地 `read_lints`(`backend/app/services/linkapi.py`) 0 错误，`docker compose exec -T backend python -m py_compile app/services/linkapi.py` 通过，`npm run dev` 启动成功且 `http://127.0.0.1:3000` 返回 200；测试环境 `http://127.0.0.1:8003/health` 返回 `{"status":"ok"}`。
+- 2026-04-04 - Step4素材管理页改造 - 调整 `frontend/src/app/components/ScriptEditor.tsx` 的 Step4 素材管理弹窗：顶部素材 tab 新增 `首帧`/`尾帧`/`远景位置关系图` 历史图入口；下方生成 tab 从原 `首帧/尾帧` 扩展为 `首帧/尾帧/场景/道具/远景位置关系图`，统一复用“上方选图 + 自然语言描述”生成逻辑；底部展示区改为跟随当前生成 tab 动态切换并支持对应图片应用/修改。
+- 2026-04-04 - 前端接口类型 - 调整 `frontend/src/lib/api.ts` 中 `generateSegmentFrameImage` 的 `frame_type` 类型为通用字符串，以支持新增素材生成 tab。
+- 2026-04-04 - 验证 - `read_lints` 检查 `frontend/src/app/components/ScriptEditor.tsx` 与 `frontend/src/lib/api.ts` 均 0 错误；已执行 `npm run dev`（frontend）启动成功，`http://127.0.0.1:3000` 返回 200。
+- 2026-04-04 - 数据迁移 - 新增 `tmp/migrate_all_media_to_cos.py`，批量迁移 `data/db.sqlite3` 中历史素材图、分镜视频、剧本 `episodes` 内嵌图片/音频/视频地址到 COS，并为全部 672 条剧本版本补传 COS `state` JSON 与 Markdown 快照。
+- 2026-04-04 - 数据迁移 - 已备份数据库到 `tmp/db.sqlite3.backup_20260404_223000`；迁移后 `asset_versions`、`segment_versions`、`scripts.episodes` 已无 `/static`、`data:image` 或非 COS 媒体地址残留；剩余 1 条 `character_voices.preview_url` 指向失效外链 `https://platform.r2.fish.audio/task/3ff61d3b6bcd4aee84e2a6671615316b.mp3`，因源文件不可达未自动改写。
+- 2026-04-04 - 验证 - `python3 -m py_compile tmp/migrate_all_media_to_cos.py` 通过；执行 `PYTHONPATH=backend python3 tmp/migrate_all_media_to_cos.py` 完成迁移；`npm run dev` 启动成功（Next.js 端口 `3002`）。
+- 2026-04-06 - Step4分镜脚本 - 将 Step4 分镜表格中的旧表头 `角色` 统一规范为 `角色形象`，并同步调整分镜生成提示词与视频生成字段语义，确保该列引用角色形象而非角色名。
+- 2026-04-06 - 验证 - `read_lints` 检查 `backend/app/api/script.py`、`backend/app/core/script_prompts.py`、`frontend/src/app/components/ScriptEditor.tsx`、`frontend/src/app/projects/[id]/script/storyboard/page.tsx` 均 0 错误；`python3 -m py_compile backend/app/api/script.py backend/app/core/script_prompts.py` 通过；执行 `npm run dev` 时检测到既有 Next 实例占用锁文件，已确认 `http://127.0.0.1:3000` 返回 200。
+- 2026-04-06 - Step4素材管理 - 调整 `frontend/src/app/components/ScriptEditor.tsx`：素材管理弹窗改为汇总当前项目表格内各行已生成图片，跨行/跨入口复用同一素材池；关闭弹窗时仅在存在当前列已选图片时回填，避免把提示词引用的角色素材误写入 `道具` 等列。
+- 2026-04-06 - 验证 - `read_lints` 检查 `frontend/src/app/components/ScriptEditor.tsx` 为 0 错误；已执行 `npm run dev`（frontend）启动成功，Next.js 服务就绪于 `3002`。
+- 2026-04-06 - Step4素材管理 - 继续调整 `frontend/src/app/components/ScriptEditor.tsx`：让 `角色形象`、`场景`、`道具`、`远景位置关系图`、`首帧` 五类入口共用同一素材池，任一入口生成/绑定的图片都会同步出现在其它四类素材管理中。
+- 2026-04-06 - 验证 - `read_lints` 检查 `frontend/src/app/components/ScriptEditor.tsx` 为 0 错误；已执行 `npm run dev`，检测到 `3000` 被占用后自动切换到 `3002` 并启动成功；同时确认既有实例 `http://127.0.0.1:3000` 返回 `200`。
+- 2026-04-06 - Step4素材管理 - 修正共享素材池构建逻辑：不再只读取当前打开单元格的素材块，改为扫描整张分镜表内所有素材管理列的已绑定素材，再与生成缓存合并，确保从任意入口打开都能看到全局共用素材。
+- 2026-04-06 - Step4素材管理 - 调整 `frontend/src/app/components/ScriptEditor.tsx`：共享的是素材管理弹窗而不是素材分类本身，现已恢复为按素材真实类型归类展示，角色形象只出现在 `角色形象` tab，场景只出现在 `场景` tab，道具只出现在 `道具` tab。
+- 2026-04-06 - 验证 - `read_lints` 检查 `frontend/src/app/components/ScriptEditor.tsx` 为 0 错误；已执行 `npm run dev`，检测到 `3000` 被占用后自动切换到 `3002`；同时确认既有实例 `http://127.0.0.1:3000` 返回 `200`。
+- 2026-04-06 - Step4素材管理 - 调整 `frontend/src/app/components/ScriptEditor.tsx`：素材管理弹窗默认隐藏整个“生成素材”区域及其标题栏，并移除素材卡片“引用到提示词”按钮；在顶部素材分类 tab 行右侧新增“创建新素材”按钮，点击后按当前分类展开生成区。
+- 2026-04-06 - 验证 - `read_lints` 检查 `frontend/src/app/components/ScriptEditor.tsx` 为 0 错误；已执行 `npm run dev`，检测到 `3000` 被占用后自动切换到 `3002` 并显示服务就绪；`preview_url` 打开 `http://127.0.0.1:3002` 成功，同时确认既有实例 `http://127.0.0.1:3000` 返回 `200`。
+- 2026-04-06 - Step4素材管理 - 修复 `frontend/src/app/components/ScriptEditor.tsx` 素材管理弹窗 JSX 条件渲染语法错误：将生成区关闭态的错误提示从嵌套三元表达式拆分为独立条件渲染，恢复页面正常编译。
+- 2026-04-06 - 验证 - `read_lints` 检查 `frontend/src/app/components/ScriptEditor.tsx` 为 0 错误；已执行 `npm run dev`，检测到 `3000` 被占用后自动切换到 `3002` 并显示服务就绪；同时确认既有实例 `http://127.0.0.1:3000` 返回 `200`。
+- 2026-04-06 - Step4素材管理 - 修复 `frontend/src/app/components/ScriptEditor.tsx` 素材管理弹窗闭合标签错误：补齐生成素材容器的缺失闭合标签并移除多余闭合标签，`next build` 已恢复通过。
+- 2026-04-06 - 验证 - `read_lints` 检查 `frontend/src/app/components/ScriptEditor.tsx` 为 0 错误；执行 `npm run build` 编译通过；已重启前端 `npm run dev` 并成功监听 `3000`。
+- 2026-04-06 - Step4素材管理 - 调整 `frontend/src/app/components/ScriptEditor.tsx`：素材卡片的“应用到提示词”按钮仅在点击“创建新素材”展开生成区后显示，默认折叠态继续隐藏该按钮。
+- 2026-04-06 - 验证 - `read_lints` 检查 `frontend/src/app/components/ScriptEditor.tsx` 为 0 错误；已执行 `npm run dev`，检测到 `3000` 已被既有实例占用后自动切换到 `3002`；同时确认 `http://127.0.0.1:3000` 返回 `200`。
+- 2026-04-06 - Step2/Step3改造 - 调整 `backend/app/api/script.py`、`backend/app/core/script_prompts.py`、`backend/app/services/assets.py`、`backend/app/schemas/script.py`、`frontend/src/app/projects/[id]/script/resources/page.tsx`、`frontend/src/app/projects/[id]/script/assets/page.tsx`、`frontend/src/lib/api.ts`：Step2 改为角色/道具/场景三 tab，并发发起 3 条提取任务；后端增加按“第X集”切分的长剧本路由、分片提取与全局合并；道具仅保留跨集重复且回归原始状态；Step3 素材列表改为角色/道具/场景三 tab 展示。
+- 2026-04-06 - 验证 - `read_lints` 检查上述改动文件均为 0 错误；`python3 -m py_compile backend/app/api/script.py backend/app/core/script_prompts.py backend/app/schemas/script.py backend/app/services/assets.py` 通过；`cd frontend && npm run typecheck` 通过；执行 `cd frontend && npm run dev` 时检测到已有 Next 实例占用 `.next/dev/lock`，同时确认现有服务 `http://127.0.0.1:3000` 返回 `200`。
+- 2026-04-06 - Step2提取修复 - 修复 `backend/app/api/script.py` 缺失 `media_storage` 导入的问题；此前 Step2 页面自动保存命中 `POST /api/projects/{project_id}/script` 时会在 `update_script` 内抛出 `NameError: media_storage is not defined`，导致浏览器报 500 并提示“提取素材失败”。
+- 2026-04-06 - 验证 - `read_lints` 检查 `backend/app/api/script.py` 为 0 错误；`python3 -m py_compile backend/app/api/script.py` 通过；后端热重载成功；执行 `cd frontend && npm run dev` 时检测到已有 Next 实例占用 `.next/dev/lock`，同时确认现有服务 `http://127.0.0.1:3000` 返回 `200`。
+- 2026-04-06 - Step2道具筛选收紧 - 调整 `backend/app/api/script.py` 与 `backend/app/core/script_prompts.py`：道具提取即使只有单个分片结果也强制再走一次全局归并 prompt，避免短剧本直接返回候选列表；同时强化道具提取/归并规则，明确删除仅单集出现、仅作背景陈设的椅子/桌子/沙发等泛化家具，只有跨集反复出现且具明确剧情功能或视觉锚点的道具才保留。
+- 2026-04-06 - 验证 - `read_lints` 检查 `backend/app/api/script.py`、`backend/app/core/script_prompts.py` 均为 0 错误；`python3 -m py_compile backend/app/api/script.py backend/app/core/script_prompts.py` 通过；执行 `cd frontend && npm run dev` 时检测到已有 Next 实例占用 `.next/dev/lock`，同时确认现有服务 `http://127.0.0.1:3000` 返回 `200`。
+- 2026-04-06 - Step3交互修复 - 调整 `frontend/src/app/projects/[id]/script/assets/page.tsx`：当素材并发生成数达到上限 3 张时，除保留原状态提示外，新增右上角错误 toast，避免用户点击“生成图片”后无可见反馈。
+- 2026-04-06 - 验证 - `read_lints` 检查 `frontend/src/app/projects/[id]/script/assets/page.tsx` 为 0 错误；`cd frontend && npm run typecheck` 通过；执行 `cd frontend && npm run dev` 时检测到已有 Next 实例占用 `.next/dev/lock`，同时确认现有服务 `http://127.0.0.1:3000` 返回 `200`。
+- 2026-04-06 - Step4视频生成规则调整 - 调整 `frontend/src/app/components/ScriptEditor.tsx`、`frontend/src/app/projects/[id]/script/storyboard/page.tsx` 与 `backend/app/services/linkapi.py`：移除“生成视频”列中的“素材管理”按钮；Step4 视频 prompt 改为仅基于“镜头调度与内容”+素材（角色形象/场景/道具/远景位置关系图/首帧图片）生成，不再拼接“分镜”等其他表格字段；新增连续分段勾选生成，限制只能勾选相邻段落且总时长不超过 15s，多段时仅保留最后一段的定格画面描述；跨多段重复素材自动去重，并在参考素材超过 8 张时弹错误 toast 阻止提交。
+- 2026-04-06 - 验证 - `read_lints` 检查 `frontend/src/app/components/ScriptEditor.tsx`、`frontend/src/app/projects/[id]/script/storyboard/page.tsx`、`backend/app/services/linkapi.py` 均为 0 错误；`python3 -m py_compile backend/app/services/linkapi.py` 通过；`cd frontend && npm run typecheck` 通过；执行 `cd frontend && npm run dev` 时检测到已有 Next 实例占用 `.next/dev/lock`，同时确认现有服务 `http://127.0.0.1:3000` 返回 `200`。
+- 2026-04-06 - Step4连续生成交互调整 - 调整 `frontend/src/app/components/ScriptEditor.tsx` 与 `frontend/src/app/projects/[id]/script/storyboard/page.tsx`：连续生成在勾选时即校验相邻性与总时长上限 `15s`，超限立即 toast 阻止勾选；当某行处于连续生成的后续分段时，自动禁用“使用前一条分镜频尾帧”复选框并保持灰态不可选。
+- 2026-04-06 - 验证 - `read_lints` 检查 `frontend/src/app/components/ScriptEditor.tsx`、`frontend/src/app/projects/[id]/script/storyboard/page.tsx` 与 `PROGRESS.md` 均为 0 错误；`cd frontend && npm run typecheck` 通过；执行 `cd frontend && npm run dev` 时检测到已有 Next 实例占用 `.next/dev/lock`，同时确认现有服务 `http://127.0.0.1:3000` 返回 `200`。
+- 2026-04-06 - 验证 - 修正 `frontend/src/app/components/ScriptEditor.tsx` 中连续生成勾选回调后，再次执行 `read_lints` 检查为 0 错误；`cd frontend && npm run typecheck` 通过；执行 `cd frontend && npm run dev` 时检测到已有 Next 实例占用 `.next/dev/lock`，同时确认现有服务 `http://127.0.0.1:3000` 返回 `200`。
+- 2026-04-06 - Step4多段生成修正 - 调整 `frontend/src/app/projects/[id]/script/storyboard/page.tsx`、`backend/app/api/segments.py` 与 `backend/app/services/segments.py`：Step4 多段选中生成前会先强制保存当前分镜并同步分段，避免点击后出现“当前行还未同步到分段”；多段生成的 prompt 改为把多个分段直接合并成一条完整视频的一次请求，自动顺延后续分段时间轴，仅保留最后一段的定格画面；后端分段列表改为按 `order_index` 稳定排序，并在读取/生成前自动按最新 storyboard 同步分段数量与文本。
+- 2026-04-06 - 验证 - `read_lints` 检查 `frontend/src/app/projects/[id]/script/storyboard/page.tsx`、`backend/app/services/segments.py`、`backend/app/api/segments.py` 与 `PROGRESS.md` 均为 0 错误；`python3 -m py_compile backend/app/services/segments.py backend/app/api/segments.py` 通过；`cd frontend && npm run typecheck` 通过；执行 `cd frontend && npm run dev` 时检测到已有 Next 实例占用 `.next/dev/lock`，同时确认现有服务 `http://127.0.0.1:3000` 返回 `200`。
+- 2026-04-06 - Step4视频生成规则调整 - 调整 `frontend/src/app/components/ScriptEditor.tsx`、`frontend/src/app/projects/[id]/script/storyboard/page.tsx` 与 `frontend/src/lib/api.ts`：移除 Step4 连续生成的前端勾选、多段合并 prompt、批量按钮文案及相关请求参数，恢复为逐条分镜单独生成视频。
+- 2026-04-06 - 验证 - `read_lints` 检查 `frontend/src/app/components/ScriptEditor.tsx`、`frontend/src/app/projects/[id]/script/storyboard/page.tsx` 与 `frontend/src/lib/api.ts` 均为 0 错误；`cd frontend && npm run typecheck` 通过；执行 `cd frontend && npm run dev` 时检测到已有 Next 实例占用 `.next/dev/lock`，同时确认现有服务 `http://127.0.0.1:3000` 返回 `200`。
+- 2026-04-06 - Step4角色形象生成修复 - 调整 `backend/app/api/segments.py`：Step4 分镜素材图生成上传 COS 时改为与素材页一致的严格上传流程，支持 `data:image`、`http(s)` 与 `/static/` 三类返回值，并在镜像外链到 COS 时开启 `strict=True`，避免失败后回退原链接再触发“未返回 COS 地址”的空泛报错。
+- 2026-04-06 - 验证 - `read_lints` 检查 `backend/app/api/segments.py` 与 `PROGRESS.md` 均为 0 错误；`python3 -m py_compile backend/app/api/segments.py` 通过；执行 `cd frontend && npm run dev` 启动成功于 `3002`，同时确认既有实例 `http://127.0.0.1:3000` 返回 `200`。
+- 2026-04-06 - 后端 - 强化 COS 落盘约束：Step3 素材生成、Step4 分镜视频/帧图生成改为无 COS 直接拒绝；分镜轮询回写视频 URL 改为强制 `strict=True` 镜像到 COS；`publish_local_file_under_static` 新增严格模式与上传成功后删除本地 static 文件能力，Step5 合并/提取链路同步改为上传后清理本地文件，并支持按 `merge_key` 回退读取 COS 合并视频。
+- 2026-04-06 - 验证 - 后端执行 `python3 -m py_compile backend/app/api/assets.py backend/app/api/segments.py backend/app/api/final.py backend/app/services/media_storage.py` 通过；`read_lints` 检查上述文件 0 错误；执行 `cd frontend && npm run dev` 时检测到既有 Next 实例占用锁，现有 `http://127.0.0.1:3000` 返回 `200 OK`。
+- 2026-04-06 - 前后端 - Step4 使用 Seedance 2.0 且开启有声视频时，角色参考图会自动绑定其基础角色对应的参考音频一并提交；前端在角色形象素材块中持久化“基础角色”元信息，后端据此为内联角色图解析并注入对应音频 URL。
+- 2026-04-06 - 验证 - `read_lints` 检查 `frontend/src/app/components/ScriptEditor.tsx`、`frontend/src/app/projects/[id]/script/storyboard/page.tsx`、`backend/app/services/linkapi.py` 均为 0 错误；`cd frontend && npm run lint` 通过（0 error / 26 warning）；`cd frontend && npm run typecheck` 通过；后端执行 `python3 -m py_compile backend/app/services/linkapi.py` 通过；执行 `cd frontend && npm run dev` 时检测到既有 Next 实例占用锁，同时确认现有服务 `http://127.0.0.1:3000` 返回 `200 OK`。
+- 2026-04-07 - 前后端 - 补全角色形象音色绑定链路：前端 `Asset` 类型新增 `base_character_name` 并让 Step4 角色形象生成支持从基础角色、已绑定角色形象和已生成角色图继承基础角色；Step4 视频/视频修改 prompt 清洗素材块管理文本；Seedance 系统提示补充“角色名-角色形象图-音频”明确映射说明。
+- 2026-04-07 - 验证 - `read_lints` 检查 `frontend/src/lib/api.ts`、`frontend/src/app/components/ScriptEditor.tsx`、`frontend/src/app/projects/[id]/script/storyboard/page.tsx`、`backend/app/services/linkapi.py` 为 0 错误；`python3 -m py_compile backend/app/services/linkapi.py` 通过；`cd frontend && npm run typecheck` 通过；执行 `cd frontend && npm run dev` 时检测到既有 Next 实例占用 `.next/dev/lock`，日志显示已有 Next 实例运行中。
+- 2026-04-07 - 测试环境部署 - 按要求使用 `duanjutest.pem` 将本地最新代码同步至 `81.70.235.208:/home/ubuntu/video_gen_app`，并在远端执行 `sudo docker compose up -d --build` 重建发布。
+- 2026-04-07 - 测试环境验证 - 远端 `duanju-backend-1/duanju-frontend-1/duanju-nginx-1` 均为 Up；`curl http://81.70.235.208:8003/health` 返回 `{"status":"ok"}`；`curl -I http://81.70.235.208` 返回 `HTTP/1.1 200 OK`。
+- 2026-04-07 - 前端修复 - 修复 Step4 分镜展示空白：`storyboard/page.tsx` 与 `ScriptEditor.tsx` 的 `stripThinkingContent` 在处理未闭合 `<think>` 时，放宽正文起始识别为 `#{1,6}` 标题并增加“首个非空字符”兜底，避免误清空真实分镜内容。
+- 2026-04-07 - 验证 - `read_lints` 检查 `frontend/src/app/projects/[id]/script/storyboard/page.tsx`、`frontend/src/app/components/ScriptEditor.tsx` 为 0 错误；`cd frontend && npm run typecheck` 通过；执行 `cd frontend && npm run dev` 时提示已有 Next 实例占用 `.next/dev/lock`（端口切到 `3002` 后仍因锁退出），属于既有运行实例冲突。
+- 2026-04-07 - 测试环境部署 - 同步 `frontend/src/app/projects/[id]/script/storyboard/page.tsx` 与 `frontend/src/app/components/ScriptEditor.tsx` 到 `81.70.235.208:/home/ubuntu/video_gen_app`，并执行 `sudo docker compose up -d --build frontend` 发布前端修复。
+- 2026-04-07 - 测试环境验证 - 前端镜像重建成功并替换运行容器（`duanju-frontend-1` Up）；构建阶段 TypeScript 与 Next 构建通过。
+- 2026-04-07 - 后端修复 - Step4 视频状态轮询新增超时兜底：`backend/app/api/segments.py` 在 `GET /projects/{id}/segments` 轮询时，对长时间 `PROCESSING`（默认 30 分钟，可由 `SEGMENT_TASK_PROCESSING_TIMEOUT_SECONDS` 配置）自动置为 `FAILED` 并返回超时提示，避免前端无限“生成中”。
+- 2026-04-07 - 验证 - 本地 `python3 -m py_compile backend/app/api/segments.py` 通过，`read_lints` 检查该文件 0 错误；执行 `cd frontend && npm run dev` 时仍检测到既有 Next 实例占用 `.next/dev/lock`。
+- 2026-04-07 - 测试环境部署 - 已同步 `backend/app/api/segments.py` 至 `81.70.235.208:/home/ubuntu/video_gen_app` 并执行 `sudo docker compose up -d --build backend` 发布。
+- 2026-04-07 - 测试环境验证 - `duanju-backend-1` 重建并 Up；查询测试库后 `PROCESSING` 任务已清零，项目 `39c057fb-28e4-4639-ac45-d778d5f8ebcd` 最新 Seedance 版本状态为 `COMPLETED` 且已有视频 URL。
+- 2026-04-07 - 后端修复 - 修复 Step4 分镜“思考内容污染”：`backend/app/api/script.py` 的分镜任务流式聚合改为仅接收 `content`（不再读取 `reasoning_content`）；新增 `_strip_storyboard_thinking_content/_sanitize_storyboard_markdown/_contains_markdown_table`，在入库前剥离 `<think>` 并强校验“必须为 Markdown 表格”，非表格直接报错避免写入英文思考链。
+- 2026-04-07 - 验证 - 本地 `python3 -m py_compile backend/app/api/script.py` 通过，`read_lints` 检查该文件 0 错误；执行 `cd frontend && npm run dev` 仍提示已有 Next 实例占用 `.next/dev/lock`（既有运行实例冲突）。
+- 2026-04-07 - 测试环境部署 - 已同步 `backend/app/api/script.py` 至 `81.70.235.208:/home/ubuntu/video_gen_app` 并执行 `sudo docker compose up -d --build backend` 发布。
+- 2026-04-07 - 测试环境验证 - `duanju-backend-1` 重建并 Up；`curl http://81.70.235.208:8003/health` 返回 `{"status":"ok"}`。
+- 2026-04-07 - 紧急修复 - 修复本地后端不可用：`backend/app/core/script_prompts.py` 中 `PROMPT_STORYBOARD` 变量声明缺失及关键词分支误写（`return PROMPT_PROMPT_STORYBOARD = ...`）导致导入期 `SyntaxError`，已恢复为 `PROMPT_STORYBOARD = """...` 与 `return PROMPT_CEO_SWEET`。
+- 2026-04-07 - 验证 - 本地 `python3 -m py_compile backend/app/core/script_prompts.py backend/app/api/script.py` 通过，`read_lints` 检查 `backend/app/core/script_prompts.py` 为 0 错误；`curl http://127.0.0.1:8003/health` 与 `curl http://127.0.0.1/api/health` 均返回 `{"status":"ok"}`；执行 `cd frontend && npm run dev` 仍提示已有 Next 实例占用 `.next/dev/lock`（既有运行实例冲突）。
+- 2026-04-07 - 后端修复 - 修复 Step4 分镜“上游空内容”误判：`backend/app/api/script.py` 在分镜任务请求中显式传入 `thinking={"type":"disabled"}`，并将“清洗后为空”细分为“上游仅返回思考内容”错误；`backend/app/services/linkapi.py` 同步透传 `thinking` 参数到上游请求。
+- 2026-04-07 - 验证 - 本地 `python3 -m py_compile backend/app/api/script.py backend/app/services/linkapi.py` 通过，`read_lints` 检查两文件 0 错误；`docker compose up -d --build backend` 重建并启动成功；`curl http://127.0.0.1:8003/health` 返回 `{"status":"ok"}`；执行 `cd frontend && npm run dev` 仍提示既有 Next 实例占用 `.next/dev/lock`。
+- 2026-04-07 - 后端修复 - 修复 Gemini 空响应导致“提炼失败”：`backend/app/services/linkapi.py` 增强 `_extract_suchuang_text`（补充 `choices[].content`、`message.parts` 等结构提取），并在 `create_chat_completion` 增加“空内容自动重试 3 次”机制，降低上游偶发空包导致的失败率。
+- 2026-04-07 - 验证 - 本地 `read_lints` 检查 `backend/app/services/linkapi.py` 0 错误，`python3 -m py_compile backend/app/services/linkapi.py backend/app/api/script.py` 通过，`docker compose up -d backend` 后 `curl http://127.0.0.1:8003/health` 返回 `{"status":"ok"}`；执行 `cd frontend && npm run dev` 仍提示既有 Next 实例占用 `.next/dev/lock`。
+- 2026-04-07 - 测试环境部署 - 已同步 `backend/app/services/linkapi.py` 至 `81.70.235.208:/home/ubuntu/video_gen_app` 并执行 `sudo docker compose up -d --build backend` 发布。
+- 2026-04-07 - 测试环境验证 - `curl http://81.70.235.208:8003/health` 返回 `{"status":"ok"}`。
+- 2026-04-07 - 后端修复 - Step4 分镜任务支持“content + reasoning”联合解析：`backend/app/api/script.py` 任务流新增 `reasoning_chunks` 收集，优先从 `content` 取表格，若失败再用 `content+thinking` 联合提取表格；新增 `_extract_storyboard_thinking_text`，并在任务结果/分集中写入 `storyboardTaskThinking`，同时补充失败场景的原始返回摘要日志用于定位模型真实返回。
+- 2026-04-07 - 接口变更 - `backend/app/schemas/script.py` 的 `StoryboardTaskStatusResponse` 新增 `thinking` 字段；`frontend/src/lib/api.ts` 同步新增 `thinking` 与 `Episode.storyboardTaskThinking` 类型。
+- 2026-04-07 - 前端改动 - `frontend/src/app/projects/[id]/script/storyboard/page.tsx` 在分镜任务轮询与启动结果中保存 `storyboardTaskThinking`，并在分集卡片增加“查看模型 thinking（默认收起）”折叠面板，便于对比正式内容与思考内容。
+- 2026-04-07 - 验证 - 本地 `read_lints` 检查四个变更文件 0 错误，`python3 -m py_compile backend/app/api/script.py backend/app/schemas/script.py backend/app/services/linkapi.py` 通过；`docker compose up -d backend` 后 `curl http://127.0.0.1:8003/health` 返回 `{"status":"ok"}`；执行 `cd frontend && npm run dev` 仍提示既有 Next 实例占用 `.next/dev/lock`。
+- 2026-04-07 - 测试环境部署 - 已同步 `backend/app/api/script.py`、`backend/app/schemas/script.py`、`backend/app/services/linkapi.py` 至 `81.70.235.208:/home/ubuntu/video_gen_app` 并执行 `sudo docker compose up -d --build backend` 发布。
+- 2026-04-07 - 测试环境验证 - `curl http://81.70.235.208:8003/health` 返回 `{"status":"ok"}`。
+- 2026-04-07 - 本地问题定位 - 通过本地 `backend` 日志确认 Step4 请求已命中上游且返回 `HTTP 200`，但失败样本的 `raw_content_head` 以 `<think>**Structuring the Script**...` 开头且 `raw_reasoning_head` 为空；根因为上游把思考链混入 `content` 且表格提取逻辑对该形态不稳。
+- 2026-04-07 - 后端修复 - 调整 `backend/app/api/script.py`：新增 `_extract_first_markdown_table`，并在 `_sanitize_storyboard_markdown` 中优先从原始文本直接提取首个 Markdown 表格，再执行 thinking 清洗与 fenced block 兜底，避免 `<think>` 包裹/未闭合时误丢表格正文。
+- 2026-04-07 - 验证 - 本地 `read_lints` 检查 `backend/app/api/script.py` 0 错误，`python3 -m py_compile backend/app/api/script.py` 通过；`docker compose up -d backend` 后 `curl http://127.0.0.1:8003/health` 返回 `{"status":"ok"}`；执行 `cd frontend && npm run dev` 仍提示既有 Next 实例占用 `.next/dev/lock`。
+- 2026-04-07 - 测试环境部署 - 已使用 `duanjutest.pem` 将最新 `backend/app/api/script.py` 同步至 `81.70.235.208:/home/ubuntu/video_gen_app`，并在远端执行 `sudo docker compose up -d --build backend` 发布最新 Step4 分镜表格提取修复。
+- 2026-04-07 - 测试环境验证 - 远端 `duanju-backend-1` 已重建并保持 Up；`curl http://127.0.0.1:8003/health` 返回 `{"status":"ok"}`；公网 `curl -I http://81.70.235.208` 返回 `HTTP/1.1 200 OK`；远端代码已包含 `_extract_first_markdown_table` 修复。
+- 2026-04-07 - 测试环境账号 - 在 `81.70.235.208` 创建测试账号 `back@front.com/123456`，并通过 `POST /auth/login` 实测登录成功。

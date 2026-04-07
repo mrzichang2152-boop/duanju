@@ -173,13 +173,103 @@ def _sanitize_step2_metadata(text: str) -> str:
     value = str(text or "").strip()
     if not value:
         return ""
-    value = re.sub(r"[，,；;。\s]*出场集数\s*[：:]?\s*[^，,；;。\n\r]*", "", value, flags=re.IGNORECASE)
+    value = re.sub(r"[，,；;。\s]*(?:出场集数|出现集数)\s*[：:]?\s*[^，,；;。\n\r]*", "", value, flags=re.IGNORECASE)
     value = re.sub(r"[，,；;。\s]*信息来源\s*[：:]?\s*[^，,；;。\n\r]*", "", value, flags=re.IGNORECASE)
     value = re.sub(r"\s{2,}", " ", value)
     cleaned = value.strip(" ，,；;。\t\n\r")
     if re.fullmatch(r"(?:第\s*\d+\s*集)(?:[、，,\s]*(?:第\s*\d+\s*集))*", cleaned):
         return ""
     return cleaned
+
+
+_STEP2_SECTION_TITLES = {
+    "角色": "character",
+    "角色列表": "character",
+    "道具": "prop",
+    "道具列表": "prop",
+    "场景": "scene",
+    "场景列表": "scene",
+}
+
+
+def _split_step2_sections(body: str) -> dict[str, str]:
+    sections = {"character": "", "prop": "", "scene": ""}
+    source = str(body or "").replace("\r\n", "\n").replace("\r", "\n")
+    if not source.strip():
+        return sections
+    current = ""
+    buffer: list[str] = []
+    found = False
+
+    def _flush() -> None:
+        nonlocal buffer, current
+        if current:
+            sections[current] = "\n".join(buffer).strip()
+        buffer = []
+
+    for raw_line in source.split("\n"):
+        normalized = raw_line.strip().lstrip("#").strip().rstrip("：:").strip()
+        section_key = _STEP2_SECTION_TITLES.get(normalized, "")
+        if section_key:
+            found = True
+            _flush()
+            current = section_key
+            continue
+        if current:
+            buffer.append(raw_line)
+    _flush()
+    if found:
+        return sections
+    sections["character"] = source.strip()
+    return sections
+
+
+def _extract_structured_named_entries(body: str, primary_label: str) -> list[tuple[str, str]]:
+    items: list[tuple[str, str]] = []
+    current_name: Optional[str] = None
+    buffer: list[str] = []
+    primary_names = {primary_label, primary_label.rstrip("名")}
+
+    def _flush() -> None:
+        nonlocal current_name, buffer
+        if current_name:
+            items.append((current_name, "；".join([part for part in buffer if part]).strip("；")))
+        current_name = None
+        buffer = []
+
+    for raw_line in body.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        clean_line = line.lstrip("#*").strip()
+        if not _has_colon(clean_line):
+            if current_name:
+                buffer.append(clean_line)
+            continue
+        label, value = _split_colon(clean_line)
+        label = label.strip()
+        value = value.strip()
+        if label in primary_names:
+            _flush()
+            current_name = value or None
+            continue
+        if current_name and value:
+            buffer.append(f"{label}：{value}")
+    _flush()
+    return items
+
+
+def _extract_props_from_step2(body: str) -> list[tuple[str, str]]:
+    structured = _extract_structured_named_entries(body, "道具名")
+    return structured if structured else _extract_props_with_desc(body)
+
+
+def _extract_scenes_from_step2(body: str) -> list[tuple[str, str]]:
+    structured = _extract_structured_named_entries(body, "场景名")
+    if structured:
+        return structured
+    legacy = _extract_scenes_with_desc(body)
+    return [(name, desc) for name, desc in legacy.items()]
 
 
 def _normalize_character_look_payload(role: str, look: str, desc: str) -> tuple[str, str]:
@@ -573,27 +663,27 @@ async def extract_assets_from_script(
     # Try to extract from manually edited resources first
     if script.content and SEPARATOR in script.content:
         resources_content = script.content.split(SEPARATOR)[0]
-        
-        # Characters
-        char_map = _extract_role_descriptions(resources_content)
+        sections = _split_step2_sections(resources_content)
+        character_source = sections.get("character") or resources_content
+        prop_source = sections.get("prop") or resources_content
+        scene_source = sections.get("scene") or resources_content
+
+        char_map = _extract_role_descriptions(character_source)
         data["characters"] = [{"name": k, "description": v} for k, v in char_map.items()]
-        
-        # Looks
-        looks_map = _extract_role_looks(resources_content)
+
+        looks_map = _extract_role_looks(character_source)
         looks_list = []
         for role, items in looks_map.items():
             for label, val in items:
                 looks_list.append({"role": role, "look": label, "description": val})
         data["character_looks"] = looks_list
-        
-        # Props
-        props_list = _extract_props_with_desc(resources_content)
+
+        props_list = _extract_props_from_step2(prop_source)
         data["props"] = [{"name": n, "description": d} for n, d in props_list]
-        
-        # Scenes
-        scenes_map = _extract_scenes_with_desc(resources_content)
-        data["scenes"] = [{"name": k, "description": v} for k, v in scenes_map.items()]
-        
+
+        scenes_list = _extract_scenes_from_step2(scene_source)
+        data["scenes"] = [{"name": n, "description": d} for n, d in scenes_list]
+
     else:
         if manual_only:
             return []

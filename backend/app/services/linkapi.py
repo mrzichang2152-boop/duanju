@@ -27,6 +27,7 @@ from app.models.asset import Asset
 from app.models.asset_version import AssetVersion
 from app.models.character_voice import CharacterVoice
 from app.models.kling_subject import KlingSubject
+from app.services.character_image_bindings import resolve_image_bound_base_character_name
 from app.services.settings import get_api_key, get_or_create_settings
 
 logger = logging.getLogger(__name__)
@@ -193,12 +194,10 @@ def _extract_suchuang_text(value: Any) -> str:
                     continue
                 message = item.get("message")
                 if isinstance(message, dict):
-                    content_text = _extract_suchuang_text(message.get("content"))
-                    if content_text:
-                        return content_text
-                    reasoning_text = _extract_suchuang_text(message.get("reasoning_content"))
-                    if reasoning_text:
-                        return reasoning_text
+                    for message_key in ("content", "reasoning_content", "parts", "text"):
+                        message_text = _extract_suchuang_text(message.get(message_key))
+                        if message_text:
+                            return message_text
                 delta = item.get("delta")
                 if isinstance(delta, dict):
                     delta_text = _extract_suchuang_text(delta.get("content"))
@@ -207,12 +206,10 @@ def _extract_suchuang_text(value: Any) -> str:
                     delta_reasoning = _extract_suchuang_text(delta.get("reasoning_content"))
                     if delta_reasoning:
                         return delta_reasoning
-                item_text = _extract_suchuang_text(item.get("text"))
-                if item_text:
-                    return item_text
-                item_reasoning = _extract_suchuang_text(item.get("reasoning_content"))
-                if item_reasoning:
-                    return item_reasoning
+                for item_key in ("content", "text", "reasoning_content", "output", "result", "answer"):
+                    item_text = _extract_suchuang_text(item.get(item_key))
+                    if item_text:
+                        return item_text
         for key in ("content", "text", "result", "output", "answer", "reasoning_content", "data", "message"):
             if key not in value:
                 continue
@@ -250,6 +247,8 @@ async def create_chat_completion(
         request_payload["temperature"] = payload.get("temperature")
     if payload.get("max_tokens") is not None:
         request_payload["max_tokens"] = payload.get("max_tokens")
+    if payload.get("thinking") is not None:
+        request_payload["thinking"] = payload.get("thinking")
     timeout_seconds_raw = str(
         os.getenv("GRSAI_TIMEOUT_SECONDS", os.getenv("SUCHUANG_TIMEOUT_SECONDS", "900"))
     ).strip()
@@ -259,48 +258,60 @@ async def create_chat_completion(
         timeout_seconds = 900.0
     timeout_seconds = max(60.0, timeout_seconds)
     timeout = httpx.Timeout(timeout_seconds, connect=15.0)
-    last_exc: Exception | None = None
-    for _ in range(2):
+    for content_attempt in range(3):
+        last_exc: Exception | None = None
+        for _ in range(2):
+            try:
+                async with httpx.AsyncClient(timeout=timeout, trust_env=True) as client:
+                    response = await client.post(endpoint, headers=headers, json=request_payload)
+                break
+            except (httpx.ReadTimeout, httpx.ConnectTimeout) as exc:
+                last_exc = exc
+                await asyncio.sleep(1.0)
+        else:
+            raise RuntimeError(f"Gemini3Pro 调用超时（>{int(timeout_seconds)}秒）") from last_exc
+
+        if response.status_code != 200:
+            raise RuntimeError(f"Gemini3.1Pro 调用失败：HTTP {response.status_code} {response.text}")
         try:
-            async with httpx.AsyncClient(timeout=timeout, trust_env=True) as client:
-                response = await client.post(endpoint, headers=headers, json=request_payload)
-            break
-        except (httpx.ReadTimeout, httpx.ConnectTimeout) as exc:
-            last_exc = exc
-            await asyncio.sleep(1.0)
-    else:
-        raise RuntimeError(f"Gemini3Pro 调用超时（>{int(timeout_seconds)}秒）") from last_exc
-    if response.status_code != 200:
-        raise RuntimeError(f"Gemini3.1Pro 调用失败：HTTP {response.status_code} {response.text}")
-    try:
-        response_json = response.json()
-    except Exception as exc:
-        raise RuntimeError(f"Gemini3.1Pro 返回非 JSON 响应：{response.text}") from exc
-    code = response_json.get("code")
-    if code not in (None, 0, 200):
-        raise RuntimeError(str(response_json.get("msg") or response_json))
-    if isinstance(response_json, dict) and not response_json.get("choices"):
-        data_obj = response_json.get("data")
-        if isinstance(data_obj, dict) and data_obj.get("choices"):
-            response_json = data_obj
-    content_text = _extract_suchuang_text(response_json)
-    if not content_text and isinstance(response_json, dict):
-        content_text = _extract_suchuang_text(response_json.get("data"))
-    if not content_text:
-        logger.warning("Gemini3.1Pro empty content response: %s", str(response_json)[:600])
-        raise RuntimeError("Gemini3.1Pro 未返回可用内容")
-    return {
-        "choices": [
-            {
-                "index": 0,
-                "message": {
-                    "role": "assistant",
-                    "content": content_text,
-                },
-                "finish_reason": "stop",
+            response_json = response.json()
+        except Exception as exc:
+            raise RuntimeError(f"Gemini3.1Pro 返回非 JSON 响应：{response.text}") from exc
+
+        code = response_json.get("code") if isinstance(response_json, dict) else None
+        if code not in (None, 0, 200):
+            raise RuntimeError(str(response_json.get("msg") or response_json))
+        if isinstance(response_json, dict) and not response_json.get("choices"):
+            data_obj = response_json.get("data")
+            if isinstance(data_obj, dict) and data_obj.get("choices"):
+                response_json = data_obj
+
+        content_text = _extract_suchuang_text(response_json)
+        if not content_text and isinstance(response_json, dict):
+            content_text = _extract_suchuang_text(response_json.get("data"))
+        if content_text:
+            return {
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {
+                            "role": "assistant",
+                            "content": content_text,
+                        },
+                        "finish_reason": "stop",
+                    }
+                ]
             }
-        ]
-    }
+
+        logger.warning(
+            "Gemini3.1Pro empty content response(attempt=%s/3): %s",
+            content_attempt + 1,
+            str(response_json)[:1200],
+        )
+        if content_attempt < 2:
+            await asyncio.sleep(0.8 * (content_attempt + 1))
+            continue
+        raise RuntimeError("Gemini3.1Pro 未返回可用内容")
 
 
 async def create_chat_completion_stream(
@@ -329,7 +340,7 @@ async def create_chat_completion_stream(
 
 
 def _backend_static_dir() -> str:
-    return os.path.abspath(os.path.join(os.path.dirname(os.path.dirname(__file__)), "static"))
+    return os.path.abspath(os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "static"))
 
 
 def _resolve_public_base_url() -> str:
@@ -1500,13 +1511,25 @@ async def _resolve_asset_bindings(
         if not resolved_image_url:
             continue
         asset = requested_asset_map[asset_id]
+        resolved_role = str(binding.get("role", "")).strip().lower() or "character"
+        resolved_base_character_name = ""
+        if resolved_role == "character":
+            resolved_base_character_name = await resolve_image_bound_base_character_name(
+                session,
+                project_id,
+                str(resolved_image_url),
+                asset_id=asset_id,
+                asset_type=str(asset.type or ""),
+                asset_name=str(asset.name or ""),
+            )
         resolved.append(
             {
                 "asset_id": asset_id,
-                "role": str(binding.get("role", "")).strip().lower() or "character",
+                "role": resolved_role,
                 "name": str(binding.get("name", "")).strip() or asset.name,
                 "description": str(binding.get("description", "")).strip() or (asset.description or ""),
                 "image_url": resolved_image_url,
+                "base_character_name": resolved_base_character_name,
             }
         )
     return resolved
@@ -1620,6 +1643,15 @@ def _pick_character_voice_for_subject_name(
     return None
 
 
+def _resolve_character_voice_reference_url(voice: CharacterVoice) -> str:
+    config = voice.config if isinstance(voice.config, dict) else {}
+    for key in ("sample_url", "audio_url", "source_url", "voice_url", "preview_url"):
+        value = str(config.get(key) or "").strip()
+        if value:
+            return value
+    return str(voice.preview_url or "").strip()
+
+
 async def _attach_character_voice_ids(
     session: AsyncSession,
     project_id: str,
@@ -1649,12 +1681,31 @@ async def _attach_character_voice_ids(
     for item in items:
         if str(item.get("role", "")).strip().lower() != "character":
             continue
-        matched = _pick_character_voice_for_subject_name(str(item.get("name", "")), voices)
+        explicit_base_character_name = str(item.get("base_character_name", "")).strip()
+        if not explicit_base_character_name:
+            explicit_base_character_name = await resolve_image_bound_base_character_name(
+                session,
+                project_id,
+                str(item.get("image_url") or "").strip(),
+                asset_id=str(item.get("asset_id") or "").strip(),
+                asset_name=str(item.get("name") or "").strip(),
+            )
+            if explicit_base_character_name:
+                item["base_character_name"] = explicit_base_character_name
+        lookup_name = explicit_base_character_name or str(item.get("name", ""))
+        matched = _pick_character_voice_for_subject_name(lookup_name, voices)
         if not matched:
             continue
+        matched_character_name = str(matched.character_name or "").strip()
         voice_id = str(matched.voice_id or "").strip()
+        reference_audio_url = _resolve_character_voice_reference_url(matched)
+        if matched_character_name:
+            item["matched_character_name"] = matched_character_name
+            item.setdefault("base_character_name", matched_character_name)
         if voice_id:
             item["voice_id"] = voice_id
+        if reference_audio_url:
+            item["reference_audio_url"] = reference_audio_url
     return items
 
 
@@ -1671,20 +1722,18 @@ async def _cleanup_redundant_character_subject_rows(
     if not keep_sid:
         return ""
 
-    subject_key = _normalize_subject_name_key(subject_name)
+    normalized_asset_id = str(asset_id or "").strip()
+    if not normalized_asset_id:
+        return keep_sid
+
     existing_q = await session.execute(
         select(KlingSubject).where(
             KlingSubject.project_id == project_id,
             KlingSubject.role == "character",
+            KlingSubject.asset_id == normalized_asset_id,
         )
     )
-    existing_rows = list(existing_q.scalars().all())
-    candidates = [
-        row
-        for row in existing_rows
-        if (subject_key and _normalize_subject_name_key(str(row.subject_name or "")) == subject_key)
-        or str(row.asset_id or "").strip() == asset_id
-    ]
+    candidates = list(existing_q.scalars().all())
     if not candidates:
         return keep_sid
 
@@ -1712,10 +1761,64 @@ async def _cleanup_redundant_character_subject_rows(
             logger.warning(
                 "删除冗余角色主体失败 project_id=%s asset_id=%s subject_id=%s",
                 project_id,
-                asset_id,
+                normalized_asset_id,
                 old_sid,
             )
     return str(keep_row.subject_id or keep_sid).strip()
+
+
+async def _find_existing_character_subject_id(
+    session: AsyncSession,
+    project_id: str,
+    item: dict[str, Any],
+) -> str:
+    asset_id = str(item.get("asset_id", "")).strip()
+    image_url = str(item.get("image_url", "")).strip()
+    voice_id = str(item.get("voice_id", "")).strip()
+    if not project_id:
+        return ""
+
+    existing_q = await session.execute(
+        select(KlingSubject).where(
+            KlingSubject.project_id == project_id,
+            KlingSubject.role == "character",
+        )
+    )
+    existing_rows = list(existing_q.scalars().all())
+    if not existing_rows:
+        return ""
+
+    exact_asset_and_image_rows = [
+        row
+        for row in existing_rows
+        if asset_id
+        and str(row.asset_id or "").strip() == asset_id
+        and image_url
+        and str(row.image_url or "").strip() == image_url
+    ]
+    exact_image_rows = [
+        row for row in existing_rows if image_url and str(row.image_url or "").strip() == image_url
+    ]
+    exact_asset_rows = [
+        row for row in existing_rows if asset_id and str(row.asset_id or "").strip() == asset_id
+    ]
+    candidates = exact_asset_and_image_rows or exact_image_rows or exact_asset_rows
+    if not candidates:
+        return ""
+
+    candidates.sort(
+        key=lambda row: (row.updated_at or row.created_at or 0, row.created_at or 0),
+        reverse=True,
+    )
+    if voice_id:
+        matched_voice = next(
+            (row for row in candidates if str(row.voice_id or "").strip() == voice_id and str(row.subject_id or "").strip()),
+            None,
+        )
+        if matched_voice:
+            return str(matched_voice.subject_id or "").strip()
+    matched = next((row for row in candidates if str(row.subject_id or "").strip()), None)
+    return str(matched.subject_id or "").strip() if matched else ""
 
 
 async def _get_or_create_character_subject_id(
@@ -1732,7 +1835,6 @@ async def _get_or_create_character_subject_id(
         return ""
 
     subject_name = str(item.get("name", "")).strip()[:64]
-    subject_key = _normalize_subject_name_key(subject_name)
     voice_id = str(item.get("voice_id", "")).strip()
     image_url = str(item.get("image_url", "")).strip()[:1024]
 
@@ -1740,27 +1842,22 @@ async def _get_or_create_character_subject_id(
         select(KlingSubject).where(
             KlingSubject.project_id == project_id,
             KlingSubject.role == "character",
+            KlingSubject.asset_id == asset_id,
         )
     )
-    existing_rows = list(existing_q.scalars().all())
-
-    same_name_rows = [
-        row
-        for row in existing_rows
-        if subject_key and _normalize_subject_name_key(str(row.subject_name or "")) == subject_key
-    ]
-    if not same_name_rows:
-        same_name_rows = [row for row in existing_rows if str(row.asset_id or "").strip() == asset_id]
-
-    same_name_rows.sort(
+    asset_rows = list(existing_q.scalars().all())
+    asset_rows.sort(
         key=lambda row: (row.updated_at or row.created_at or 0, row.created_at or 0),
         reverse=True,
     )
-    latest = same_name_rows[0] if same_name_rows else None
+    latest = asset_rows[0] if asset_rows else None
 
     if latest and str(latest.subject_id or "").strip() and not force_create:
         latest_voice = str(latest.voice_id or "").strip()
-        if (voice_id and latest_voice == voice_id) or (not voice_id):
+        latest_image = str(latest.image_url or "").strip()
+        image_matches = not image_url or not latest_image or latest_image == image_url
+        voice_matches = (voice_id and latest_voice == voice_id) or (not voice_id)
+        if image_matches and voice_matches:
             keep_sid = str(latest.subject_id).strip()
             keep_sid = await _cleanup_redundant_character_subject_rows(
                 session,
@@ -1786,9 +1883,6 @@ async def _get_or_create_character_subject_id(
         return ""
 
     target_row = latest
-    if not target_row:
-        target_row = next((row for row in existing_rows if str(row.asset_id or "").strip() == asset_id), None)
-
     if target_row:
         target_row.asset_id = asset_id
         target_row.subject_id = created_subject_id
@@ -2165,6 +2259,12 @@ async def create_video(
         if isinstance(asset_bindings_raw, list)
         else []
     )
+    inline_asset_bindings_raw = payload.get("inline_asset_bindings")
+    inline_asset_bindings = (
+        [item for item in inline_asset_bindings_raw if isinstance(item, dict)]
+        if isinstance(inline_asset_bindings_raw, list)
+        else []
+    )
 
     if not api_key:
         raise RuntimeError("未配置视频接口 API Key，请先在设置页填写后重试")
@@ -2216,9 +2316,9 @@ async def create_video(
     resolved_assets: list[dict[str, Any]] = []
     if (is_kling_model or is_seedance_model) and project_id and asset_bindings:
         resolved_assets = await _resolve_asset_bindings(session, project_id, asset_bindings)
-        if is_kling_model and resolved_assets:
+        if resolved_assets:
             resolved_assets = await _attach_character_voice_ids(session, project_id, resolved_assets)
-        if is_kling_model and not resolved_assets:
+        elif is_kling_model:
             logger.warning(
                 "检测到素材绑定但未解析到可用素材图片，回退为无参考图生成。project_id=%s user_id=%s asset_count=%s",
                 project_id,
@@ -2226,65 +2326,75 @@ async def create_video(
                 len(asset_bindings),
             )
 
-    if resolved_assets and is_kling_model:
-        # 确保被选中的角色在当前项目下已配置 Kling 音色；否则 Kling 会静默回退为默认音色，
-        # 容易让用户误以为使用了自定义音色，这里直接中断并给出明确错误提示。
-        missing_voice_roles = [
-            (str(item.get("name") or "").strip() or str(item.get("asset_id") or "").strip())
-            for item in resolved_assets
-            if str(item.get("role") or "").strip().lower() == "character"
-            and not str(item.get("voice_id") or "").strip()
-        ]
-        if require_character_voice and missing_voice_roles:
-            raise RuntimeError(
-                "Kling 视频生成失败：以下角色未配置音色，将回退为默认音色。"
-                "请先在 Step3 上传角色音频并生成 Kling 音色后再重试："
-                + "、".join(missing_voice_roles)
+    resolved_inline_assets: list[dict[str, Any]] = []
+    if (is_kling_model or is_seedance_model) and inline_asset_bindings:
+        for item in inline_asset_bindings:
+            raw_image_url = str(item.get("image_url") or "").strip()
+            if not raw_image_url:
+                continue
+            resolved_inline_url = await _resolve_image_url(raw_image_url)
+            normalized_inline_url = str(resolved_inline_url or "").strip()
+            if not normalized_inline_url:
+                continue
+            resolved_inline_assets.append(
+                {
+                    "asset_id": str(item.get("asset_id") or "").strip(),
+                    "role": str(item.get("role") or "").strip().lower() or "character",
+                    "name": str(item.get("name") or "").strip(),
+                    "description": str(item.get("description") or "").strip(),
+                    "image_url": normalized_inline_url,
+                    "voice_id": str(item.get("voice_id") or "").strip(),
+                    "base_character_name": str(item.get("base_character_name") or "").strip(),
+                }
             )
+        if resolved_inline_assets and project_id:
+            resolved_inline_assets = await _attach_character_voice_ids(session, project_id, resolved_inline_assets)
+
+    kling_reference_items = [*resolved_assets, *resolved_inline_assets]
+    if kling_reference_items and is_kling_model:
         prepared_refs: list[dict[str, str]] = []
         character_elements: list[dict[str, Any]] = []
         character_prompt_items: list[dict[str, str]] = []
-        async with httpx.AsyncClient(timeout=120.0, trust_env=True) as subject_client:
-            for item in resolved_assets:
-                role = str(item.get("role", "")).strip().lower()
-                asset_id = str(item.get("asset_id", "")).strip()
-                prepared_image_url = _normalize_kling_image_value(str(item.get("image_url", "")))
-                if not prepared_image_url:
-                    continue
-                if role == "character":
-                    item["image_url"] = prepared_image_url
-                    subject_id = await _get_or_create_character_subject_id(
-                        session,
-                        subject_client,
-                        api_key,
-                        project_id,
-                        item,
-                    )
-                    if subject_id:
-                        character_elements.append({"element_id": subject_id})
-                        character_prompt_items.append(
-                            {
-                                "name": str(item.get("name", "")).strip(),
-                                "description": str(item.get("description", "")).strip(),
-                            }
-                        )
-                        continue
-                    raise RuntimeError(
-                        "角色主体创建失败：当前 Step4 已启用仅主体生成模式，禁止回退为角色图片参考。"
-                        f"请先在 Step3 确保该角色主体创建成功后再重试（角色：{str(item.get('name', '')).strip() or asset_id}）。"
-                    )
-                mapped_type = ""
-                if first_frame_asset_id and asset_id == first_frame_asset_id:
-                    mapped_type = "first_frame"
-                prepared_refs.append(
-                    {
-                        "role": role,
-                        "name": str(item.get("name", "")).strip(),
-                        "description": str(item.get("description", "")).strip(),
-                        "image_url": prepared_image_url,
-                        "type": mapped_type,
-                    }
+        element_id_set: set[str] = set()
+        reference_key_set: set[str] = set()
+        for item in kling_reference_items:
+            role = str(item.get("role", "")).strip().lower()
+            asset_id = str(item.get("asset_id", "")).strip()
+            prepared_image_url = _normalize_kling_image_value(str(item.get("image_url", "")))
+            if not prepared_image_url:
+                continue
+            if role == "character":
+                subject_id = await _find_existing_character_subject_id(
+                    session,
+                    project_id,
+                    {**item, "image_url": prepared_image_url},
                 )
+                if subject_id and subject_id not in element_id_set:
+                    element_id_set.add(subject_id)
+                    character_elements.append({"element_id": subject_id})
+                    character_prompt_items.append(
+                        {
+                            "name": str(item.get("name", "")).strip(),
+                            "description": str(item.get("description", "")).strip(),
+                        }
+                    )
+                    continue
+            mapped_type = ""
+            if role == "first_frame" or (first_frame_asset_id and asset_id == first_frame_asset_id):
+                mapped_type = "first_frame"
+            reference_key = f"{role}|{mapped_type}|{prepared_image_url}"
+            if reference_key in reference_key_set:
+                continue
+            reference_key_set.add(reference_key)
+            prepared_refs.append(
+                {
+                    "role": role,
+                    "name": str(item.get("name", "")).strip(),
+                    "description": str(item.get("description", "")).strip(),
+                    "image_url": prepared_image_url,
+                    "type": mapped_type,
+                }
+            )
 
         prompt_lines = ["【主体语义映射】"]
         reference_images: list[dict[str, Any]] = []
@@ -2293,7 +2403,7 @@ async def create_video(
             if item.get("type"):
                 image_item["type"] = item["type"]
             reference_images.append(image_item)
-            role_name = "场景" if item.get("role") == "scene" else "道具" if item.get("role") == "prop" else "主体"
+            role_name = "首帧" if item.get("type") == "first_frame" else "场景" if item.get("role") == "scene" else "道具" if item.get("role") == "prop" else "角色形象"
             prompt_lines.append(f"{role_name}{index}: {item.get('name', '')}；描述：{item.get('description', '')}；引用：<<<image_{index}>>>")
         for index, item in enumerate(character_prompt_items, start=1):
             prompt_lines.append(
@@ -2420,30 +2530,96 @@ async def create_video(
                 duration_value = 5
             duration_value = max(4, min(15, duration_value))
 
-            reference_images: list[dict[str, Any]] = []
+            reference_entries: list[dict[str, Any]] = []
+            first_frame_reference_url = ""
+            last_frame_reference_url = ""
 
-            async def _append_seedance_reference(image_src: str, role: str = "reference_image") -> None:
+            async def _append_seedance_image_reference(
+                image_src: str,
+                semantic_role: str = "",
+                name: str = "",
+                description: str = "",
+                bound_character_name: str = "",
+            ) -> str:
                 resolved = await _resolve_image_url(image_src)
                 if not resolved:
-                    return
-                reference_images.append({
-                    "type": "image_url",
-                    "image_url": {"url": str(resolved).strip()},
-                    "role": role,
-                })
+                    return ""
+                resolved_text = str(resolved).strip()
+                reference_entries.append(
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": resolved_text},
+                        "role": "reference_image",
+                        "semantic_role": str(semantic_role or "").strip().lower(),
+                        "name": str(name or "").strip(),
+                        "description": str(description or "").strip(),
+                        "bound_character_name": str(bound_character_name or "").strip(),
+                    }
+                )
+                return resolved_text
 
             if custom_first_frame_url:
-                await _append_seedance_reference(custom_first_frame_url, "reference_image")
+                first_frame_reference_url = await _append_seedance_image_reference(custom_first_frame_url, "first_frame")
             if custom_last_frame_url:
-                await _append_seedance_reference(custom_last_frame_url, "reference_image")
+                last_frame_reference_url = await _append_seedance_image_reference(custom_last_frame_url, "last_frame")
             if previous_segment_video_url and not custom_first_frame_url:
                 tail_frame_b64 = await _extract_video_tail_frame_base64(previous_segment_video_url)
                 if tail_frame_b64:
-                    await _append_seedance_reference(f"data:image/jpeg;base64,{tail_frame_b64}", "reference_image")
-            for item in resolved_assets:
+                    first_frame_reference_url = await _append_seedance_image_reference(
+                        f"data:image/jpeg;base64,{tail_frame_b64}",
+                        "first_frame",
+                    )
+            for item in [*resolved_assets, *resolved_inline_assets]:
                 image_ref = str(item.get("image_url") or "").strip()
                 if image_ref:
-                    await _append_seedance_reference(image_ref, "reference_image")
+                    await _append_seedance_image_reference(
+                        image_ref,
+                        str(item.get("role") or "").strip().lower(),
+                        str(item.get("name") or "").strip(),
+                        str(item.get("description") or "").strip(),
+                        str(
+                            item.get("base_character_name")
+                            or item.get("matched_character_name")
+                            or item.get("name")
+                            or ""
+                        ).strip(),
+                    )
+
+            audio_reference_items: list[dict[str, str]] = []
+            if with_audio_value:
+                audio_seen: set[str] = set()
+                missing_audio_names: list[str] = []
+                for item in [*resolved_assets, *resolved_inline_assets]:
+                    if str(item.get("role") or "").strip().lower() != "character":
+                        continue
+                    character_name = str(
+                        item.get("base_character_name")
+                        or item.get("matched_character_name")
+                        or item.get("name")
+                        or ""
+                    ).strip()
+                    raw_audio_url = str(item.get("reference_audio_url") or "").strip()
+                    if raw_audio_url:
+                        resolved_audio_url = await _resolve_image_url(raw_audio_url)
+                        normalized_audio_url = str(resolved_audio_url or "").strip()
+                        if normalized_audio_url and normalized_audio_url not in audio_seen:
+                            audio_seen.add(normalized_audio_url)
+                            audio_reference_items.append(
+                                {
+                                    "character_name": character_name,
+                                    "audio_url": normalized_audio_url,
+                                }
+                            )
+                        continue
+                    if character_name:
+                        missing_audio_names.append(character_name)
+                dedup_missing_audio_names = list(dict.fromkeys([name for name in missing_audio_names if name]))
+                if dedup_missing_audio_names:
+                    raise RuntimeError(
+                        "Seedance 角色有声视频缺少对应角色音频："
+                        + "、".join(dedup_missing_audio_names[:5])
+                        + "。请先为对应基础角色上传音频；若当前角色形象是历史生成结果，请重新应用一次角色形象素材后再生成视频。"
+                    )
 
             raw_reference_images = payload.get("reference_images")
             if isinstance(raw_reference_images, list):
@@ -2451,27 +2627,30 @@ async def create_video(
                     if isinstance(item, dict):
                         ref_url = str(item.get("image_url") or "").strip()
                         if ref_url:
-                            await _append_seedance_reference(ref_url, "reference_image")
+                            await _append_seedance_image_reference(ref_url)
                     elif isinstance(item, str) and item.strip():
-                        await _append_seedance_reference(item.strip(), "reference_image")
+                        await _append_seedance_image_reference(item.strip())
 
             if image_url:
-                await _append_seedance_reference(str(image_url), "reference_image")
+                await _append_seedance_image_reference(str(image_url))
 
             if reference_video_url:
                 resolved_video_url = await _resolve_image_url(reference_video_url)
                 if resolved_video_url:
-                    reference_images.append(
+                    reference_entries.append(
                         {
                             "type": "video_url",
                             "video_url": {"url": str(resolved_video_url).strip()},
                             "role": "reference_video",
+                            "semantic_role": "reference_video",
+                            "name": "",
+                            "description": "",
                         }
                     )
 
-            dedup_content: list[dict[str, Any]] = []
-            seen_ref_keys: set[str] = set()
-            for item in reference_images:
+            dedup_entries: list[dict[str, Any]] = []
+            dedup_entry_map: dict[str, dict[str, Any]] = {}
+            for item in reference_entries:
                 item_type = str(item.get("type") or "").strip().lower()
                 role = str(item.get("role") or "").strip().lower()
                 if item_type == "image_url":
@@ -2482,13 +2661,227 @@ async def create_video(
                     key = f"video|{role}|{ref_url}"
                 else:
                     continue
-                if not ref_url or key in seen_ref_keys:
+                if not ref_url:
                     continue
-                seen_ref_keys.add(key)
-                dedup_content.append(item)
+                semantic_role = str(item.get("semantic_role") or "").strip().lower()
+                existing_item = dedup_entry_map.get(key)
+                if existing_item:
+                    semantic_roles = existing_item.setdefault("semantic_roles", [])
+                    if semantic_role and semantic_role not in semantic_roles:
+                        semantic_roles.append(semantic_role)
+                    if not existing_item.get("name") and item.get("name"):
+                        existing_item["name"] = item.get("name")
+                    if not existing_item.get("description") and item.get("description"):
+                        existing_item["description"] = item.get("description")
+                    if not existing_item.get("bound_character_name") and item.get("bound_character_name"):
+                        existing_item["bound_character_name"] = item.get("bound_character_name")
+                    continue
+                normalized_item = dict(item)
+                normalized_item["semantic_roles"] = [semantic_role] if semantic_role else []
+                dedup_entry_map[key] = normalized_item
+                dedup_entries.append(normalized_item)
 
-            content_items: list[dict[str, Any]] = [{"type": "text", "text": str(data.get("prompt") or "").strip()}]
-            content_items.extend(dedup_content)
+            def _find_seedance_image_label(target_url: str) -> str:
+                normalized_target = str(target_url or "").strip()
+                if not normalized_target:
+                    return ""
+                image_index = 0
+                for media_item in dedup_entries:
+                    if str(media_item.get("type") or "").strip().lower() != "image_url":
+                        continue
+                    ref_url = str((media_item.get("image_url") or {}).get("url") or "").strip()
+                    if not ref_url:
+                        continue
+                    image_index += 1
+                    if ref_url == normalized_target:
+                        return f"图片{image_index}"
+                return ""
+
+            def _collect_seedance_image_labels_by_role(target_role: str) -> list[str]:
+                labels: list[str] = []
+                image_index = 0
+                for media_item in dedup_entries:
+                    if str(media_item.get("type") or "").strip().lower() != "image_url":
+                        continue
+                    ref_url = str((media_item.get("image_url") or {}).get("url") or "").strip()
+                    if not ref_url:
+                        continue
+                    image_index += 1
+                    semantic_roles = [str(role or "").strip().lower() for role in (media_item.get("semantic_roles") or [])]
+                    if target_role in semantic_roles:
+                        labels.append(f"图片{image_index}")
+                return labels
+
+            def _build_seedance_semantic_mapping_lines() -> list[str]:
+                mapping_lines: list[str] = []
+                image_index = 0
+                role_prefix_map = {
+                    "scene": "场景参考",
+                    "character": "角色参考",
+                    "prop": "道具参考",
+                    "first_frame": "首帧参考",
+                    "last_frame": "尾帧参考",
+                }
+                for media_item in dedup_entries:
+                    if str(media_item.get("type") or "").strip().lower() != "image_url":
+                        continue
+                    ref_url = str((media_item.get("image_url") or {}).get("url") or "").strip()
+                    if not ref_url:
+                        continue
+                    image_index += 1
+                    label = f"图片{image_index}"
+                    bound_character_name = str(media_item.get("bound_character_name") or "").strip()
+                    name = str(media_item.get("name") or "").strip()
+                    description = str(media_item.get("description") or "").strip()
+                    detail_parts: list[str] = []
+                    if bound_character_name:
+                        detail_parts.append(f"角色名：{bound_character_name}")
+                    if name:
+                        detail_parts.append(f"素材名：{name}")
+                    if description:
+                        detail_parts.append(f"描述：{description}")
+                    detail_text = "；".join(detail_parts) or "请按该参考图执行。"
+                    semantic_roles = [str(role or "").strip().lower() for role in (media_item.get("semantic_roles") or [])]
+                    for semantic_role in semantic_roles:
+                        prefix = role_prefix_map.get(semantic_role)
+                        if prefix:
+                            mapping_lines.append(f"{prefix}{label}：{detail_text}")
+                return mapping_lines
+
+            def _build_seedance_character_assignment_lines() -> list[str]:
+                ordered_character_names: list[str] = []
+                image_labels_by_character: dict[str, list[str]] = {}
+                material_names_by_character: dict[str, list[str]] = {}
+                image_index = 0
+                for media_item in dedup_entries:
+                    if str(media_item.get("type") or "").strip().lower() != "image_url":
+                        continue
+                    ref_url = str((media_item.get("image_url") or {}).get("url") or "").strip()
+                    if not ref_url:
+                        continue
+                    image_index += 1
+                    semantic_roles = [str(role or "").strip().lower() for role in (media_item.get("semantic_roles") or [])]
+                    if "character" not in semantic_roles:
+                        continue
+                    character_name = str(media_item.get("bound_character_name") or media_item.get("name") or "").strip()
+                    if not character_name:
+                        continue
+                    if character_name not in ordered_character_names:
+                        ordered_character_names.append(character_name)
+                    image_labels_by_character.setdefault(character_name, []).append(f"图片{image_index}")
+                    material_name = str(media_item.get("name") or "").strip()
+                    if material_name and material_name not in material_names_by_character.setdefault(character_name, []):
+                        material_names_by_character[character_name].append(material_name)
+
+                audio_labels_by_character: dict[str, list[str]] = {}
+                for index, audio_item in enumerate(audio_reference_items, start=1):
+                    character_name = str(audio_item.get("character_name") or "").strip()
+                    if not character_name:
+                        continue
+                    if character_name not in ordered_character_names:
+                        ordered_character_names.append(character_name)
+                    audio_labels_by_character.setdefault(character_name, []).append(f"音频{index}")
+
+                assignment_lines: list[str] = []
+                for character_name in ordered_character_names:
+                    image_labels = image_labels_by_character.get(character_name, [])
+                    material_names = material_names_by_character.get(character_name, [])
+                    audio_labels = audio_labels_by_character.get(character_name, [])
+                    if not image_labels and not audio_labels:
+                        continue
+                    sentence_parts = [f"分镜脚本中提到的角色“{character_name}”"]
+                    if image_labels:
+                        material_hint = f"（素材名：{'、'.join(material_names)}）" if material_names else ""
+                        sentence_parts.append(f"对应角色形象参考{'、'.join(image_labels)}{material_hint}")
+                    if audio_labels:
+                        sentence_parts.append(f"发声时对应参考{'、'.join(audio_labels)}")
+                    assignment_lines.append("；".join(sentence_parts) + "。")
+                return assignment_lines
+
+            first_frame_label = _find_seedance_image_label(first_frame_reference_url)
+            last_frame_label = _find_seedance_image_label(last_frame_reference_url)
+            scene_labels = _collect_seedance_image_labels_by_role("scene")
+            character_labels = _collect_seedance_image_labels_by_role("character")
+            prop_labels = _collect_seedance_image_labels_by_role("prop")
+            seedance_prompt_lines: list[str] = []
+            character_assignment_lines = _build_seedance_character_assignment_lines()
+            if character_assignment_lines:
+                seedance_prompt_lines.append("【角色名与素材对应关系】")
+                seedance_prompt_lines.extend(character_assignment_lines)
+            semantic_mapping_lines = _build_seedance_semantic_mapping_lines()
+            if semantic_mapping_lines:
+                seedance_prompt_lines.append("【参考图语义映射】")
+                seedance_prompt_lines.extend(semantic_mapping_lines)
+            if first_frame_label:
+                seedance_prompt_lines.append(
+                    f"首帧必须严格使用{first_frame_label}作为起始画面，视频第0秒的构图、主体朝向、机位和动作起势都以该图片为准，不得替换成其他参考图。"
+                )
+                seedance_prompt_lines.append(
+                    f"除{first_frame_label}外，其余参考图片仅用于角色、场景、道具一致性参考，不作为首帧。"
+                )
+            if scene_labels:
+                scene_label_text = "、".join(scene_labels)
+                seedance_prompt_lines.append(
+                    f"场景空间、环境布局、远近层次、景别基底与布光氛围必须优先参考{scene_label_text}，不得忽略或替换成无关场景。"
+                )
+                if first_frame_label:
+                    seedance_prompt_lines.append(
+                        f"在锁定{first_frame_label}作为首帧的同时，整体场景基底仍须延续{scene_label_text}。"
+                    )
+            if character_labels:
+                seedance_prompt_lines.append(
+                    f"角色外观、服装、发型与身份识别必须优先参考{'、'.join(character_labels)}，保持人物一致性。"
+                )
+            if prop_labels:
+                seedance_prompt_lines.append(
+                    f"关键道具的外观、材质、颜色与持拿关系必须参考{'、'.join(prop_labels)}，不要缺失关键道具。"
+                )
+            if audio_reference_items:
+                seedance_prompt_lines.append("【参考音频映射】")
+                for index, audio_item in enumerate(audio_reference_items, start=1):
+                    character_name = str(audio_item.get("character_name") or f"角色{index}").strip()
+                    seedance_prompt_lines.append(
+                        f"音频{index}对应角色“{character_name}”的声线、音色、语气与说话节奏参考；若角色“{character_name}”出镜并发声，请优先参考音频{index}。"
+                    )
+            if last_frame_label:
+                seedance_prompt_lines.append(
+                    f"尾帧尽量收束并定格到{last_frame_label}的画面状态。"
+                )
+
+            prompt_text = str(data.get("prompt") or "").strip()
+            if seedance_prompt_lines:
+                prompt_text = f"{prompt_text}\n" + "\n".join(seedance_prompt_lines)
+
+            content_items: list[dict[str, Any]] = [{"type": "text", "text": prompt_text}]
+            for item in dedup_entries:
+                item_type = str(item.get("type") or "").strip().lower()
+                if item_type == "image_url":
+                    content_items.append(
+                        {
+                            "type": "image_url",
+                            "image_url": item.get("image_url") or {},
+                            "role": str(item.get("role") or "reference_image").strip() or "reference_image",
+                        }
+                    )
+                elif item_type == "video_url":
+                    content_items.append(
+                        {
+                            "type": "video_url",
+                            "video_url": item.get("video_url") or {},
+                            "role": str(item.get("role") or "reference_video").strip() or "reference_video",
+                        }
+                    )
+            for item in audio_reference_items:
+                audio_url = str(item.get("audio_url") or "").strip()
+                if not audio_url:
+                    continue
+                content_items.append(
+                    {
+                        "type": "audio_url",
+                        "audio_url": {"url": audio_url},
+                        "role": "reference_audio",
+                    }
+                )
 
             data = {
                 "model": model,

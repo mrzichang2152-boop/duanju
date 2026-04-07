@@ -3,7 +3,7 @@ import Image from "next/image";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { getToken } from "@/lib/auth";
-import { generateSegmentFrameImage, getModels, getSegmentFrameImageTaskStatus, generateTTS, getProjectVoices, type Asset, type CharacterVoice } from "@/lib/api";
+import { deleteSegmentFrameImage, generateImageSubject, generateSegmentFrameImage, getModels, getSegmentFrameImageTaskStatus, generateTTS, getProjectVoices, type Asset, type CharacterVoice } from "@/lib/api";
 import { extractDrawModels } from "@/lib/models";
 
 interface ScriptEditorProps {
@@ -21,15 +21,7 @@ interface ScriptEditorProps {
   rowVideoUrlMap?: Record<number, string>;
   rowVersionListMap?: Record<number, Array<{ id: string; video_url: string; status: string; task_status_msg?: string | null; is_selected: boolean }>>;
   rowSelectedVersionIdMap?: Record<number, string>;
-  onGenerateKlingRow?: (params: {
-    globalRowIndex: number;
-    previousGlobalRowIndex?: number;
-    headers: string[];
-    row: string[];
-    usePreviousSegmentEndFrame?: boolean;
-    customFirstFrameUrl?: string;
-    customLastFrameUrl?: string;
-  }) => void;
+  onGenerateKlingRow?: (params: VideoGenerateRowPayload) => void;
   onModifyKlingRow?: (params: {
     globalRowIndex: number;
     headers: string[];
@@ -56,14 +48,38 @@ type AppliedVoiceSegment = { text: string; audioUrl: string };
 type VoiceEmotionIntensity = "slightly" | "very" | "extremely";
 type VoiceAccentLevel = "slight" | "normal" | "strong";
 type PronunciationRule = { id: string; source: string; target: string };
-type FrameReference = { assetId: string; name: string; imageUrl: string };
-type FrameMaterialTab = "character" | "prop" | "scene";
+type FrameGenerationTab = "character" | "first" | "last" | "scene" | "prop" | "wide";
+type FrameReference = { assetId: string; name: string; imageUrl: string; source: "asset" | "generated" };
+type FrameMaterialTab = "character" | "baseCharacter" | "prop" | "scene" | "first" | "last" | "wide";
+type FrameMaterialEntry = { id: string; name: string; description?: string; imageUrl: string; source: "asset" | "generated"; asset?: Asset; baseCharacterName?: string };
+type FrameGeneratedMeta = { name: string; description: string; frameType: FrameGenerationTab; baseCharacterName?: string };
+type FrameModalCellTarget = {
+  blockIndex: number;
+  rowIndex: number;
+  colIndex: number;
+  columnHeader: string;
+};
+type FrameAppliedState = Partial<Record<FrameGenerationTab, string>>;
+type VideoGenerateRowPayload = {
+  globalRowIndex: number;
+  previousGlobalRowIndex?: number;
+  headers: string[];
+  row: string[];
+  usePreviousSegmentEndFrame?: boolean;
+  customFirstFrameUrl?: string;
+  customLastFrameUrl?: string;
+};
 type PersistedFrameState = {
+  characterImageMap?: Record<string, string[]>;
   firstImageMap?: Record<string, string[]>;
   lastImageMap?: Record<string, string[]>;
-  appliedMap?: Record<string, { first?: string; last?: string }>;
+  sceneImageMap?: Record<string, string[]>;
+  propImageMap?: Record<string, string[]>;
+  wideImageMap?: Record<string, string[]>;
+  appliedMap?: Record<string, FrameAppliedState>;
   previousEndFrameMap?: Record<string, boolean>;
   pendingMap?: Record<string, number>;
+  generatedMetaMap?: Record<string, FrameGeneratedMeta>;
 };
 
 const VOICE_TAG_GROUPS: VoiceTagGroup[] = [
@@ -169,12 +185,120 @@ const VOICE_TAG_GROUPS: VoiceTagGroup[] = [
   },
 ];
 
-const KLING_COLUMN = "视频生成";
+const KLING_COLUMN = "生成视频";
 const LEGACY_KLING_COLUMN = "Kling视频生成";
+const STORYBOARD_SYSTEM_COLUMNS = ["场景", "道具", "远景位置关系图", "首帧图片", KLING_COLUMN] as const;
 const FRAME_DEFAULT_IMAGE_MODEL = "nano-banana-2";
 const getFrameStateStorageKey = (projectId: string) => `script_editor_frame_state_v2:${projectId}`;
 const FRAME_PENDING_MAX_AGE_MS = 30 * 60 * 1000;
-const buildFramePendingKey = (rowIndex: number, frameType: "first" | "last") => `${rowIndex}:${frameType}`;
+const buildFramePendingKey = (rowIndex: number, frameType: FrameGenerationTab) => `${rowIndex}:${frameType}`;
+const FRAME_GENERATE_TAB_ORDER: FrameGenerationTab[] = ["character", "first", "last", "scene", "prop", "wide"];
+const FRAME_GENERATE_TAB_META: Record<FrameGenerationTab, {
+  label: string;
+  promptPlaceholder: string;
+  buttonIdleText: string;
+  previewTitle: string;
+  previewAlt: string;
+  activeTabClass: string;
+  buttonClass: string;
+  appliedClass: string;
+  idleClass: string;
+}> = {
+  character: {
+    label: "角色形象",
+    promptPlaceholder: "输入角色形象提示词",
+    buttonIdleText: "生成角色形象",
+    previewTitle: "角色形象展示区",
+    previewAlt: "角色形象",
+    activeTabClass: "bg-violet-600 text-white",
+    buttonClass: "bg-violet-600 hover:bg-violet-700",
+    appliedClass: "bg-violet-600 text-white",
+    idleClass: "border border-violet-300 text-violet-700",
+  },
+  first: {
+    label: "首帧",
+    promptPlaceholder: "输入首帧提示词",
+    buttonIdleText: "生成首帧",
+    previewTitle: "首帧展示区",
+    previewAlt: "首帧",
+    activeTabClass: "bg-emerald-600 text-white",
+    buttonClass: "bg-emerald-600 hover:bg-emerald-700",
+    appliedClass: "bg-emerald-600 text-white",
+    idleClass: "border border-emerald-300 text-emerald-700",
+  },
+  last: {
+    label: "尾帧",
+    promptPlaceholder: "输入尾帧提示词",
+    buttonIdleText: "生成尾帧",
+    previewTitle: "尾帧展示区",
+    previewAlt: "尾帧",
+    activeTabClass: "bg-fuchsia-600 text-white",
+    buttonClass: "bg-fuchsia-600 hover:bg-fuchsia-700",
+    appliedClass: "bg-fuchsia-600 text-white",
+    idleClass: "border border-fuchsia-300 text-fuchsia-700",
+  },
+  scene: {
+    label: "场景",
+    promptPlaceholder: "输入场景提示词",
+    buttonIdleText: "生成场景图",
+    previewTitle: "场景展示区",
+    previewAlt: "场景图",
+    activeTabClass: "bg-blue-600 text-white",
+    buttonClass: "bg-blue-600 hover:bg-blue-700",
+    appliedClass: "bg-blue-600 text-white",
+    idleClass: "border border-blue-300 text-blue-700",
+  },
+  prop: {
+    label: "道具",
+    promptPlaceholder: "输入道具提示词",
+    buttonIdleText: "生成道具图",
+    previewTitle: "道具展示区",
+    previewAlt: "道具图",
+    activeTabClass: "bg-amber-600 text-white",
+    buttonClass: "bg-amber-600 hover:bg-amber-700",
+    appliedClass: "bg-amber-600 text-white",
+    idleClass: "border border-amber-300 text-amber-700",
+  },
+  wide: {
+    label: "远景位置关系图",
+    promptPlaceholder: "输入远景位置关系图提示词",
+    buttonIdleText: "生成远景位置关系图",
+    previewTitle: "远景位置关系图展示区",
+    previewAlt: "远景位置关系图",
+    activeTabClass: "bg-cyan-600 text-white",
+    buttonClass: "bg-cyan-600 hover:bg-cyan-700",
+    appliedClass: "bg-cyan-600 text-white",
+    idleClass: "border border-cyan-300 text-cyan-700",
+  },
+};
+const FRAME_MATERIAL_TAB_ORDER: FrameMaterialTab[] = ["character", "baseCharacter", "prop", "scene", "first", "last", "wide"];
+const FRAME_MATERIAL_TAB_LABEL: Record<FrameMaterialTab, string> = {
+  character: "角色形象",
+  baseCharacter: "基础角色",
+  prop: "道具",
+  scene: "场景",
+  first: "首帧",
+  last: "尾帧",
+  wide: "远景位置关系图",
+};
+const FRAME_MATERIAL_REF_START = "<!-- MATERIAL_REF_START -->";
+const FRAME_MATERIAL_REF_END = "<!-- MATERIAL_REF_END -->";
+
+function normalizeRoleKey(name: string) {
+  const value = String(name || "").trim();
+  for (const sep of ["·", "：", ":", "-", "—", "｜", "|"]) {
+    if (value.includes(sep)) {
+      const left = value.split(sep, 1)[0]?.trim();
+      if (left) return left;
+    }
+  }
+  return value;
+}
+
+function escapeRegExp(value: string) {
+  return String(value || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
 const isCompletedVideoVersion = (version: { video_url: string; status: string }) => {
   const status = String(version.status || "").toUpperCase();
   if (!version.video_url) return false;
@@ -210,7 +334,39 @@ const ELEVEN_LANGUAGE_OPTIONS = [
 
 function isKlingColumnHeader(header: string) {
   const text = (header || "").replace(/\s+/g, "");
-  return text === KLING_COLUMN || text === LEGACY_KLING_COLUMN;
+  return text === KLING_COLUMN || text === LEGACY_KLING_COLUMN || text === "视频生成";
+}
+
+function isMaterialManagerColumnHeader(header: string) {
+  const text = (header || "").replace(/\s+/g, "");
+  return text.includes("角色") || text.includes("场景") || text.includes("道具") || text.includes("远景位置关系图") || text.includes("首帧图片");
+}
+
+function resolveFrameGenerateTabFromHeader(header?: string | null): FrameGenerationTab {
+  const text = String(header || "").replace(/\s+/g, "");
+  if (text.includes("远景位置关系图")) return "wide";
+  if (text.includes("道具")) return "prop";
+  if (text.includes("场景")) return "scene";
+  if (text.includes("尾帧")) return "last";
+  return "first";
+}
+
+function resolveFrameMaterialTabFromHeader(header?: string | null): FrameMaterialTab {
+  const text = String(header || "").replace(/\s+/g, "");
+  if (text.includes("远景位置关系图")) return "wide";
+  if (text.includes("道具")) return "prop";
+  if (text.includes("场景")) return "scene";
+  if (text.includes("尾帧")) return "last";
+  if (text.includes("首帧")) return "first";
+  return "character";
+}
+
+function resolveFrameTypeFromMaterialTab(tab: FrameMaterialTab): FrameGenerationTab | null {
+  if (tab === "character" || tab === "baseCharacter") return "character";
+  if (tab === "first" || tab === "last" || tab === "scene" || tab === "prop" || tab === "wide") {
+    return tab;
+  }
+  return null;
 }
 
 function getSceneColumnIndex(headers: string[]) {
@@ -298,22 +454,35 @@ export function ScriptEditor({
   const [videoEditKeepOriginalSound, setVideoEditKeepOriginalSound] = useState(true);
   const [videoEditError, setVideoEditError] = useState("");
   const [frameModalRowIndex, setFrameModalRowIndex] = useState<number | null>(null);
+  const [frameModalCellTarget, setFrameModalCellTarget] = useState<FrameModalCellTarget | null>(null);
   const [frameModalTab, setFrameModalTab] = useState<FrameMaterialTab>("character");
-  const [frameGenerateTab, setFrameGenerateTab] = useState<"first" | "last">("first");
+  const [frameGenerateTab, setFrameGenerateTab] = useState<FrameGenerationTab>("first");
+  const [frameMaterialNameInput, setFrameMaterialNameInput] = useState("");
+  const [frameMaterialDescriptionInput, setFrameMaterialDescriptionInput] = useState("");
   const [framePromptInput, setFramePromptInput] = useState("");
   const [frameReferences, setFrameReferences] = useState<FrameReference[]>([]);
-  const [frameGeneratingType, setFrameGeneratingType] = useState<"first" | "last" | null>(null);
+  const [frameGeneratedMetaMap, setFrameGeneratedMetaMap] = useState<Record<string, FrameGeneratedMeta>>({});
+  const [frameGeneratingType, setFrameGeneratingType] = useState<FrameGenerationTab | null>(null);
   const [frameImageModels, setFrameImageModels] = useState<string[]>([FRAME_DEFAULT_IMAGE_MODEL]);
   const [frameImageModel, setFrameImageModel] = useState(FRAME_DEFAULT_IMAGE_MODEL);
+  const [frameCharacterImageMap, setFrameCharacterImageMap] = useState<Record<number, string[]>>({});
   const [frameFirstImageMap, setFrameFirstImageMap] = useState<Record<number, string[]>>({});
   const [frameLastImageMap, setFrameLastImageMap] = useState<Record<number, string[]>>({});
-  const [frameAppliedMap, setFrameAppliedMap] = useState<Record<number, { first?: string; last?: string }>>({});
+  const [frameSceneImageMap, setFrameSceneImageMap] = useState<Record<number, string[]>>({});
+  const [framePropImageMap, setFramePropImageMap] = useState<Record<number, string[]>>({});
+  const [frameWideImageMap, setFrameWideImageMap] = useState<Record<number, string[]>>({});
+  const [frameAppliedMap, setFrameAppliedMap] = useState<Record<number, FrameAppliedState>>({});
   const [framePendingMap, setFramePendingMap] = useState<Record<string, number>>({});
   const [previewFrameUrl, setPreviewFrameUrl] = useState<string | null>(null);
   const [frameError, setFrameError] = useState("");
-  const [frameEditTarget, setFrameEditTarget] = useState<{ frameType: "first" | "last"; imageUrl: string } | null>(null);
+  const [frameNotice, setFrameNotice] = useState("");
+  const [frameSubjectCreatingImageUrl, setFrameSubjectCreatingImageUrl] = useState<string | null>(null);
+  const [frameEditTarget, setFrameEditTarget] = useState<{ frameType: FrameGenerationTab; imageUrl: string } | null>(null);
   const [frameEditInput, setFrameEditInput] = useState("");
   const [frameEditing, setFrameEditing] = useState(false);
+  const [frameGeneratePanelOpen, setFrameGeneratePanelOpen] = useState(false);
+  const [frameDeletingImageUrl, setFrameDeletingImageUrl] = useState<string | null>(null);
+  const [frameScriptAppliedThisSession, setFrameScriptAppliedThisSession] = useState(false);
   const [voiceError, setVoiceError] = useState("");
   const [usePreviousEndFrameMap, setUsePreviousEndFrameMap] = useState<Record<number, boolean>>({});
   const [voiceSelection, setVoiceSelection] = useState<{ start: number; end: number; text: string }>({ start: 0, end: 0, text: "" });
@@ -358,28 +527,28 @@ export function ScriptEditor({
     }
   }, []);
 
-  // Fetch project assets once
-  useEffect(() => {
-    if (projectId) {
-      const fetchAssets = async () => {
-        try {
-          const token = getToken();
-          const res = await fetch(`/api/projects/${projectId}/assets`, {
-            headers: token ? {
-              'Authorization': `Bearer ${token}`
-            } : undefined
-          });
-          if (res.ok) {
-            const data = await res.json();
-            setProjectAssets(data);
-          }
-        } catch (e) {
-          console.error("Failed to fetch project assets", e);
-        }
-      };
-      fetchAssets();
+  const refreshProjectAssets = useCallback(async () => {
+    if (!projectId) return;
+    try {
+      const token = getToken();
+      const res = await fetch(`/api/projects/${projectId}/assets`, {
+        headers: token
+          ? {
+              Authorization: `Bearer ${token}`,
+            }
+          : undefined,
+      });
+      if (!res.ok) return;
+      const data = (await res.json()) as Asset[];
+      setProjectAssets(data);
+    } catch (e) {
+      console.error("Failed to fetch project assets", e);
     }
   }, [projectId]);
+
+  useEffect(() => {
+    void refreshProjectAssets();
+  }, [refreshProjectAssets]);
 
   useEffect(() => {
     if (!projectId) return;
@@ -438,30 +607,50 @@ export function ScriptEditor({
 
   useEffect(() => {
     if (!projectId) {
+      setFrameCharacterImageMap({});
       setFrameFirstImageMap({});
       setFrameLastImageMap({});
+      setFrameSceneImageMap({});
+      setFramePropImageMap({});
+      setFrameWideImageMap({});
       setFrameAppliedMap({});
       setUsePreviousEndFrameMap({});
       setFramePendingMap({});
+      setFrameGeneratedMetaMap({});
       return;
     }
     try {
       const raw = localStorage.getItem(getFrameStateStorageKey(projectId));
       if (!raw) {
+        setFrameCharacterImageMap({});
         setFrameFirstImageMap({});
         setFrameLastImageMap({});
+        setFrameSceneImageMap({});
+        setFramePropImageMap({});
+        setFrameWideImageMap({});
         setFrameAppliedMap({});
         setUsePreviousEndFrameMap({});
         setFramePendingMap({});
+        setFrameGeneratedMetaMap({});
         return;
       }
       const parsed = JSON.parse(raw) as PersistedFrameState;
+      const characterImageMap = parsed.characterImageMap || {};
       const firstImageMap = parsed.firstImageMap || {};
       const lastImageMap = parsed.lastImageMap || {};
+      const sceneImageMap = parsed.sceneImageMap || {};
+      const propImageMap = parsed.propImageMap || {};
+      const wideImageMap = parsed.wideImageMap || {};
+      const generatedMetaMap = parsed.generatedMetaMap || {};
+      setFrameCharacterImageMap(characterImageMap);
       setFrameFirstImageMap(firstImageMap);
       setFrameLastImageMap(lastImageMap);
+      setFrameSceneImageMap(sceneImageMap);
+      setFramePropImageMap(propImageMap);
+      setFrameWideImageMap(wideImageMap);
       setFrameAppliedMap(parsed.appliedMap || {});
       setUsePreviousEndFrameMap(parsed.previousEndFrameMap || {});
+      setFrameGeneratedMetaMap(generatedMetaMap);
       const now = Date.now();
       const rawPendingMap = parsed.pendingMap || {};
       const nextPendingMap: Record<string, number> = {};
@@ -470,38 +659,58 @@ export function ScriptEditor({
         if (!(value > 0 && now - value <= FRAME_PENDING_MAX_AGE_MS)) return;
         const [rowIndexText, frameTypeText] = String(key).split(":", 2);
         const rowIndex = Number(rowIndexText);
-        const frameType = frameTypeText === "last" ? "last" : "first";
+        const frameType = FRAME_GENERATE_TAB_ORDER.includes(frameTypeText as FrameGenerationTab)
+          ? (frameTypeText as FrameGenerationTab)
+          : "first";
         const hasGeneratedImage = Number.isFinite(rowIndex)
-          ? frameType === "first"
-            ? Boolean(firstImageMap[rowIndex]?.length)
-            : Boolean(lastImageMap[rowIndex]?.length)
+          ? frameType === "character"
+            ? Boolean(characterImageMap[rowIndex]?.length)
+            : frameType === "first"
+              ? Boolean(firstImageMap[rowIndex]?.length)
+              : frameType === "last"
+                ? Boolean(lastImageMap[rowIndex]?.length)
+                : frameType === "scene"
+                  ? Boolean(sceneImageMap[rowIndex]?.length)
+                  : frameType === "prop"
+                    ? Boolean(propImageMap[rowIndex]?.length)
+                    : Boolean(wideImageMap[rowIndex]?.length)
           : false;
         if (hasGeneratedImage) return;
         nextPendingMap[key] = value;
       });
       setFramePendingMap(nextPendingMap);
     } catch {
+      setFrameCharacterImageMap({});
       setFrameFirstImageMap({});
       setFrameLastImageMap({});
+      setFrameSceneImageMap({});
+      setFramePropImageMap({});
+      setFrameWideImageMap({});
       setFrameAppliedMap({});
       setUsePreviousEndFrameMap({});
       setFramePendingMap({});
+      setFrameGeneratedMetaMap({});
     }
   }, [projectId]);
 
   useEffect(() => {
     if (!projectId) return;
     const payload: PersistedFrameState = {
+      characterImageMap: frameCharacterImageMap,
       firstImageMap: frameFirstImageMap,
       lastImageMap: frameLastImageMap,
+      sceneImageMap: frameSceneImageMap,
+      propImageMap: framePropImageMap,
+      wideImageMap: frameWideImageMap,
       appliedMap: frameAppliedMap,
       previousEndFrameMap: usePreviousEndFrameMap,
       pendingMap: framePendingMap,
+      generatedMetaMap: frameGeneratedMetaMap,
     };
     try {
       localStorage.setItem(getFrameStateStorageKey(projectId), JSON.stringify(payload));
     } catch {}
-  }, [projectId, frameFirstImageMap, frameLastImageMap, frameAppliedMap, usePreviousEndFrameMap, framePendingMap]);
+  }, [projectId, frameCharacterImageMap, frameFirstImageMap, frameLastImageMap, frameSceneImageMap, framePropImageMap, frameWideImageMap, frameAppliedMap, usePreviousEndFrameMap, framePendingMap, frameGeneratedMetaMap]);
 
   // Parse markdown content into blocks
   const stripThinkingContent = useCallback((markdown: string) => {
@@ -510,10 +719,13 @@ export function ScriptEditor({
     if (/<think>/i.test(cleaned) && !/<\/think>/i.test(cleaned)) {
       const thinkStart = cleaned.search(/<think>/i);
       const tail = cleaned.slice(thinkStart);
-      const firstContentOffset = tail.search(/^\s*(\|.+\||###\s+.+)$/m);
+      const firstContentOffset = tail.search(/^\s*(\|.+\||#{1,6}\s+.+)$/m);
+      const fallbackOffset = tail.search(/\S/m);
       if (thinkStart >= 0) {
         if (firstContentOffset >= 0) {
           cleaned = `${cleaned.slice(0, thinkStart)}${tail.slice(firstContentOffset)}`;
+        } else if (fallbackOffset >= 0) {
+          cleaned = `${cleaned.slice(0, thinkStart)}${tail.slice(fallbackOffset)}`;
         } else {
           cleaned = cleaned.slice(0, thinkStart);
         }
@@ -662,35 +874,51 @@ export function ScriptEditor({
     };
 
     const headers = splitTableLine(headerLine).map((header) => header.trim());
+    const normalizedHeaders = headers.map((header) => header.replace(/\s+/g, ''));
+    if (!normalizedHeaders.includes('角色形象')) {
+      const roleIndex = normalizedHeaders.findIndex((header) => header === '角色');
+      if (roleIndex >= 0) {
+        headers[roleIndex] = '角色形象';
+      }
+    }
     const rows = rowLines.map((line) => {
       const cells = splitTableLine(line).map((cell) => cell.trim().replace(/<br\s*\/?>/gi, "\n"));
       return normalizeRowByHeaders(cells, headers);
     });
-    const klingIndex = headers.findIndex((header) => isKlingColumnHeader(header));
-    if (klingIndex < 0) {
-      headers.push(KLING_COLUMN);
-      rows.forEach((row) => row.push(""));
-    } else {
-      headers[klingIndex] = KLING_COLUMN;
+    const ensureHeaderColumn = (requiredHeader: string) => {
+      const requiredNormalized = requiredHeader.replace(/\s+/g, "");
+      const existingIndex = requiredHeader === KLING_COLUMN
+        ? headers.findIndex((header) => isKlingColumnHeader(header))
+        : headers.findIndex((header) => header.replace(/\s+/g, "") === requiredNormalized);
+      if (existingIndex < 0) {
+        headers.push(requiredHeader);
+        rows.forEach((row) => row.push(""));
+        return;
+      }
+      if (requiredHeader === KLING_COLUMN) {
+        headers[existingIndex] = KLING_COLUMN;
+      }
       rows.forEach((row) => {
-        if (!row[klingIndex]) {
-          row[klingIndex] = "";
+        while (row.length < headers.length) {
+          row.push("");
         }
       });
-    }
+    };
+    STORYBOARD_SYSTEM_COLUMNS.forEach((header) => ensureHeaderColumn(header));
 
     return { type: 'table', headers, rows };
   };
 
   const getColumnWidthClass = (header: string) => {
     const text = header.replace(/\s+/g, '');
-    if (isKlingColumnHeader(text)) return 'min-w-[160px] w-[160px]';
-    if (text.includes('时间轴') || text.includes('时长')) return 'w-[170px] min-w-[170px]';
-    if (text.includes('镜头调度与内容融合')) return 'w-[320px] min-w-[320px]';
+    if (isKlingColumnHeader(text)) return 'min-w-[180px] w-[180px]';
+    if (text.includes('远景位置关系图') || text.includes('首帧图片')) return 'w-[220px] min-w-[220px]';
+    if (text.includes('时间轴') || text.includes('时长') || text.includes('分段时长')) return 'w-[170px] min-w-[170px]';
+    if (text.includes('镜头调度与内容融合') || text.includes('镜头调度与内容')) return 'w-[360px] min-w-[360px]';
     if (text.includes('画面描述')) return 'w-[220px] min-w-[220px]';
-    if (text.includes('角色形象') || text === '形象') return 'w-[180px] min-w-[180px]';
+    if (text.includes('角色形象') || text === '形象' || text === '角色') return 'w-[180px] min-w-[180px]';
     if (text.includes('道具') || text.includes('场景')) return 'w-[180px] min-w-[180px]';
-    if (text.includes('备注')) return 'w-[160px] min-w-[160px]';
+    if (text.includes('备注') || text.includes('分镜')) return 'w-[200px] min-w-[200px]';
     if (text.includes('集数') || text.includes('时长')) return 'w-[80px] min-w-[80px]';
     if (text.includes('场景') || text.includes('人物') || text.includes('角色')) return 'w-[150px] min-w-[150px]';
     if (text.includes('剧情') || text.includes('内容') || text.includes('台词') || text.includes('画面')) return 'min-w-[400px]';
@@ -1119,33 +1347,141 @@ export function ScriptEditor({
   }, []);
 
   const resolveAssetType = useCallback((asset: Asset): FrameMaterialTab | null => {
-    const typeText = String(asset.type || "").toLowerCase();
-    if (typeText.includes("character") || typeText.includes("角色")) return "character";
+    const rawType = String(asset.type || "").trim().toUpperCase();
+    const typeText = rawType.toLowerCase();
+    if (rawType === "CHARACTER_LOOK" || typeText.includes("look") || typeText.includes("角色形象")) return "character";
+    if (rawType === "CHARACTER" || typeText === "character" || typeText.includes("基础角色")) return "baseCharacter";
     if (typeText.includes("prop") || typeText.includes("道具")) return "prop";
     if (typeText.includes("scene") || typeText.includes("场景")) return "scene";
     return null;
   }, []);
 
+  const resolveBaseCharacterNameFromReferences = useCallback((references: FrameReference[]) => {
+    for (const reference of references) {
+      const generatedMetaBaseCharacterName = normalizeRoleKey(String(frameGeneratedMetaMap[reference.imageUrl]?.baseCharacterName || "").trim());
+      if (generatedMetaBaseCharacterName) {
+        return generatedMetaBaseCharacterName;
+      }
+      const matchedAsset = projectAssets.find((asset) => asset.id === reference.assetId);
+      if (!matchedAsset) continue;
+      const boundBaseCharacterName = normalizeRoleKey(String(matchedAsset.base_character_name || "").trim());
+      if (boundBaseCharacterName) {
+        return boundBaseCharacterName;
+      }
+      if (resolveAssetType(matchedAsset) === "baseCharacter") {
+        return normalizeRoleKey(String(matchedAsset.name || "").trim());
+      }
+    }
+    return "";
+  }, [frameGeneratedMetaMap, projectAssets, resolveAssetType]);
+
   const materialAssetsByTab = useMemo(() => {
-    const initial: Record<FrameMaterialTab, Array<{ asset: Asset; imageUrl: string }>> = {
+    const initial: Record<FrameMaterialTab, FrameMaterialEntry[]> = {
       character: [],
+      baseCharacter: [],
       prop: [],
       scene: [],
+      first: [],
+      last: [],
+      wide: [],
     };
-    projectAssets.forEach((asset) => {
+    const appendEntry = (tab: FrameMaterialTab, entry: FrameMaterialEntry) => {
+      if (!entry.imageUrl) return;
+      if (initial[tab].some((item) => item.imageUrl === entry.imageUrl)) return;
+      initial[tab].push(entry);
+    };
+    (projectAssets || []).forEach((asset) => {
       const tab = resolveAssetType(asset);
       if (!tab) return;
       const imageUrl = resolveAssetImageUrl(asset);
       if (!imageUrl) return;
-      initial[tab].push({ asset, imageUrl });
+      const boundBaseCharacterName = normalizeRoleKey(
+        String(asset.base_character_name || (tab === "baseCharacter" ? asset.name : "")).trim()
+      );
+      appendEntry(tab, {
+        id: asset.id,
+        name: asset.name,
+        description: String(asset.description || "").trim(),
+        imageUrl,
+        source: "asset",
+        asset,
+        baseCharacterName: boundBaseCharacterName || undefined,
+      });
     });
+    const materialBlockRegex = /<!--\s*MATERIAL_REF_START\s*-->[\s\S]*?<!--\s*MATERIAL_REF_END\s*-->/g;
+    let scriptMaterialIndex = 0;
+    blocks.forEach((block) => {
+      if (block.type !== "table") return;
+      block.headers.forEach((header, colIndex) => {
+        if (!isMaterialManagerColumnHeader(header)) return;
+        const currentTab = resolveFrameMaterialTabFromHeader(header);
+        block.rows.forEach((row) => {
+          const currentValue = String(row[colIndex] || "");
+          const blocksInCell = currentValue.match(materialBlockRegex) || [];
+          blocksInCell.forEach((blockText) => {
+            const imageUrl = String(blockText.match(/!\[[^\]]*\]\(([^)]+)\)/)?.[1] || "").trim();
+            if (!imageUrl) return;
+            const materialTypeText = String(blockText.match(/素材类型\s*[：:]\s*([^\n]+)/)?.[1] || "").trim();
+            const materialName = String(blockText.match(/素材名\s*[：:]\s*([^\n]+)/)?.[1] || "").trim();
+            const materialDescription = String(blockText.match(/素材描述\s*[：:]\s*([^\n]+)/)?.[1] || "").trim();
+            const baseCharacterName = String(blockText.match(/基础角色\s*[：:]\s*([^\n]+)/)?.[1] || "").trim();
+            const matchedAsset = (projectAssets || []).find((asset) => resolveAssetImageUrl(asset) === imageUrl);
+            const matchedMeta = frameGeneratedMetaMap[imageUrl];
+            const parsedTab = materialTypeText ? resolveFrameMaterialTabFromHeader(materialTypeText) : currentTab;
+            appendEntry(parsedTab, {
+              id: matchedAsset?.id || `script:${parsedTab}:${imageUrl}:${scriptMaterialIndex}`,
+              name: matchedAsset?.name || matchedMeta?.name || materialName || FRAME_MATERIAL_TAB_LABEL[parsedTab],
+              description: (matchedAsset?.description ? String(matchedAsset.description).trim() : "") || matchedMeta?.description || materialDescription || "",
+              imageUrl,
+              source: matchedAsset ? "asset" : "generated",
+              asset: matchedAsset,
+              baseCharacterName:
+                matchedMeta?.baseCharacterName
+                || normalizeRoleKey(String(matchedAsset?.base_character_name || "").trim())
+                || baseCharacterName
+                || undefined,
+            });
+            scriptMaterialIndex += 1;
+          });
+        });
+      });
+    });
+    const appendGeneratedEntriesFromMap = (tab: FrameGenerationTab, imageMap: Record<number, string[]>) => {
+      const orderedRows = Object.entries(imageMap || {}).sort(([left], [right]) => {
+        const leftRow = Number(left);
+        const rightRow = Number(right);
+        if (frameModalRowIndex !== null && leftRow === frameModalRowIndex) return -1;
+        if (frameModalRowIndex !== null && rightRow === frameModalRowIndex) return 1;
+        return leftRow - rightRow;
+      });
+      orderedRows.forEach(([rowKey, imageList]) => {
+        const ownerRowIndex = Number(rowKey);
+        imageList.forEach((imageUrl, index) => {
+          const meta = frameGeneratedMetaMap[imageUrl];
+          appendEntry(tab, {
+            id: `generated:${tab}:${imageUrl}`,
+            name: meta?.name || `${FRAME_MATERIAL_TAB_LABEL[tab]}${index + 1}`,
+            description: meta?.description || (Number.isFinite(ownerRowIndex) ? `来自第 ${ownerRowIndex + 1} 行` : ""),
+            imageUrl,
+            source: "generated",
+            baseCharacterName: meta?.baseCharacterName || undefined,
+          });
+        });
+      });
+    };
+    appendGeneratedEntriesFromMap("character", frameCharacterImageMap);
+    appendGeneratedEntriesFromMap("first", frameFirstImageMap);
+    appendGeneratedEntriesFromMap("last", frameLastImageMap);
+    appendGeneratedEntriesFromMap("scene", frameSceneImageMap);
+    appendGeneratedEntriesFromMap("prop", framePropImageMap);
+    appendGeneratedEntriesFromMap("wide", frameWideImageMap);
     return initial;
-  }, [projectAssets, resolveAssetImageUrl, resolveAssetType]);
+  }, [blocks, projectAssets, resolveAssetImageUrl, resolveAssetType, frameModalCellTarget, frameModalRowIndex, frameCharacterImageMap, frameFirstImageMap, frameLastImageMap, frameSceneImageMap, framePropImageMap, frameWideImageMap, frameGeneratedMetaMap]);
 
   const frameReferenceOptionMap = useMemo(() => {
     const map: Record<string, FrameReference> = {};
-    (Object.values(materialAssetsByTab).flat() || []).forEach(({ asset, imageUrl }) => {
-      map[asset.id] = { assetId: asset.id, name: asset.name, imageUrl };
+    (Object.values(materialAssetsByTab).flat() || []).forEach((entry) => {
+      map[entry.id] = { assetId: entry.id, name: entry.name, imageUrl: entry.imageUrl, source: entry.source };
     });
     return map;
   }, [materialAssetsByTab]);
@@ -1164,7 +1500,8 @@ export function ScriptEditor({
       } else {
         const refName = String(node.dataset.refName || "").trim();
         const refUrl = String(node.dataset.refUrl || "").trim();
-        if (refName && refUrl) refs.push({ assetId: refId, name: refName, imageUrl: refUrl });
+        const refSource = node.dataset.refSource === "generated" ? "generated" : "asset";
+        if (refName && refUrl) refs.push({ assetId: refId, name: refName, imageUrl: refUrl, source: refSource });
       }
     });
     const prompt = String(editor.textContent || "").replace(/\u00a0/g, " ").trim();
@@ -1172,19 +1509,41 @@ export function ScriptEditor({
     setFramePromptInput(prompt);
   }, [frameReferenceOptionMap]);
 
-  const openFrameModal = (globalRowIndex: number) => {
+  const openFrameModal = (globalRowIndex: number, cellTarget: FrameModalCellTarget | null = null) => {
+    const defaultGenerateTab = resolveFrameGenerateTabFromHeader(cellTarget?.columnHeader);
     setFrameModalRowIndex(globalRowIndex);
-    setFrameModalTab("character");
-    setFrameGenerateTab("first");
+    setFrameModalCellTarget(cellTarget);
+    setFrameModalTab(resolveFrameMaterialTabFromHeader(cellTarget?.columnHeader));
+    setFrameGenerateTab(defaultGenerateTab);
+    setFrameMaterialNameInput("");
+    setFrameMaterialDescriptionInput("");
     setFramePromptInput("");
     setFrameReferences([]);
     setFrameError("");
+    setFrameNotice("");
+    setFrameSubjectCreatingImageUrl(null);
+    setFrameEditTarget(null);
+    setFrameEditInput("");
+    setFrameEditing(false);
+    setFrameGeneratePanelOpen(false);
+    setFrameDeletingImageUrl(null);
+    setFrameScriptAppliedThisSession(false);
     window.setTimeout(() => {
       if (frameEditorRef.current) {
         frameEditorRef.current.innerHTML = "";
       }
     }, 0);
   };
+
+  const openFrameGeneratePanel = useCallback((tab: FrameMaterialTab) => {
+    const nextGenerateTab = resolveFrameTypeFromMaterialTab(tab);
+    if (nextGenerateTab) {
+      setFrameGenerateTab(nextGenerateTab);
+    }
+    setFrameGeneratePanelOpen(true);
+    setFrameError("");
+    setFrameNotice("");
+  }, []);
 
   const insertFrameReferenceToken = useCallback((ref: FrameReference) => {
     const editor = frameEditorRef.current;
@@ -1195,6 +1554,7 @@ export function ScriptEditor({
     token.dataset.refId = ref.assetId;
     token.dataset.refName = ref.name;
     token.dataset.refUrl = ref.imageUrl;
+    token.dataset.refSource = ref.source;
     token.contentEditable = "false";
     token.className = "mx-1 inline-flex rounded bg-blue-100 px-2 py-0.5 text-xs text-blue-700 align-middle";
     token.textContent = ref.name;
@@ -1216,10 +1576,6 @@ export function ScriptEditor({
     syncFrameEditorState();
   }, [syncFrameEditorState]);
 
-  const toggleFrameReference = (assetId: string, name: string, imageUrl: string) => {
-    insertFrameReferenceToken({ assetId, name, imageUrl });
-  };
-
   const syncVideoEditEditorState = useCallback(() => {
     const editor = videoEditEditorRef.current;
     if (!editor) return;
@@ -1234,7 +1590,8 @@ export function ScriptEditor({
       } else {
         const refName = String(node.dataset.refName || "").trim();
         const refUrl = String(node.dataset.refUrl || "").trim();
-        if (refName && refUrl) refs.push({ assetId: refId, name: refName, imageUrl: refUrl });
+        const refSource = node.dataset.refSource === "generated" ? "generated" : "asset";
+        if (refName && refUrl) refs.push({ assetId: refId, name: refName, imageUrl: refUrl, source: refSource });
       }
     });
     const prompt = String(editor.textContent || "").replace(/\u00a0/g, " ").trim();
@@ -1251,6 +1608,7 @@ export function ScriptEditor({
     token.dataset.refId = ref.assetId;
     token.dataset.refName = ref.name;
     token.dataset.refUrl = ref.imageUrl;
+    token.dataset.refSource = ref.source;
     token.contentEditable = "false";
     token.className = "mx-1 inline-flex rounded bg-indigo-100 px-2 py-0.5 text-xs text-indigo-700 align-middle";
     token.textContent = ref.name;
@@ -1385,7 +1743,7 @@ export function ScriptEditor({
     closeVideoEditModal();
   };
 
-  const markFramePending = useCallback((rowIndex: number, frameType: "first" | "last", pending: boolean) => {
+  const markFramePending = useCallback((rowIndex: number, frameType: FrameGenerationTab, pending: boolean) => {
     const key = buildFramePendingKey(rowIndex, frameType);
     setFramePendingMap((prev) => {
       if (pending) {
@@ -1398,40 +1756,102 @@ export function ScriptEditor({
     });
   }, []);
 
-  const appendGeneratedFrameImage = useCallback((rowIndex: number, frameType: "first" | "last", imageUrl: string) => {
+  const appendGeneratedFrameImage = useCallback((
+    rowIndex: number,
+    frameType: FrameGenerationTab,
+    imageUrl: string,
+    meta?: { name: string; description: string; baseCharacterName?: string }
+  ) => {
     if (!projectId || !imageUrl) return;
-    setFrameFirstImageMap((prev) => {
-      if (frameType !== "first") return prev;
-      const list = prev[rowIndex] || [];
-      return { ...prev, [rowIndex]: [imageUrl, ...list] };
-    });
-    setFrameLastImageMap((prev) => {
-      if (frameType !== "last") return prev;
-      const list = prev[rowIndex] || [];
-      return { ...prev, [rowIndex]: [imageUrl, ...list] };
-    });
+    const appendToMap = (input: Record<number, string[]>) => {
+      const list = input[rowIndex] || [];
+      return { ...input, [rowIndex]: [imageUrl, ...list] };
+    };
+    if (frameType === "character") {
+      setFrameCharacterImageMap((prev) => appendToMap(prev));
+    } else if (frameType === "first") {
+      setFrameFirstImageMap((prev) => appendToMap(prev));
+    } else if (frameType === "last") {
+      setFrameLastImageMap((prev) => appendToMap(prev));
+    } else if (frameType === "scene") {
+      setFrameSceneImageMap((prev) => appendToMap(prev));
+    } else if (frameType === "prop") {
+      setFramePropImageMap((prev) => appendToMap(prev));
+    } else {
+      setFrameWideImageMap((prev) => appendToMap(prev));
+    }
+    if (meta) {
+      setFrameGeneratedMetaMap((prev) => ({
+        ...prev,
+        [imageUrl]: {
+          name: String(meta.name || "").trim(),
+          description: String(meta.description || "").trim(),
+          frameType,
+          baseCharacterName: String(meta.baseCharacterName || "").trim() || undefined,
+        },
+      }));
+    }
     try {
       const raw = localStorage.getItem(getFrameStateStorageKey(projectId));
       const parsed = raw ? (JSON.parse(raw) as PersistedFrameState) : {};
+      const characterImageMap = parsed.characterImageMap || {};
       const firstImageMap = parsed.firstImageMap || {};
       const lastImageMap = parsed.lastImageMap || {};
-      if (frameType === "first") {
-        const list = firstImageMap[rowIndex] || [];
-        firstImageMap[rowIndex] = [imageUrl, ...list];
+      const sceneImageMap = parsed.sceneImageMap || {};
+      const propImageMap = parsed.propImageMap || {};
+      const wideImageMap = parsed.wideImageMap || {};
+      const generatedMetaMap = parsed.generatedMetaMap || {};
+      if (frameType === "character") {
+        characterImageMap[rowIndex] = [imageUrl, ...(characterImageMap[rowIndex] || [])];
+      } else if (frameType === "first") {
+        firstImageMap[rowIndex] = [imageUrl, ...(firstImageMap[rowIndex] || [])];
+      } else if (frameType === "last") {
+        lastImageMap[rowIndex] = [imageUrl, ...(lastImageMap[rowIndex] || [])];
+      } else if (frameType === "scene") {
+        sceneImageMap[rowIndex] = [imageUrl, ...(sceneImageMap[rowIndex] || [])];
+      } else if (frameType === "prop") {
+        propImageMap[rowIndex] = [imageUrl, ...(propImageMap[rowIndex] || [])];
       } else {
-        const list = lastImageMap[rowIndex] || [];
-        lastImageMap[rowIndex] = [imageUrl, ...list];
+        wideImageMap[rowIndex] = [imageUrl, ...(wideImageMap[rowIndex] || [])];
+      }
+      if (meta) {
+        generatedMetaMap[imageUrl] = {
+          name: String(meta.name || "").trim(),
+          description: String(meta.description || "").trim(),
+          frameType,
+          baseCharacterName: String(meta.baseCharacterName || "").trim() || undefined,
+        };
       }
       localStorage.setItem(
         getFrameStateStorageKey(projectId),
         JSON.stringify({
           ...parsed,
+          characterImageMap,
           firstImageMap,
           lastImageMap,
+          sceneImageMap,
+          propImageMap,
+          wideImageMap,
+          generatedMetaMap,
         })
       );
     } catch {}
   }, [projectId]);
+
+  const getFrameImagesForRow = useCallback((rowIndex: number, frameType: FrameGenerationTab) => {
+    if (frameType === "character") return frameCharacterImageMap[rowIndex] || [];
+    if (frameType === "first") return frameFirstImageMap[rowIndex] || [];
+    if (frameType === "last") return frameLastImageMap[rowIndex] || [];
+    if (frameType === "scene") return frameSceneImageMap[rowIndex] || [];
+    if (frameType === "prop") return framePropImageMap[rowIndex] || [];
+    return frameWideImageMap[rowIndex] || [];
+  }, [frameCharacterImageMap, frameFirstImageMap, frameLastImageMap, frameSceneImageMap, framePropImageMap, frameWideImageMap]);
+
+  const getPreferredFrameImageForRow = useCallback((rowIndex: number, frameType: FrameGenerationTab) => {
+    const applied = frameAppliedMap[rowIndex]?.[frameType];
+    if (applied) return applied;
+    return getFrameImagesForRow(rowIndex, frameType)[0] || "";
+  }, [frameAppliedMap, getFrameImagesForRow]);
 
   const waitForFrameTask = useCallback(async (taskId: string) => {
     if (!projectId) throw new Error("项目不存在");
@@ -1453,12 +1873,18 @@ export function ScriptEditor({
     throw new Error("生成超时，请稍后刷新查看");
   }, [projectId]);
 
-  const generateFrameImage = async (frameType: "first" | "last") => {
+  const generateFrameImage = async (frameType: FrameGenerationTab) => {
     if (!projectId || frameModalRowIndex === null) return;
     const rowIndex = frameModalRowIndex;
     const token = getToken();
     if (!token) return;
     const prompt = framePromptInput.trim();
+    const materialName = frameMaterialNameInput.trim();
+    const materialDescription = frameMaterialDescriptionInput.trim();
+    if (!materialName) {
+      setFrameError("请先输入素材名称");
+      return;
+    }
     if (!prompt) {
       setFrameError("请输入提示词");
       return;
@@ -1466,6 +1892,7 @@ export function ScriptEditor({
     setFrameGeneratingType(frameType);
     markFramePending(rowIndex, frameType, true);
     setFrameError("");
+    setFrameNotice("");
     try {
       const references = Array.from(new Set(frameReferences.map((item) => item.imageUrl))).filter(Boolean);
       const task = await generateSegmentFrameImage(token, projectId, {
@@ -1476,7 +1903,11 @@ export function ScriptEditor({
         model: frameImageModel,
       });
       const generated = await waitForFrameTask(task.task_id);
-      appendGeneratedFrameImage(rowIndex, frameType, generated);
+      appendGeneratedFrameImage(rowIndex, frameType, generated, {
+        name: materialName,
+        description: materialDescription,
+        baseCharacterName: frameType === "character" ? resolveBaseCharacterNameFromReferences(frameReferences) : undefined,
+      });
     } catch (error) {
       if (frameModalRowIndexRef.current === rowIndex) {
         setFrameError(error instanceof Error ? error.message : "生成失败");
@@ -1487,35 +1918,350 @@ export function ScriptEditor({
     }
   };
 
-  const applyFrameForRow = (rowIndex: number, frameType: "first" | "last", imageUrl: string) => {
+  const createCharacterSubjectFromFrameImage = async (imageUrl: string) => {
+    if (!projectId) return;
+    const token = getToken();
+    if (!token) return;
+    const meta = frameGeneratedMetaMap[imageUrl];
+    const baseCharacterName = normalizeRoleKey(String(meta?.baseCharacterName || "").trim());
+    if (!baseCharacterName) {
+      setFrameNotice("");
+      setFrameError("请先在生成角色形象时引用“基础角色”，再创建主体");
+      return;
+    }
+    const matchedVoice = projectVoices.find((item) => normalizeRoleKey(item.character_name) === baseCharacterName);
+    if (!matchedVoice?.voice_id || String(matchedVoice.voice_type || "").toUpperCase() !== "KLING_CUSTOM") {
+      setFrameNotice("");
+      setFrameError(`请先在 Step3 为角色“${baseCharacterName}”上传音频并创建 Kling 音色`);
+      return;
+    }
+
+    setFrameSubjectCreatingImageUrl(imageUrl);
+    setFrameError("");
+    setFrameNotice("");
+    try {
+      await generateImageSubject(token, projectId, {
+        image_url: imageUrl,
+        character_name: baseCharacterName,
+        material_name: String(meta?.name || "").trim() || baseCharacterName,
+        material_description: String(meta?.description || "").trim() || undefined,
+      });
+      setFrameNotice("主体创建成功，可用于 Kling 视频生成时绑定音色");
+    } catch (error) {
+      setFrameError(error instanceof Error ? error.message : "创建主体失败");
+    } finally {
+      setFrameSubjectCreatingImageUrl(null);
+    }
+  };
+
+  const applyFrameForRow = (rowIndex: number, frameType: FrameGenerationTab, imageUrl: string) => {
     setFrameAppliedMap((prev) => {
       const current = prev[rowIndex] || {};
-      const currentValue = frameType === "first" ? current.first : current.last;
+      const currentValue = current[frameType];
       const nextValue = currentValue === imageUrl ? undefined : imageUrl;
       return {
         ...prev,
-        [rowIndex]:
-          frameType === "first"
-            ? { ...current, first: nextValue }
-            : { ...current, last: nextValue },
+        [rowIndex]: { ...current, [frameType]: nextValue },
       };
     });
   };
 
+  const buildAssetReferenceLines = useCallback((references: FrameReference[]) => Array.from(
+    new Set(
+      references
+        .filter((item) => item.source === "asset")
+        .map((item) => {
+          const assetId = String(item.assetId || "").trim();
+          const name = String(item.name || "").trim();
+          if (!assetId || !name) return "";
+          return `${name} [AssetID: ${assetId}]`;
+        })
+        .filter(Boolean)
+    )
+  ), []);
+
+  const buildMaterialScriptValue = useCallback((tab: FrameMaterialTab, entry: FrameMaterialEntry, extraAssetLines: string[] = []) => {
+    const lines: string[] = [];
+    const imageLabel = tab === "scene"
+      ? "场景图"
+      : tab === "prop"
+        ? "道具图"
+        : tab === "wide"
+          ? "远景位置关系图"
+          : tab === "first"
+            ? "首帧图片"
+            : "角色形象";
+    const materialType = FRAME_MATERIAL_TAB_LABEL[tab] || "素材";
+    const materialName = String(entry.name || "").trim();
+    const materialDescription = String(entry.description || "").trim();
+    const baseCharacterName = String(entry.baseCharacterName || "").trim();
+    lines.push(FRAME_MATERIAL_REF_START);
+    if (entry.imageUrl) {
+      lines.push(`![${imageLabel}](${entry.imageUrl})`);
+    }
+    lines.push(`素材类型：${materialType}`);
+    if (materialName) {
+      lines.push(`素材名：${materialName}`);
+    }
+    if (materialDescription) {
+      lines.push(`素材描述：${materialDescription}`);
+    }
+    if (tab === "character" && baseCharacterName) {
+      lines.push(`基础角色：${baseCharacterName}`);
+    }
+    if (entry.source === "asset") {
+      const assetId = String(entry.asset?.id || entry.id || "").trim();
+      if (assetId && materialName) {
+        lines.push(`${materialName} [AssetID: ${assetId}]`);
+      }
+    }
+    extraAssetLines.forEach((line) => {
+      const normalized = String(line || "").trim();
+      if (normalized) lines.push(normalized);
+    });
+    lines.push(FRAME_MATERIAL_REF_END);
+    return lines.filter(Boolean).join("\n").trim();
+  }, []);
+
+  const getStoryboardRowContext = useCallback((globalRowIndex: number) => {
+    let cursor = rowStartIndex;
+    for (let blockIndex = 0; blockIndex < blocks.length; blockIndex += 1) {
+      const block = blocks[blockIndex];
+      if (block.type !== "table") continue;
+      const nextCursor = cursor + block.rows.length;
+      if (globalRowIndex >= cursor && globalRowIndex < nextCursor) {
+        const rowIndex = globalRowIndex - cursor;
+        return {
+          blockIndex,
+          rowIndex,
+          headers: block.headers,
+          row: block.rows[rowIndex] || [],
+        };
+      }
+      cursor = nextCursor;
+    }
+    return null;
+  }, [blocks, rowStartIndex]);
+
+  const resolveScriptTargetForMaterialTab = useCallback((globalRowIndex: number, tab: FrameMaterialTab) => {
+    const rowContext = getStoryboardRowContext(globalRowIndex);
+    if (!rowContext) return null;
+    const normalizedHeaders = rowContext.headers.map((header) => header.replace(/\s+/g, ""));
+    const findHeaderIndex = (matcher: (header: string) => boolean) => normalizedHeaders.findIndex(matcher);
+    let colIndex = -1;
+    if (tab === "character" || tab === "baseCharacter") {
+      colIndex = findHeaderIndex((header) => header.includes("角色形象") || header === "形象");
+      if (colIndex < 0) colIndex = findHeaderIndex((header) => header === "角色" || header.includes("人物"));
+    } else if (tab === "scene") {
+      colIndex = findHeaderIndex((header) => header.includes("场景"));
+    } else if (tab === "prop") {
+      colIndex = findHeaderIndex((header) => header.includes("道具"));
+    } else if (tab === "wide") {
+      colIndex = findHeaderIndex((header) => header.includes("远景位置关系图"));
+    } else if (tab === "first") {
+      colIndex = findHeaderIndex((header) => header.includes("首帧图片"));
+    }
+    if (colIndex < 0) return null;
+    return {
+      blockIndex: rowContext.blockIndex,
+      rowIndex: rowContext.rowIndex,
+      colIndex,
+      columnHeader: rowContext.headers[colIndex] || "",
+    };
+  }, [getStoryboardRowContext]);
+
+  const getTableCellValueByTarget = useCallback((target: { blockIndex: number; rowIndex: number; colIndex: number }) => {
+    const block = blocks[target.blockIndex];
+    if (!block || block.type !== "table") return "";
+    const row = block.rows[target.rowIndex] || [];
+    return String(row[target.colIndex] || "");
+  }, [blocks]);
+
+  const isMaterialEntryAppliedToScript = useCallback((entry: FrameMaterialEntry, tab: FrameMaterialTab = frameModalTab) => {
+    if (frameModalRowIndex === null || !entry.imageUrl) return false;
+    const target = resolveScriptTargetForMaterialTab(frameModalRowIndex, tab);
+    if (!target) return false;
+    const currentValue = getTableCellValueByTarget(target);
+    if (!currentValue) return false;
+    const imagePattern = new RegExp(`!\\[[^\\]]*\\]\\(${escapeRegExp(entry.imageUrl)}\\)`);
+    return imagePattern.test(currentValue);
+  }, [frameModalRowIndex, frameModalTab, getTableCellValueByTarget, resolveScriptTargetForMaterialTab]);
+
+  const applyMaterialEntryToScript = useCallback((entry: FrameMaterialEntry, tab: FrameMaterialTab = frameModalTab) => {
+    if (frameModalRowIndex === null) return;
+    const frameType = resolveFrameTypeFromMaterialTab(tab);
+    if (frameType && entry.imageUrl) {
+      applyFrameForRow(frameModalRowIndex, frameType, entry.imageUrl);
+    }
+    const target = resolveScriptTargetForMaterialTab(frameModalRowIndex, tab);
+    if (target) {
+      const currentValue = getTableCellValueByTarget(target);
+      const imagePattern = new RegExp(`!\\[[^\\]]*\\]\\(${escapeRegExp(entry.imageUrl)}\\)`);
+      const isApplied = imagePattern.test(currentValue);
+      if (isApplied) {
+        const blockPattern = new RegExp(`${escapeRegExp(FRAME_MATERIAL_REF_START)}[\\s\\S]*?${escapeRegExp(FRAME_MATERIAL_REF_END)}\\n?`, "g");
+        let nextValue = String(currentValue || "").replace(blockPattern, (blockText) => {
+          if (blockText.includes(`(${entry.imageUrl})`)) return "";
+          return blockText;
+        });
+        if (nextValue === currentValue) {
+          const imageLinePattern = new RegExp(`^.*!\\[[^\\]]*\\]\\(${escapeRegExp(entry.imageUrl)}\\).*$\\n?`, "gm");
+          nextValue = nextValue.replace(imageLinePattern, "");
+        }
+        nextValue = nextValue.replace(/\n{3,}/g, "\n\n").trim();
+        updateTable(target.blockIndex, target.rowIndex, target.colIndex, nextValue);
+        setFrameScriptAppliedThisSession(true);
+        setFrameError("");
+        return;
+      }
+      const blockValue = buildMaterialScriptValue(tab, entry);
+      const nextValue = [String(currentValue || "").trim(), blockValue]
+        .filter(Boolean)
+        .join("\n\n")
+        .replace(/\n{3,}/g, "\n\n")
+        .trim();
+      updateTable(target.blockIndex, target.rowIndex, target.colIndex, nextValue);
+      setFrameScriptAppliedThisSession(true);
+      setFrameError("");
+      return;
+    }
+    if (frameType && entry.imageUrl) {
+      setFrameScriptAppliedThisSession(true);
+      setFrameError("");
+      return;
+    }
+    setFrameError("当前行缺少可写入的对应剧本列");
+  }, [frameModalRowIndex, frameModalTab, buildMaterialScriptValue, getTableCellValueByTarget, resolveScriptTargetForMaterialTab, applyFrameForRow]);
+
+  const removeFrameReferenceTokensByImageUrl = useCallback((imageUrl: string) => {
+    const editor = frameEditorRef.current;
+    if (!editor || !imageUrl) return;
+    const tokenNodes = Array.from(editor.querySelectorAll("span[data-frame-ref='1']")) as HTMLSpanElement[];
+    tokenNodes.forEach((node) => {
+      if (String(node.dataset.refUrl || "").trim() !== imageUrl) return;
+      const nextSibling = node.nextSibling;
+      node.remove();
+      if (nextSibling?.nodeType === Node.TEXT_NODE && !(nextSibling.textContent || "").trim()) {
+        nextSibling.parentNode?.removeChild(nextSibling);
+      }
+    });
+    syncFrameEditorState();
+  }, [syncFrameEditorState]);
+
+  const removeGeneratedFrameImage = useCallback((rowIndex: number, frameType: FrameGenerationTab, imageUrl: string) => {
+    const removeFromMap = (input: Record<number, string[]>) => {
+      const list = (input[rowIndex] || []).filter((item) => item !== imageUrl);
+      if ((input[rowIndex] || []).length === list.length) return input;
+      const next = { ...input };
+      if (list.length > 0) {
+        next[rowIndex] = list;
+      } else {
+        delete next[rowIndex];
+      }
+      return next;
+    };
+    if (frameType === "first") {
+      setFrameFirstImageMap((prev) => removeFromMap(prev));
+    } else if (frameType === "last") {
+      setFrameLastImageMap((prev) => removeFromMap(prev));
+    } else if (frameType === "scene") {
+      setFrameSceneImageMap((prev) => removeFromMap(prev));
+    } else if (frameType === "prop") {
+      setFramePropImageMap((prev) => removeFromMap(prev));
+    } else {
+      setFrameWideImageMap((prev) => removeFromMap(prev));
+    }
+    setFrameAppliedMap((prev) => {
+      const current = prev[rowIndex];
+      if (!current || current[frameType] !== imageUrl) return prev;
+      const nextRow = { ...current };
+      delete nextRow[frameType];
+      const next = { ...prev };
+      if (Object.keys(nextRow).length > 0) {
+        next[rowIndex] = nextRow;
+      } else {
+        delete next[rowIndex];
+      }
+      return next;
+    });
+  }, []);
+
+  const deleteFrameImage = useCallback(async (frameType: FrameGenerationTab, imageUrl: string) => {
+    if (!projectId || frameModalRowIndex === null || !imageUrl) return;
+    const token = getToken();
+    if (!token) return;
+    setFrameDeletingImageUrl(imageUrl);
+    setFrameError("");
+    try {
+      await deleteSegmentFrameImage(token, projectId, imageUrl);
+      removeGeneratedFrameImage(frameModalRowIndex, frameType, imageUrl);
+      setFrameGeneratedMetaMap((prev) => {
+        if (!Object.prototype.hasOwnProperty.call(prev, imageUrl)) return prev;
+        const next = { ...prev };
+        delete next[imageUrl];
+        return next;
+      });
+      removeFrameReferenceTokensByImageUrl(imageUrl);
+      if (previewFrameUrl === imageUrl) {
+        setPreviewFrameUrl(null);
+      }
+      if (frameEditTarget?.frameType === frameType && frameEditTarget?.imageUrl === imageUrl) {
+        setFrameEditTarget(null);
+        setFrameEditInput("");
+      }
+    } catch (error) {
+      setFrameError(error instanceof Error ? error.message : "删除失败");
+    } finally {
+      setFrameDeletingImageUrl(null);
+    }
+  }, [projectId, frameModalRowIndex, removeGeneratedFrameImage, removeFrameReferenceTokensByImageUrl, previewFrameUrl, frameEditTarget]);
+
   const closeFrameModalAndApply = () => {
+    if (!frameScriptAppliedThisSession && frameModalCellTarget && frameModalRowIndex !== null) {
+      const normalizedHeader = frameModalCellTarget.columnHeader.replace(/\s+/g, "");
+      const targetTab = resolveFrameMaterialTabFromHeader(normalizedHeader);
+      const targetFrameType = resolveFrameGenerateTabFromHeader(normalizedHeader);
+      const preferredImageUrl = getPreferredFrameImageForRow(frameModalRowIndex, targetFrameType);
+      if (preferredImageUrl) {
+        const preferredEntry = (materialAssetsByTab[targetTab] || []).find((entry) => entry.imageUrl === preferredImageUrl)
+          || Object.values(materialAssetsByTab).flat().find((entry) => entry.imageUrl === preferredImageUrl);
+        const preferredMeta = frameGeneratedMetaMap[preferredImageUrl];
+        const nextValue = buildMaterialScriptValue(
+          targetTab,
+          {
+            id: preferredEntry?.id || `preferred:${targetTab}:${preferredImageUrl}`,
+            name: preferredEntry?.name || preferredMeta?.name || frameMaterialNameInput.trim() || FRAME_MATERIAL_TAB_LABEL[targetTab],
+            description: preferredEntry?.description || preferredMeta?.description || frameMaterialDescriptionInput.trim() || "",
+            imageUrl: preferredImageUrl,
+            source: preferredEntry?.source || "generated",
+            asset: preferredEntry?.asset,
+            baseCharacterName: preferredEntry?.baseCharacterName || preferredMeta?.baseCharacterName || undefined,
+          }
+        );
+        if (nextValue) {
+          updateTable(frameModalCellTarget.blockIndex, frameModalCellTarget.rowIndex, frameModalCellTarget.colIndex, nextValue);
+        }
+      }
+    }
     setFrameModalRowIndex(null);
+    setFrameModalCellTarget(null);
     setFramePromptInput("");
+    setFrameMaterialNameInput("");
+    setFrameMaterialDescriptionInput("");
     setFrameReferences([]);
     setFrameError("");
     setFrameEditTarget(null);
     setFrameEditInput("");
     setFrameEditing(false);
+    setFrameGeneratePanelOpen(false);
+    setFrameDeletingImageUrl(null);
+    setFrameScriptAppliedThisSession(false);
     if (frameEditorRef.current) {
       frameEditorRef.current.innerHTML = "";
     }
   };
 
-  const startFrameEdit = (frameType: "first" | "last", imageUrl: string) => {
+  const startFrameEdit = (frameType: FrameGenerationTab, imageUrl: string) => {
     setFrameEditTarget({ frameType, imageUrl });
     setFrameEditInput("");
     setFrameError("");
@@ -1530,6 +2276,12 @@ export function ScriptEditor({
     const token = getToken();
     if (!token) return;
     const editPrompt = frameEditInput.trim();
+    const materialName = frameMaterialNameInput.trim();
+    const materialDescription = frameMaterialDescriptionInput.trim();
+    if (!materialName) {
+      setFrameError("请先输入素材名称");
+      return;
+    }
     if (!editPrompt) {
       setFrameError("请输入修改意见");
       return;
@@ -1537,6 +2289,7 @@ export function ScriptEditor({
     setFrameEditing(true);
     markFramePending(rowIndex, editTarget.frameType, true);
     setFrameError("");
+    setFrameNotice("");
     try {
       const references = Array.from(new Set([editTarget.imageUrl, ...extraRefs])).filter(Boolean);
       const mergedPrompt = `${basePrompt}\n修改意见：${editPrompt}`.trim();
@@ -1548,7 +2301,11 @@ export function ScriptEditor({
         model: frameImageModel,
       });
       const generated = await waitForFrameTask(task.task_id);
-      appendGeneratedFrameImage(rowIndex, editTarget.frameType, generated);
+      appendGeneratedFrameImage(rowIndex, editTarget.frameType, generated, {
+        name: materialName,
+        description: materialDescription,
+        baseCharacterName: editTarget.frameType === "character" ? resolveBaseCharacterNameFromReferences(frameReferences) : undefined,
+      });
       if (frameModalRowIndexRef.current === rowIndex) {
         setFrameEditTarget(null);
         setFrameEditInput("");
@@ -1630,7 +2387,6 @@ export function ScriptEditor({
                         const previewUrl = selectedVersion?.video_url || rowVideoUrl;
                         const versionIndex = completedVersionsForDisplay.findIndex((version) => version.id === effectiveSelectedVersionId);
                         const downloadFilename = `分镜${globalRowIndex + 1}-${versionIndex >= 0 ? `版本${versionIndex + 1}` : "当前版本"}.mp4`;
-                        const normalized = header.replace(/\s+/g, '');
                         const appliedFrames = frameAppliedMap[globalRowIndex] || {};
                         return (
                           <td 
@@ -1660,7 +2416,7 @@ export function ScriptEditor({
                                 >
                                   {generatingGlobalRowIndex === globalRowIndex || isPending ? "生成中" : "生成视频"}
                                 </button>
-                                <label className={`flex items-center gap-1 text-[11px] ${canUsePreviousEndFrame ? "text-slate-600" : "text-slate-300"}`}>
+                                <label className={`flex items-center gap-1 text-[11px] ${!canUsePreviousEndFrame ? "text-slate-300" : "text-slate-600"}`}>
                                   <input
                                     type="checkbox"
                                     checked={canUsePreviousEndFrame ? usePreviousEndFrame : false}
@@ -1672,13 +2428,6 @@ export function ScriptEditor({
                                   />
                                   使用前一条分镜频尾帧
                                 </label>
-                                <button
-                                  type="button"
-                                  onClick={() => openFrameModal(globalRowIndex)}
-                                  className="rounded border border-blue-200 px-3 py-1 text-xs text-blue-700 hover:bg-blue-50"
-                                >
-                                  自定义首尾帧
-                                </button>
                                 {(appliedFrames.first || appliedFrames.last) ? (
                                   <div className="flex items-center gap-2">
                                     {appliedFrames.first ? (
@@ -1773,7 +2522,15 @@ export function ScriptEditor({
                                   onChange={(v) => updateTable(index, rowIndex, colIndex, v)}
                                   projectId={projectId}
                                   projectAssets={projectAssets}
+                                  generatedMetaMap={frameGeneratedMetaMap}
                                   columnHeader={header}
+                                  showMaterialManager={isMaterialManagerColumnHeader(header)}
+                                  onOpenMaterialManager={() => openFrameModal(globalRowIndex, {
+                                    blockIndex: index,
+                                    rowIndex,
+                                    colIndex,
+                                    columnHeader: header,
+                                  })}
                                 />
                               </div>
                             )}
@@ -1867,16 +2624,17 @@ export function ScriptEditor({
               </button>
             </div>
             <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
-              {(materialAssetsByTab[videoEditTab] || []).map(({ asset, imageUrl }) => {
+              {(materialAssetsByTab[videoEditTab] || []).filter((entry) => Boolean(entry.asset)).map((entry) => {
+                const asset = entry.asset as Asset;
                 const selected = videoEditReferences.some((item) => item.assetId === asset.id);
                 return (
                   <button
                     key={`video-edit-${asset.id}`}
                     type="button"
-                    onClick={() => insertVideoEditReferenceToken({ assetId: asset.id, name: asset.name, imageUrl })}
+                    onClick={() => insertVideoEditReferenceToken({ assetId: asset.id, name: asset.name, imageUrl: entry.imageUrl, source: "asset" })}
                     className={`overflow-hidden rounded-lg border text-left ${selected ? "border-indigo-500 ring-2 ring-indigo-200" : "border-slate-200"}`}
                   >
-                    <img src={imageUrl} alt={asset.name} className="h-24 w-full object-cover bg-slate-100" />
+                    <img src={entry.imageUrl} alt={asset.name} className="h-24 w-full object-cover bg-slate-100" />
                     <div className="truncate px-2 py-1 text-xs">{asset.name}</div>
                   </button>
                 );
@@ -1928,8 +2686,9 @@ export function ScriptEditor({
     {frameModalRowIndex !== null ? (
       <div className="fixed inset-0 z-50 overflow-y-auto bg-black/50 px-4 py-6">
         <div className="mx-auto w-full max-w-6xl rounded-2xl border border-slate-200 bg-white shadow-xl">
-          <div className="sticky top-0 z-10 flex items-center justify-between border-b border-slate-100 bg-white px-5 py-4">
-            <div className="text-sm font-semibold text-slate-900">自定义首尾帧</div>
+            <div className="sticky top-0 z-10 flex items-center justify-between border-b border-slate-100 bg-white px-5 py-4">
+              <div className="text-sm font-semibold text-slate-900">{frameModalCellTarget ? "素材管理" : "自定义素材生成"}</div>
+
             <button
               onClick={closeFrameModalAndApply}
               className="rounded-md px-2 py-1 text-xs text-slate-500 hover:bg-slate-100"
@@ -1938,245 +2697,254 @@ export function ScriptEditor({
             </button>
           </div>
           <div className="space-y-4 p-5">
-            <div className="flex items-center gap-2 border-b border-slate-100 pb-2">
-              <button
-                type="button"
-                onClick={() => setFrameModalTab("character")}
-                className={`rounded px-3 py-1 text-xs ${frameModalTab === "character" ? "bg-blue-600 text-white" : "border border-slate-200 text-slate-600"}`}
-              >
-                角色形象
-              </button>
-              <button
-                type="button"
-                onClick={() => setFrameModalTab("prop")}
-                className={`rounded px-3 py-1 text-xs ${frameModalTab === "prop" ? "bg-blue-600 text-white" : "border border-slate-200 text-slate-600"}`}
-              >
-                道具
-              </button>
-              <button
-                type="button"
-                onClick={() => setFrameModalTab("scene")}
-                className={`rounded px-3 py-1 text-xs ${frameModalTab === "scene" ? "bg-blue-600 text-white" : "border border-slate-200 text-slate-600"}`}
-              >
-                场景
-              </button>
+            <div className="space-y-2 border-b border-slate-100 pb-2">
+              <div className="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
+                <div className="flex flex-wrap items-center gap-2">
+                  {FRAME_MATERIAL_TAB_ORDER.map((tab) => (
+                    <button
+                      key={tab}
+                      type="button"
+                      onClick={() => setFrameModalTab(tab)}
+                      className={`rounded px-3 py-1 text-xs ${frameModalTab === tab ? "bg-blue-600 text-white" : "border border-slate-200 text-slate-600"}`}
+                    >
+                      {FRAME_MATERIAL_TAB_LABEL[tab]}
+                    </button>
+                  ))}
+                </div>
+                <button
+                  type="button"
+                  onClick={() => openFrameGeneratePanel(frameModalTab)}
+                  className="shrink-0 rounded border border-blue-200 px-3 py-1.5 text-xs text-blue-700 hover:bg-blue-50"
+                >
+                  创建新素材
+                </button>
+              </div>
+              <div className="text-xs text-slate-500">所有入口共用同一素材管理弹窗，素材按类型显示在各自 tab 中。</div>
             </div>
-            <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
-              {(materialAssetsByTab[frameModalTab] || []).map(({ asset, imageUrl }) => {
-                const selected = frameReferences.some((item) => item.assetId === asset.id);
+            <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 xl:grid-cols-4">
+              {(materialAssetsByTab[frameModalTab] || []).map((entry) => {
+                const promptSelected = frameReferences.some((item) => item.assetId === entry.id);
+                const scriptApplied = isMaterialEntryAppliedToScript(entry, frameModalTab);
                 return (
-                  <button
-                    key={asset.id}
-                    type="button"
-                    onClick={() => toggleFrameReference(asset.id, asset.name, imageUrl)}
-                    className={`overflow-hidden rounded-lg border text-left ${selected ? "border-blue-500 ring-2 ring-blue-200" : "border-slate-200"}`}
+                  <div
+                    key={entry.id}
+                    className={`overflow-hidden rounded-lg border bg-white ${scriptApplied ? "border-emerald-500 ring-2 ring-emerald-200" : "border-slate-200"}`}
                   >
-                    <img src={imageUrl} alt={asset.name} className="h-24 w-full object-cover bg-slate-100" />
-                    <div className="truncate px-2 py-1 text-xs">{asset.name}</div>
-                  </button>
+                    <button
+                      type="button"
+                      onClick={() => setPreviewFrameUrl(entry.imageUrl)}
+                      className="block w-full cursor-zoom-in text-left"
+                    >
+                      <img src={entry.imageUrl} alt={entry.name} className="h-28 w-full object-cover bg-slate-100" />
+                      <div className="truncate px-2 pt-2 text-xs text-slate-700">{entry.name}</div>
+                      {entry.description ? <div className="line-clamp-2 px-2 pb-2 text-[11px] text-slate-500">{entry.description}</div> : <div className="px-2 pb-2 text-[11px] text-slate-300">&nbsp;</div>}
+                    </button>
+                    <div className="flex items-center justify-end gap-2 border-t border-slate-100 p-2">
+                      {frameGeneratePanelOpen ? (
+                        <button
+                          type="button"
+                          onClick={() => insertFrameReferenceToken({ assetId: entry.id, name: entry.name, imageUrl: entry.imageUrl, source: entry.source })}
+                          className={`rounded px-2 py-1 text-[11px] ${promptSelected ? "bg-blue-600 text-white" : "border border-blue-200 text-blue-700 hover:bg-blue-50"}`}
+                        >
+                          {promptSelected ? "已应用到提示词" : "应用到提示词"}
+                        </button>
+                      ) : null}
+                      <button
+                        type="button"
+                        onClick={() => applyMaterialEntryToScript(entry, frameModalTab)}
+                        className={`rounded border px-2 py-1 text-[11px] ${scriptApplied ? "border-rose-200 text-rose-700 hover:bg-rose-50" : "border-emerald-200 text-emerald-700 hover:bg-emerald-50"}`}
+                      >
+                        {scriptApplied ? "取消" : "应用至剧本"}
+                      </button>
+                    </div>
+                  </div>
                 );
               })}
             </div>
-            <div className="space-y-2">
-              <div className="flex flex-wrap items-center gap-2">
-                <button
-                  type="button"
-                  onClick={() => setFrameGenerateTab("first")}
-                  className={`rounded px-3 py-1 text-xs ${frameGenerateTab === "first" ? "bg-emerald-600 text-white" : "border border-slate-200 text-slate-600"}`}
-                >
-                  首帧
-                </button>
-                <button
-                  type="button"
-                  onClick={() => setFrameGenerateTab("last")}
-                  className={`rounded px-3 py-1 text-xs ${frameGenerateTab === "last" ? "bg-fuchsia-600 text-white" : "border border-slate-200 text-slate-600"}`}
-                >
-                  尾帧
-                </button>
-                <label className="ml-1 flex items-center gap-1 text-xs text-slate-600">
-                  <span>模型</span>
-                  <select
-                    value={frameImageModel}
-                    onChange={(event) => setFrameImageModel(event.target.value)}
-                    className="rounded border border-slate-300 bg-white px-2 py-1 text-xs text-slate-700"
-                  >
-                    {frameImageModels.map((modelId) => (
-                      <option key={modelId} value={modelId}>
-                        {modelId}
-                      </option>
-                    ))}
-                  </select>
-                </label>
+            {(materialAssetsByTab[frameModalTab] || []).length === 0 ? (
+              <div className="rounded-lg border border-dashed border-slate-200 bg-slate-50 px-3 py-6 text-center text-xs text-slate-400">
+                {`当前暂无${FRAME_MATERIAL_TAB_LABEL[frameModalTab]}素材`}
               </div>
-              <div className="relative min-h-[96px] w-full rounded-lg border border-slate-200 px-3 py-2">
-                <div
-                  ref={frameEditorRef}
-                  contentEditable
-                  suppressContentEditableWarning
-                  onInput={syncFrameEditorState}
-                  className="min-h-[80px] w-full whitespace-pre-wrap break-words text-sm outline-none"
-                />
-                {!framePromptInput && frameReferences.length === 0 ? (
-                  <span className="pointer-events-none absolute left-3 top-2 text-sm text-slate-400">
-                    输入首尾帧提示词
-                  </span>
-                ) : null}
-              </div>
-              <div className="flex items-center gap-2">
-                {frameGenerateTab === "first" ? (
+            ) : null}
+            {frameGeneratePanelOpen ? (
+              <div className="overflow-hidden rounded-xl border border-slate-200 bg-slate-50">
+                <div className="flex items-center justify-between border-b border-slate-200 bg-white px-4 py-3">
+                  <div>
+                    <div className="text-sm font-semibold text-slate-800">生成素材</div>
+                    <div className="text-xs text-slate-500">可按当前类型创建新素材，并在下方管理生成结果。</div>
+                  </div>
                   <button
                     type="button"
-                    onClick={() => generateFrameImage("first")}
-                    disabled={frameGeneratingType !== null || (frameModalRowIndex !== null && Boolean(framePendingMap[buildFramePendingKey(frameModalRowIndex, "first")]))}
-                    className="rounded bg-emerald-600 px-3 py-1.5 text-xs text-white hover:bg-emerald-700 disabled:opacity-50"
+                    onClick={() => setFrameGeneratePanelOpen(false)}
+                    className="rounded border border-slate-200 bg-white px-2 py-1 text-xs text-slate-600 hover:bg-slate-50"
                   >
-                    {frameGeneratingType === "first" || (frameModalRowIndex !== null && Boolean(framePendingMap[buildFramePendingKey(frameModalRowIndex, "first")])) ? "生成中..." : "生成首帧"}
+                    收起
                   </button>
-                ) : (
-                  <button
-                    type="button"
-                    onClick={() => generateFrameImage("last")}
-                    disabled={frameGeneratingType !== null || (frameModalRowIndex !== null && Boolean(framePendingMap[buildFramePendingKey(frameModalRowIndex, "last")]))}
-                    className="rounded bg-fuchsia-600 px-3 py-1.5 text-xs text-white hover:bg-fuchsia-700 disabled:opacity-50"
-                  >
-                    {frameGeneratingType === "last" || (frameModalRowIndex !== null && Boolean(framePendingMap[buildFramePendingKey(frameModalRowIndex, "last")])) ? "生成中..." : "生成尾帧"}
-                  </button>
-                )}
-                {frameError ? <span className="text-xs text-rose-600">{frameError}</span> : null}
-              </div>
-            </div>
-            <div className="space-y-2">
-              <div className="text-xs font-semibold text-slate-600">首帧展示区</div>
-              <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
-                {(frameFirstImageMap[frameModalRowIndex] || []).map((imageUrl) => {
-                  const applied = frameAppliedMap[frameModalRowIndex]?.first === imageUrl;
-                  const editing = frameEditTarget?.frameType === "first" && frameEditTarget?.imageUrl === imageUrl;
-                  return (
-                    <div key={`first-${imageUrl}`} className="overflow-hidden rounded-lg border border-slate-200">
-                      <img
-                        src={imageUrl}
-                        alt="首帧"
-                        onClick={() => setPreviewFrameUrl(imageUrl)}
-                        className="h-28 w-full cursor-zoom-in object-cover bg-slate-100"
-                      />
-                      <div className="flex items-center justify-end gap-2 p-2">
+                </div>
+                <div className="space-y-4 bg-white p-4">
+                  <div className="space-y-2">
+                    <div className="flex flex-wrap items-center gap-2">
+                      {FRAME_GENERATE_TAB_ORDER.map((tab) => (
                         <button
+                          key={tab}
                           type="button"
-                          onClick={() => applyFrameForRow(frameModalRowIndex, "first", imageUrl)}
-                          className={`rounded px-2 py-1 text-xs ${applied ? "bg-emerald-600 text-white" : "border border-emerald-300 text-emerald-700"}`}
+                          onClick={() => setFrameGenerateTab(tab)}
+                          className={`rounded px-3 py-1 text-xs ${frameGenerateTab === tab ? FRAME_GENERATE_TAB_META[tab].activeTabClass : "border border-slate-200 text-slate-600"}`}
                         >
-                          {applied ? "已应用" : "应用"}
+                          {FRAME_GENERATE_TAB_META[tab].label}
                         </button>
-                        <button
-                          type="button"
-                          onClick={() => startFrameEdit("first", imageUrl)}
-                          className={`rounded px-2 py-1 text-xs ${editing ? "bg-indigo-600 text-white" : "border border-indigo-300 text-indigo-700"}`}
+                      ))}
+                      <label className="ml-1 flex items-center gap-1 text-xs text-slate-600">
+                        <span>模型</span>
+                        <select
+                          value={frameImageModel}
+                          onChange={(event) => setFrameImageModel(event.target.value)}
+                          className="rounded border border-slate-300 bg-white px-2 py-1 text-xs text-slate-700"
                         >
-                          输入修改意见
-                        </button>
-                      </div>
+                          {frameImageModels.map((modelId) => (
+                            <option key={modelId} value={modelId}>
+                              {modelId}
+                            </option>
+                          ))}
+                        </select>
+                      </label>
                     </div>
-                  );
-                })}
-              </div>
-              {frameEditTarget?.frameType === "first" ? (
-                <div className="rounded-lg border border-slate-200 bg-slate-50 p-3">
-                  <textarea
-                    value={frameEditInput}
-                    onChange={(event) => setFrameEditInput(event.target.value)}
-                    placeholder="输入对当前首帧图片的修改意见"
-                    className="h-20 w-full rounded border border-slate-200 bg-white px-3 py-2 text-sm outline-none"
-                  />
-                  <div className="mt-2 flex justify-end gap-2">
-                    <button
-                      type="button"
-                      onClick={() => {
-                        setFrameEditTarget(null);
-                        setFrameEditInput("");
-                      }}
-                      disabled={frameEditing}
-                      className="rounded border border-slate-300 bg-white px-3 py-1.5 text-xs text-slate-700 hover:bg-slate-50 disabled:opacity-50"
-                    >
-                      取消
-                    </button>
-                    <button
-                      type="button"
-                      onClick={submitFrameEdit}
-                      disabled={frameEditing}
-                      className="rounded bg-indigo-600 px-3 py-1.5 text-xs text-white hover:bg-indigo-700 disabled:opacity-50"
-                    >
-                      {frameEditing ? "修改中..." : "修改图片"}
-                    </button>
+                    <div className="grid grid-cols-1 gap-2 md:grid-cols-2">
+                      <input
+                        value={frameMaterialNameInput}
+                        onChange={(event) => setFrameMaterialNameInput(event.target.value)}
+                        className="w-full rounded border border-slate-200 px-3 py-2 text-sm outline-none focus:border-blue-500"
+                        placeholder="素材名称（必填）"
+                      />
+                      <input
+                        value={frameMaterialDescriptionInput}
+                        onChange={(event) => setFrameMaterialDescriptionInput(event.target.value)}
+                        className="w-full rounded border border-slate-200 px-3 py-2 text-sm outline-none focus:border-blue-500"
+                        placeholder="素材描述（可选，展示为灰色小字）"
+                      />
+                    </div>
+                    <div className="relative min-h-[96px] w-full rounded-lg border border-slate-200 px-3 py-2">
+                      <div
+                        ref={frameEditorRef}
+                        contentEditable
+                        suppressContentEditableWarning
+                        onInput={syncFrameEditorState}
+                        className="min-h-[80px] w-full whitespace-pre-wrap break-words text-sm outline-none"
+                      />
+                      {!framePromptInput && frameReferences.length === 0 ? (
+                        <span className="pointer-events-none absolute left-3 top-2 text-sm text-slate-400">
+                          {FRAME_GENERATE_TAB_META[frameGenerateTab].promptPlaceholder}
+                        </span>
+                      ) : null}
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <button
+                        type="button"
+                        onClick={() => generateFrameImage(frameGenerateTab)}
+                        disabled={frameGeneratingType !== null || (frameModalRowIndex !== null && Boolean(framePendingMap[buildFramePendingKey(frameModalRowIndex, frameGenerateTab)]))}
+                        className={`rounded px-3 py-1.5 text-xs text-white disabled:opacity-50 ${FRAME_GENERATE_TAB_META[frameGenerateTab].buttonClass}`}
+                      >
+                        {frameGeneratingType === frameGenerateTab || (frameModalRowIndex !== null && Boolean(framePendingMap[buildFramePendingKey(frameModalRowIndex, frameGenerateTab)])) ? "生成中..." : FRAME_GENERATE_TAB_META[frameGenerateTab].buttonIdleText}
+                      </button>
+                      {frameError ? <span className="text-xs text-rose-600">{frameError}</span> : null}
+                      {!frameError && frameNotice ? <span className="text-xs text-emerald-600">{frameNotice}</span> : null}
+                    </div>
+                  </div>
+                  <div className="space-y-2">
+                    <div className="text-xs font-semibold text-slate-600">{FRAME_GENERATE_TAB_META[frameGenerateTab].previewTitle}</div>
+                    <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 xl:grid-cols-4">
+                      {getFrameImagesForRow(frameModalRowIndex, frameGenerateTab).map((imageUrl) => {
+                        const applied = frameAppliedMap[frameModalRowIndex]?.[frameGenerateTab] === imageUrl;
+                        const editing = frameEditTarget?.frameType === frameGenerateTab && frameEditTarget?.imageUrl === imageUrl;
+                        const deleting = frameDeletingImageUrl === imageUrl;
+                        return (
+                          <div key={`${frameGenerateTab}-${imageUrl}`} className="overflow-hidden rounded-lg border border-slate-200">
+                            <img
+                              src={imageUrl}
+                              alt={FRAME_GENERATE_TAB_META[frameGenerateTab].previewAlt}
+                              onClick={() => setPreviewFrameUrl(imageUrl)}
+                              className="h-28 w-full cursor-zoom-in object-cover bg-slate-100"
+                            />
+                            <div className="flex flex-wrap items-center justify-end gap-2 p-2">
+                              {frameGenerateTab === "character" ? (
+                                <button
+                                  type="button"
+                                  title="用于可灵模型生成视频时绑定音色"
+                                  onClick={() => createCharacterSubjectFromFrameImage(imageUrl)}
+                                  disabled={frameSubjectCreatingImageUrl === imageUrl}
+                                  className="rounded border border-sky-200 px-2 py-1 text-xs text-sky-700 hover:bg-sky-50 disabled:opacity-50"
+                                >
+                                  {frameSubjectCreatingImageUrl === imageUrl ? "创建中..." : "创建主体"}
+                                </button>
+                              ) : null}
+                              <button
+                                type="button"
+                                onClick={() => applyFrameForRow(frameModalRowIndex, frameGenerateTab, imageUrl)}
+                                className={`rounded px-2 py-1 text-xs ${applied ? FRAME_GENERATE_TAB_META[frameGenerateTab].appliedClass : FRAME_GENERATE_TAB_META[frameGenerateTab].idleClass}`}
+                              >
+                                {applied ? "已应用" : "应用"}
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => startFrameEdit(frameGenerateTab, imageUrl)}
+                                className={`rounded px-2 py-1 text-xs ${editing ? "bg-indigo-600 text-white" : "border border-indigo-300 text-indigo-700"}`}
+                              >
+                                输入修改意见
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => deleteFrameImage(frameGenerateTab, imageUrl)}
+                                disabled={deleting}
+                                className="rounded border border-rose-200 px-2 py-1 text-xs text-rose-600 hover:bg-rose-50 disabled:opacity-50"
+                              >
+                                {deleting ? "删除中..." : "删除"}
+                              </button>
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                    {getFrameImagesForRow(frameModalRowIndex, frameGenerateTab).length === 0 ? (
+                      <div className="rounded-lg border border-dashed border-slate-200 bg-slate-50 px-3 py-6 text-center text-xs text-slate-400">
+                        当前暂无{FRAME_GENERATE_TAB_META[frameGenerateTab].label}图片
+                      </div>
+                    ) : null}
+                    {frameEditTarget?.frameType === frameGenerateTab ? (
+                      <div className="rounded-lg border border-slate-200 bg-slate-50 p-3">
+                        <textarea
+                          value={frameEditInput}
+                          onChange={(event) => setFrameEditInput(event.target.value)}
+                          placeholder={`输入对当前${FRAME_GENERATE_TAB_META[frameGenerateTab].label}图片的修改意见`}
+                          className="h-20 w-full rounded border border-slate-200 bg-white px-3 py-2 text-sm outline-none"
+                        />
+                        <div className="mt-2 flex justify-end gap-2">
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setFrameEditTarget(null);
+                              setFrameEditInput("");
+                            }}
+                            disabled={frameEditing}
+                            className="rounded border border-slate-300 bg-white px-3 py-1.5 text-xs text-slate-700 hover:bg-slate-50 disabled:opacity-50"
+                          >
+                            取消
+                          </button>
+                          <button
+                            type="button"
+                            onClick={submitFrameEdit}
+                            disabled={frameEditing}
+                            className="rounded bg-indigo-600 px-3 py-1.5 text-xs text-white hover:bg-indigo-700 disabled:opacity-50"
+                          >
+                            {frameEditing ? "修改中..." : "修改图片"}
+                          </button>
+                        </div>
+                      </div>
+                    ) : null}
                   </div>
                 </div>
-              ) : null}
-            </div>
-            <div className="space-y-2">
-              <div className="text-xs font-semibold text-slate-600">尾帧展示区</div>
-              <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
-                {(frameLastImageMap[frameModalRowIndex] || []).map((imageUrl) => {
-                  const applied = frameAppliedMap[frameModalRowIndex]?.last === imageUrl;
-                  const editing = frameEditTarget?.frameType === "last" && frameEditTarget?.imageUrl === imageUrl;
-                  return (
-                    <div key={`last-${imageUrl}`} className="overflow-hidden rounded-lg border border-slate-200">
-                      <img
-                        src={imageUrl}
-                        alt="尾帧"
-                        onClick={() => setPreviewFrameUrl(imageUrl)}
-                        className="h-28 w-full cursor-zoom-in object-cover bg-slate-100"
-                      />
-                      <div className="flex items-center justify-end gap-2 p-2">
-                        <button
-                          type="button"
-                          onClick={() => applyFrameForRow(frameModalRowIndex, "last", imageUrl)}
-                          className={`rounded px-2 py-1 text-xs ${applied ? "bg-fuchsia-600 text-white" : "border border-fuchsia-300 text-fuchsia-700"}`}
-                        >
-                          {applied ? "已应用" : "应用"}
-                        </button>
-                        <button
-                          type="button"
-                          onClick={() => startFrameEdit("last", imageUrl)}
-                          className={`rounded px-2 py-1 text-xs ${editing ? "bg-indigo-600 text-white" : "border border-indigo-300 text-indigo-700"}`}
-                        >
-                          输入修改意见
-                        </button>
-                      </div>
-                    </div>
-                  );
-                })}
               </div>
-              {frameEditTarget?.frameType === "last" ? (
-                <div className="rounded-lg border border-slate-200 bg-slate-50 p-3">
-                  <textarea
-                    value={frameEditInput}
-                    onChange={(event) => setFrameEditInput(event.target.value)}
-                    placeholder="输入对当前尾帧图片的修改意见"
-                    className="h-20 w-full rounded border border-slate-200 bg-white px-3 py-2 text-sm outline-none"
-                  />
-                  <div className="mt-2 flex justify-end gap-2">
-                    <button
-                      type="button"
-                      onClick={() => {
-                        setFrameEditTarget(null);
-                        setFrameEditInput("");
-                      }}
-                      disabled={frameEditing}
-                      className="rounded border border-slate-300 bg-white px-3 py-1.5 text-xs text-slate-700 hover:bg-slate-50 disabled:opacity-50"
-                    >
-                      取消
-                    </button>
-                    <button
-                      type="button"
-                      onClick={submitFrameEdit}
-                      disabled={frameEditing}
-                      className="rounded bg-indigo-600 px-3 py-1.5 text-xs text-white hover:bg-indigo-700 disabled:opacity-50"
-                    >
-                      {frameEditing ? "修改中..." : "修改图片"}
-                    </button>
-                  </div>
-                </div>
-              ) : null}
-            </div>
+            ) : null}
+            {!frameGeneratePanelOpen && frameError ? <div className="border-t border-slate-200 px-4 py-3 text-xs text-rose-600">{frameError}</div> : null}
           </div>
         </div>
       </div>
@@ -2498,13 +3266,19 @@ function TableCell({
   onChange,
   projectId,
   projectAssets,
+  generatedMetaMap,
   columnHeader,
+  showMaterialManager = false,
+  onOpenMaterialManager,
 }: {
   value: string;
   onChange: (v: string) => void;
   projectId?: string;
   projectAssets?: Asset[];
+  generatedMetaMap?: Record<string, FrameGeneratedMeta>;
   columnHeader?: string;
+  showMaterialManager?: boolean;
+  onOpenMaterialManager?: () => void;
 }) {
   const [isEditing, setIsEditing] = useState(false);
   const [previewUrl, setPreviewUrl] = useState<string | null>(null);
@@ -2594,6 +3368,13 @@ function TableCell({
         .sort((a, b) => b.score - a.score);
       return scored[0]?.asset;
     };
+    const findAssetByImageUrl = (imageUrl: string) => {
+      const normalizedImageUrl = String(imageUrl || "").trim();
+      if (!normalizedImageUrl) return undefined;
+      return searchPool.find((asset) => resolveAssetImageUrl(asset) === normalizedImageUrl)
+        || allAssets.find((asset) => resolveAssetImageUrl(asset) === normalizedImageUrl);
+    };
+    const genericMaterialNameSet = new Set(["角色", "角色形象", "基础角色", "场景", "道具", "首帧", "尾帧", "远景位置关系图", "素材"]);
     const pushRef = (raw: string) => {
       const text = String(raw || "").trim();
       if (!text) return;
@@ -2613,9 +3394,40 @@ function TableCell({
       pushRef((match[1] || "").trim());
     }
 
-    const text = trimmedValue.replace(assetTagRegex, "").trim();
+    const text = trimmedValue
+      .replace(assetTagRegex, "")
+      .replace(/!\[[^\]]*\]\(([^)]+)\)\s*\n\s*素材类型\s*[：:]\s*([^\n]+)\s*\n\s*素材名\s*[：:]\s*([^\n]+)/gim, (match, imageUrl, _materialType, materialName) => {
+        const normalizedImageUrl = String(imageUrl || "").trim();
+        const normalizedName = String(materialName || "").trim();
+        if (!genericMaterialNameSet.has(normalizedName)) return match;
+        const matchedAsset = findAssetByImageUrl(normalizedImageUrl);
+        const matchedMeta = generatedMetaMap?.[normalizedImageUrl];
+        const merged = [
+          String(matchedAsset?.name || matchedMeta?.name || "").trim(),
+          String(matchedAsset?.description || matchedMeta?.description || "").trim(),
+        ].filter(Boolean).join(" ");
+        if (!merged) return match;
+        return match.replace(/素材名\s*[：:]\s*([^\n]+)/i, `素材名：${merged}`);
+      })
+      .replace(/^\s*素材类型\s*[：:].*$/gim, "")
+      .replace(/^\s*素材名\s*[：:]\s*(.+?)\s*\n\s*素材描述\s*[：:]\s*(.+?)\s*$/gim, (_match, name, desc) => {
+        const merged = [String(name || "").trim(), String(desc || "").trim()].filter(Boolean).join(" ");
+        return merged ? `素材名：${merged}` : "";
+      })
+      .replace(/^\s*素材描述\s*[：:].*$/gim, "")
+      .replace(/^\s*.+?\s*\[AssetID:\s*[^\]]+\]\s*$/gim, "")
+      .replace(/^\s*<!--\s*MATERIAL_REF_START\s*-->\s*$/gim, "")
+      .replace(/^\s*<!--\s*MATERIAL_REF_END\s*-->\s*$/gim, "")
+      .replace(/^\s*<\s*!\s*--\s*MATERIAL_REF_START\s*$/gim, "")
+      .replace(/^\s*<\s*!\s*--\s*$/gim, "")
+      .replace(/^\s*--\s*>\s*$/gim, "")
+      .replace(/^\s*MATERIAL_REF_START\s*$/gim, "")
+      .replace(/^\s*MATERIAL_REF_END\s*$/gim, "")
+      .replace(/^\s*<\s*!\s*--\s*MATERIAL_REF_END\s*$/gim, "")
+      .replace(/\n{3,}/g, "\n\n")
+      .trim();
     return { displayText: text, assetRefs: refs };
-  }, [enableAssetBindingAssist, normalizeAssetKey, preferredAssetTypes, projectAssets, value]);
+  }, [enableAssetBindingAssist, generatedMetaMap, normalizeAssetKey, preferredAssetTypes, projectAssets, value]);
   const pickerAssetData = React.useMemo<{
     items: Array<{ id: string; name: string; hasImage: boolean; imageUrl: string }>;
     canonicalIdBySourceId: Map<string, string>;
@@ -2742,6 +3554,9 @@ function TableCell({
     setPickerOpen(false);
   }, [normalizeAssetKey, onChange, pickerAssets, selectedPickerIds, value]);
 
+  const hasMaterialBlock = /MATERIAL_REF_START|!\[[^\]]*\]\(/i.test(String(value || ""));
+  const enableDirectEditOnClick = !showMaterialManager && !hasMaterialBlock;
+
   if (isEditing) {
     return (
       <AutoResizeTextarea
@@ -2757,10 +3572,26 @@ function TableCell({
   return (
     <>
       <div 
-        onClick={() => setIsEditing(true)}
-        className="min-h-[24px] cursor-text"
+        onClick={() => {
+          if (enableDirectEditOnClick) setIsEditing(true);
+        }}
+        onDoubleClick={() => setIsEditing(true)}
+        className={`min-h-[24px] ${enableDirectEditOnClick ? "cursor-text" : "cursor-default"}`}
       >
-        {enableAssetBindingAssist && pickerAssetType ? (
+        {showMaterialManager ? (
+          <div className="sticky top-0 z-20 mb-1 inline-block rounded bg-white">
+            <button
+              type="button"
+              onClick={(event) => {
+                event.stopPropagation();
+                onOpenMaterialManager?.();
+              }}
+              className="rounded border border-blue-200 px-2 py-0.5 text-xs text-blue-600 hover:bg-blue-50"
+            >
+              素材管理
+            </button>
+          </div>
+        ) : enableAssetBindingAssist && pickerAssetType ? (
           <div className="mb-1">
             <button
               type="button"
@@ -2776,11 +3607,41 @@ function TableCell({
             <ReactMarkdown
               remarkPlugins={[remarkGfm]}
               components={{
-                p: ({ children }) => <p className="whitespace-pre-wrap mb-1 last:mb-0">{children}</p>,
+                p: ({ children }) => {
+                  const plainText = React.Children.toArray(children)
+                    .map((child) => (typeof child === "string" || typeof child === "number" ? String(child) : ""))
+                    .join("")
+                    .trim();
+                  if (!plainText) return <p className="whitespace-pre-wrap mb-1 last:mb-0">{children}</p>;
+                  if (/MATERIAL_REF_START|MATERIAL_REF_END/i.test(plainText)) return null;
+                  if (/^<\s*!\s*--\s*>?$/.test(plainText) || /^--\s*>$/.test(plainText)) return null;
+                  if (/^素材类型\s*[：:]/.test(plainText)) return null;
+                  if (/^素材名\s*[：:]/.test(plainText)) {
+                    const name = plainText.replace(/^素材名\s*[：:]\s*/, "").trim();
+                    return name ? <p className="mb-0.5 text-[11px] text-slate-400">{name}</p> : null;
+                  }
+                  if (/^素材描述\s*[：:]/.test(plainText)) return null;
+                  return <p className="whitespace-pre-wrap mb-1 last:mb-0">{children}</p>;
+                },
                 strong: ({ children }) => <strong className="font-semibold text-slate-800">{children}</strong>,
                 ul: ({ children }) => <ul className="list-disc pl-5 space-y-1">{children}</ul>,
                 ol: ({ children }) => <ol className="list-decimal pl-5 space-y-1">{children}</ol>,
                 li: ({ children }) => <li className="whitespace-pre-wrap">{children}</li>,
+                img: ({ src, alt }) => (
+                  // eslint-disable-next-line jsx-a11y/no-noninteractive-element-interactions, @next/next/no-img-element
+                  <img
+                    src={String(src || "")}
+                    alt={String(alt || "")}
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      const nextUrl = String(src || "").trim();
+                      if (!nextUrl) return;
+                      setPreviewTitle(String(alt || "素材预览"));
+                      setPreviewUrl(nextUrl);
+                    }}
+                    className="my-1 block h-auto w-full max-w-full cursor-zoom-in rounded border border-slate-200 object-contain"
+                  />
+                ),
               }}
             >
               {displayText}
@@ -2788,7 +3649,7 @@ function TableCell({
           ) : <span className="text-slate-300 italic">空</span>}
         </div>
 
-        {enableAssetBindingAssist && assetRefs.length > 0 ? (
+        {enableAssetBindingAssist && assetRefs.length > 0 && !showMaterialManager ? (
           <div className="mt-1 flex flex-wrap gap-2">
             {assetRefs.map((assetRef, index) => {
               const image = assetRef.id ? assetImages.find((item) => item.id === assetRef.id) : undefined;

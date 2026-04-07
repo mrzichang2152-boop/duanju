@@ -44,3 +44,7 @@ class SegmentFrameGenerateRequest(BaseModel):
 
 class SegmentFrameGenerateResponse(BaseModel):
     image_url: str
+
+
+class SegmentFrameDeleteRequest(BaseModel):
+    image_url: str

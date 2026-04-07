@@ -183,6 +183,8 @@ export default function AssetsPage() {
   const [defaultImageModel, setDefaultImageModel] = useState("");
   const [savedModel, setSavedModel] = useState("");
   const [message, setMessage] = useState<string | null>(null);
+  const [actionToast, setActionToast] = useState<{ type: "error" | "success" | "info"; text: string } | null>(null);
+  const [activeAssetTab, setActiveAssetTab] = useState<"character" | "prop" | "scene">("character");
   const redirectingMissingProjectRef = useRef(false);
 
   const redirectToProjectsOnMissing = useCallback(() => {
@@ -202,6 +204,12 @@ export default function AssetsPage() {
     const timer = setTimeout(() => setMessage(null), 2200);
     return () => clearTimeout(timer);
   }, [message]);
+
+  useEffect(() => {
+    if (!actionToast) return;
+    const timer = setTimeout(() => setActionToast(null), 2600);
+    return () => clearTimeout(timer);
+  }, [actionToast]);
 
   const STYLE_OPTIONS = [
     "真人电影写实", "3D 写实渲染", "3D 超写实渲染", "3D 虚幻引擎风", "3D 游戏 CG",
@@ -580,7 +588,9 @@ export default function AssetsPage() {
       return;
     }
     if (readPendingAssetGenJobs(projectId).length >= MAX_PARALLEL_GENERATIONS) {
-      setStatus(`最多同时生成 ${MAX_PARALLEL_GENERATIONS} 张，请等待已有任务完成`);
+      const text = `最多同时生成 ${MAX_PARALLEL_GENERATIONS} 张，请等待已有任务完成`;
+      setStatus(text);
+      setActionToast({ type: "error", text });
       return;
     }
     const activeAssetId =
@@ -896,9 +906,8 @@ export default function AssetsPage() {
 
   const characterAssets = aggregatedAssets.filter((asset) => asset.type === "CHARACTER");
   const lookAssets = aggregatedAssets.filter((asset) => asset.type === "CHARACTER_LOOK");
-  const otherAssets = aggregatedAssets.filter(
-    (asset) => asset.type !== "CHARACTER" && asset.type !== "CHARACTER_LOOK"
-  );
+  const propAssets = aggregatedAssets.filter((asset) => asset.type === "PROP");
+  const sceneAssets = aggregatedAssets.filter((asset) => asset.type === "SCENE");
 
   const looksByRole = lookAssets.reduce<Record<string, AggregatedAsset[]>>((acc, asset) => {
     const baseName = normalizeRoleKey(asset.name);
@@ -1246,6 +1255,19 @@ export default function AssetsPage() {
           </button>
         </div>
       )}
+      {actionToast ? (
+        <div
+          className={`fixed right-6 top-20 z-50 max-w-md rounded-lg border px-4 py-3 text-sm shadow-lg ${
+            actionToast.type === "error"
+              ? "border-red-200 bg-red-50 text-red-700"
+              : actionToast.type === "success"
+                ? "border-emerald-200 bg-emerald-50 text-emerald-700"
+                : "border-sky-200 bg-sky-50 text-sky-700"
+          }`}
+        >
+          {actionToast.text}
+        </div>
+      ) : null}
       <div className="flex items-center justify-between">
         <h1 className="text-2xl font-semibold">Step 3: 生成素材</h1>
         <div className="flex items-center gap-2">
@@ -1294,10 +1316,34 @@ export default function AssetsPage() {
         </div>
         {status ? <div className="mt-2 text-blue-600">{status}</div> : null}
         {configLoading ? <div className="mt-1 text-xs text-slate-400">模型加载中...</div> : null}
+        <div className="mt-4 flex items-center gap-2 border-b border-slate-200 pb-3">
+          <button
+            type="button"
+            onClick={() => setActiveAssetTab("character")}
+            className={`rounded-lg px-3 py-2 text-sm ${activeAssetTab === "character" ? "bg-slate-900 text-white" : "text-slate-600 hover:bg-slate-50"}`}
+          >
+            角色
+          </button>
+          <button
+            type="button"
+            onClick={() => setActiveAssetTab("prop")}
+            className={`rounded-lg px-3 py-2 text-sm ${activeAssetTab === "prop" ? "bg-slate-900 text-white" : "text-slate-600 hover:bg-slate-50"}`}
+          >
+            道具
+          </button>
+          <button
+            type="button"
+            onClick={() => setActiveAssetTab("scene")}
+            className={`rounded-lg px-3 py-2 text-sm ${activeAssetTab === "scene" ? "bg-slate-900 text-white" : "text-slate-600 hover:bg-slate-50"}`}
+          >
+            场景
+          </button>
+        </div>
         {assets.length === 0 ? (
           <div className="mt-2 text-slate-600">{error ? "素材加载失败，请稍后重试。" : "尚未提取素材。"}</div>
-        ) : (
+        ) : activeAssetTab === "character" ? (
           <div className="mt-4 space-y-4">
+            {characterAssets.length === 0 ? <div className="text-slate-600">暂无角色素材。</div> : null}
             {characterAssets.map((asset) => (
               <div key={asset.id} className="rounded-lg border border-sky-200 border-l-4 border-l-sky-300 bg-sky-50/50 p-3">
                 {renderAssetContent(
@@ -1326,10 +1372,7 @@ export default function AssetsPage() {
                     <div className="text-xs font-semibold text-slate-600">角色形象</div>
                     <div className="mt-3 space-y-3">
                       {looksByRole[normalizeRoleKey(asset.name)].map((look) => (
-                        <div
-                          key={look.id}
-                          className="rounded-lg border border-slate-200 p-3"
-                        >
+                        <div key={look.id} className="rounded-lg border border-slate-200 p-3">
                           {renderAssetContent(look)}
                         </div>
                       ))}
@@ -1338,7 +1381,16 @@ export default function AssetsPage() {
                 ) : null}
               </div>
             ))}
-            {otherAssets.map((asset) => renderAssetCard(asset))}
+          </div>
+        ) : activeAssetTab === "prop" ? (
+          <div className="mt-4 space-y-4">
+            {propAssets.length === 0 ? <div className="text-slate-600">暂无道具素材。</div> : null}
+            {propAssets.map((asset) => renderAssetCard(asset))}
+          </div>
+        ) : (
+          <div className="mt-4 space-y-4">
+            {sceneAssets.length === 0 ? <div className="text-slate-600">暂无场景素材。</div> : null}
+            {sceneAssets.map((asset) => renderAssetCard(asset))}
           </div>
         )}
       </div>

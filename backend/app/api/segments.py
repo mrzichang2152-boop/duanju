@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import os
+from datetime import datetime, timezone
 from uuid import uuid4
 
 import httpx
@@ -13,6 +14,7 @@ from app.core.db import get_db, SessionLocal
 from app.schemas.common import StatusResponse
 from app.schemas.script import AsyncTaskStatusResponse
 from app.schemas.segments import (
+    SegmentFrameDeleteRequest,
     SegmentFrameGenerateRequest,
     SegmentFrameGenerateResponse,
     SegmentGenerateRequest,
@@ -20,8 +22,11 @@ from app.schemas.segments import (
     SegmentSelectRequest,
     SegmentVersionResponse,
 )
-from app.services.assets import download_image_as_local_file
 from app.services import media_storage
+from app.services.character_image_bindings import (
+    infer_base_character_name_from_references,
+    upsert_character_image_binding,
+)
 from app.services.linkapi import create_image, create_video
 from app.services.projects import get_project
 from app.services.segments import (
@@ -32,6 +37,7 @@ from app.services.segments import (
     list_segment_versions,
     list_segments,
     select_segment_version,
+    sync_segments_with_script,
 )
 from app.services.settings import get_api_key, get_or_create_settings
 from app.services.kling_query import query_kling_task_status
@@ -48,6 +54,10 @@ router = APIRouter()
 logger = logging.getLogger(__name__)
 OPENROUTER_IMAGE_MODEL = "nano-banana-2"
 _FRAME_TASK_TYPE = "FRAME_GENERATE"
+_SEGMENT_TASK_PROCESSING_TIMEOUT_SECONDS = max(
+    300,
+    int(str(os.getenv("SEGMENT_TASK_PROCESSING_TIMEOUT_SECONDS", "1800") or "1800").strip() or 1800),
+)
 
 
 def _safe_int(value: object, default: int = 0) -> int:
@@ -78,6 +88,15 @@ def _is_kling_pending_status(value: str) -> bool:
 
 def _is_seedance_task(task_id: str | None) -> bool:
     return str(task_id or "").strip().lower().startswith("seedance|")
+
+
+def _is_version_processing_timed_out(version) -> bool:
+    created_at = getattr(version, "created_at", None)
+    if not isinstance(created_at, datetime):
+        return False
+    now = datetime.now(timezone.utc)
+    created = created_at.replace(tzinfo=timezone.utc) if created_at.tzinfo is None else created_at.astimezone(timezone.utc)
+    return (now - created).total_seconds() >= _SEGMENT_TASK_PROCESSING_TIMEOUT_SECONDS
 
 
 async def _resolve_seedance_key(db: AsyncSession, user_id: str) -> str:
@@ -135,7 +154,7 @@ async def fetch_segments(
         project = await get_project(db, user_id, project_id)
         if not project:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="项目不存在")
-        segments = await list_segments(db, project_id)
+        segments = await sync_segments_with_script(db, project_id)
         if not segments:
             segments = await create_segments_from_script(db, project_id)
         
@@ -156,6 +175,10 @@ async def fetch_segments(
                         _, tid = raw_task_id.split("|", 1)
                         if not seedance_key:
                             version_status_msg_map[str(v.id)] = "Seedance 鉴权未配置"
+                            if _is_version_processing_timed_out(v):
+                                v.status = "FAILED"
+                                db.add(v)
+                                return True
                             return False
                         new_status, video_url, task_status_msg = await _query_seedance_task_status(tid, seedance_key)
                     else:
@@ -163,17 +186,34 @@ async def fetch_segments(
                         new_status, video_url, task_status_msg = await query_kling_task_status(db, user_id, endpoint, tid)
                     if task_status_msg:
                         version_status_msg_map[str(v.id)] = task_status_msg
+                    if _is_kling_pending_status(new_status) and _is_version_processing_timed_out(v):
+                        v.status = "FAILED"
+                        version_status_msg_map[str(v.id)] = (
+                            f"任务超时：超过 {int(_SEGMENT_TASK_PROCESSING_TIMEOUT_SECONDS // 60)} 分钟仍未完成，请重试"
+                        )
+                        db.add(v)
+                        return True
                     if not _is_kling_pending_status(new_status):
                         v.status = str(new_status or v.status or "PENDING")
                         if video_url:
                             cos_url = await media_storage.mirror_http_url_to_cos(
-                                project_id, "segment_videos", str(video_url)
+                                project_id,
+                                "segment_videos",
+                                str(video_url),
+                                strict=True,
                             )
                             v.video_url = cos_url
                         db.add(v)
                         return True
                 except Exception:
                     logger.exception("查询视频任务状态异常 version_id=%s", getattr(v, "id", ""))
+                    if _is_version_processing_timed_out(v):
+                        v.status = "FAILED"
+                        version_status_msg_map[str(v.id)] = (
+                            f"任务超时：状态查询异常且超过 {int(_SEGMENT_TASK_PROCESSING_TIMEOUT_SECONDS // 60)} 分钟，请重试"
+                        )
+                        db.add(v)
+                        return True
                 return False
 
             results = await asyncio.gather(*(check_and_update(v) for v in processing_versions))
@@ -228,7 +268,12 @@ async def generate_segments(
         project = await get_project(db, user_id, project_id)
         if not project:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="项目不存在")
-        segments = await list_segments(db, project_id)
+        if not media_storage.cos_enabled():
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="未配置腾讯云 COS，已禁止将生成视频落盘到服务器",
+            )
+        segments = await sync_segments_with_script(db, project_id)
         if not segments:
             segments = await create_segments_from_script(db, project_id)
         target = None
@@ -280,7 +325,7 @@ async def generate_segments(
             raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="生成失败：未获取到视频或任务ID")
 
         if video_url:
-            video_url = await media_storage.mirror_http_url_to_cos(project_id, "segment_videos", video_url)
+            video_url = await media_storage.mirror_http_url_to_cos(project_id, "segment_videos", video_url, strict=True)
 
         version_status = "PROCESSING" if not video_url and task_id else "COMPLETED"
         await create_segment_version(db, target.id, video_url, prompt, task_id=task_id, status=version_status)
@@ -331,21 +376,60 @@ async def _generate_segment_frame_image_sync(
             first = data[0]
             if isinstance(first, dict):
                 image_url = str(first.get("url") or "").strip()
+                if not image_url and first.get("b64_json"):
+                    image_url = f"data:image/png;base64,{first.get('b64_json')}"
     if not image_url:
         raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="生成图片失败：未获取到图片地址")
-    frame_type = "last" if str(payload.frame_type or "").strip().lower() == "last" else "first"
+    frame_type = str(payload.frame_type or "").strip().lower() or "first"
+    if not media_storage.cos_enabled():
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="未配置腾讯云 COS，无法保存生成图片")
     try:
-        local_url = await download_image_as_local_file(
-            image_url,
-            filename_base=f"{project_id}_{frame_type}_frame_{uuid4().hex[:8]}",
-        )
+        if image_url.startswith("data:image"):
+            image_bytes, content_type = media_storage.decode_data_image_url(image_url)
+            cos_url = await media_storage.upload_bytes_under_project_to_cos(
+                project_id,
+                f"segment_frame_images/{frame_type}",
+                image_bytes,
+                content_type,
+                filename_hint=f"{frame_type}.png",
+            )
+        elif image_url.startswith(("http://", "https://")):
+            cos_url = await media_storage.mirror_http_url_to_cos(
+                project_id,
+                f"segment_frame_images/{frame_type}",
+                image_url,
+                strict=True,
+            )
+        elif image_url.startswith("/static/"):
+            rel = image_url.replace("/static/", "", 1).lstrip("/")
+            abs_img = os.path.join(media_storage.backend_static_dir(), rel)
+            cos_url = await media_storage.publish_local_file_under_static(
+                project_id,
+                abs_img,
+                strict=True,
+                delete_local=True,
+            )
+        else:
+            raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="上传 COS 失败：图片地址格式不支持")
+    except HTTPException:
+        raise
     except Exception as exc:
-        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=f"落地图片失败: {exc}") from exc
-    if media_storage.cos_enabled() and local_url.startswith("/static/"):
-        rel = local_url.replace("/static/", "", 1).lstrip("/")
-        abs_path = os.path.join(media_storage.backend_static_dir(), rel)
-        local_url = await media_storage.publish_local_file_under_static(project_id, abs_path)
-    return SegmentFrameGenerateResponse(image_url=local_url)
+        logger.error("Segment frame image upload to COS failed: %s", exc, exc_info=True)
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=f"上传 COS 失败: {exc}") from exc
+    if not media_storage.is_cos_public_url(cos_url):
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="上传 COS 失败：未返回 COS 地址")
+    if frame_type == "character":
+        base_character_name = await infer_base_character_name_from_references(db, project_id, references)
+        if base_character_name:
+            await upsert_character_image_binding(
+                db,
+                project_id,
+                cos_url,
+                base_character_name,
+                source_image_url=references[0] if references else "",
+            )
+            await db.commit()
+    return SegmentFrameGenerateResponse(image_url=cos_url)
 
 
 async def _run_frame_generate_task(task_id: str) -> None:
@@ -428,6 +512,25 @@ async def get_segment_frame_image_task_status(
         result=parse_task_result(task),
         error=(str(task.error or "").strip() or None),
     )
+
+
+@router.post("/{project_id}/segments/frame-images/delete", response_model=StatusResponse)
+async def delete_segment_frame_image(
+    project_id: str,
+    payload: SegmentFrameDeleteRequest,
+    user_id: str = Depends(get_current_user_id),
+    db: AsyncSession = Depends(get_db),
+) -> StatusResponse:
+    project = await get_project(db, user_id, project_id)
+    if not project:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="项目不存在")
+    image_url = str(payload.image_url or "").strip()
+    if not image_url:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="图片地址不能为空")
+    deleted = await media_storage.delete_cos_media_by_url(image_url)
+    if not deleted:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="仅支持删除已上传到 COS 的图片")
+    return StatusResponse(status="ready")
 
 
 @router.put("/{project_id}/segments/{segment_id}/select", response_model=StatusResponse)

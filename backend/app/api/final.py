@@ -27,6 +27,7 @@ from starlette.background import BackgroundTask
 from app.api.deps import get_current_user_id
 from app.core.db import get_db
 from app.schemas.common import StatusResponse
+from app.services import media_storage
 from app.services.eleven_labs import eleven_labs_service
 from app.services.media_storage import load_media_bytes, publish_local_file_under_static
 from app.services.projects import get_project
@@ -214,8 +215,13 @@ def _to_static_url(abs_path: str) -> str:
 
 
 async def _publish_static_file(project_id: str, abs_path: str) -> str:
-    """生成本地文件后写入 COS（若已配置）并返回可访问 URL。"""
-    return await publish_local_file_under_static(project_id, abs_path)
+    """生成本地文件后强制写入 COS，并在成功后清理本地 static 文件。"""
+    return await publish_local_file_under_static(
+        project_id,
+        abs_path,
+        strict=True,
+        delete_local=True,
+    )
 
 
 def _safe_remove_static_file(static_url: str, allowed_root: str) -> None:
@@ -1316,11 +1322,19 @@ async def extract_episode_audio_pipeline(
             candidate = _merged_video_path(project_id, merge_key)
             if os.path.exists(candidate) and os.path.getsize(candidate) > 0:
                 source_merged_path = candidate
+            elif media_storage.cos_enabled():
+                source_merged_path = media_storage.build_cos_public_url_for_static_relative(
+                    project_id,
+                    f"audio_pipeline/{project_id}/merged/{merge_key}.mp4",
+                )
         if not source_merged_path:
             if not clip_urls:
                 raise RuntimeError("未找到可复用的合并视频，请先执行一键合并视频")
             merge_key, source_merged_path, _ = await _prepare_merged_video(project_id, clip_urls, payload.episode_title)
-        await asyncio.to_thread(shutil.copyfile, source_merged_path, work_merged_video_path)
+        if source_merged_path.startswith(("http://", "https://")):
+            await _download_video(source_merged_path, work_merged_video_path)
+        else:
+            await asyncio.to_thread(shutil.copyfile, source_merged_path, work_merged_video_path)
         has_audio_stream = await asyncio.to_thread(_probe_has_audio_stream, work_merged_video_path)
         if has_audio_stream:
             work_source_audio_mp3_path = os.path.join(work_dir, "source.mp3")
@@ -1348,7 +1362,7 @@ async def extract_episode_audio_pipeline(
                 ],
                 "视频不包含可提取音轨，生成静音轨失败",
             )
-        await asyncio.to_thread(shutil.copyfile, source_merged_path, merged_video_path)
+        await asyncio.to_thread(shutil.copyfile, work_merged_video_path, merged_video_path)
         await asyncio.to_thread(shutil.copyfile, work_source_audio_path, source_audio_path)
         await asyncio.to_thread(shutil.copyfile, work_source_audio_path, vocal_audio_path)
         duration_sec = _probe_duration_seconds(source_audio_path)
