@@ -218,6 +218,7 @@ export default function AssetsPage() {
     "2D 美式卡通", "2D Q 版卡通", "2D 水彩油画", "2D 水墨国风", "2D 赛博风格"
   ];
   const [globalStyle, setGlobalStyle] = useState<string>("真人电影写实");
+  const [quickChannel, setQuickChannel] = useState<boolean>(false);
   const [assetStyles, setAssetStyles] = useState<Record<string, string>>({});
   const [voicesByCharacter, setVoicesByCharacter] = useState<Record<string, CharacterVoice>>({});
 
@@ -654,6 +655,7 @@ export default function AssetsPage() {
           options: {
             aspect_ratio: assetSizes[activeAssetId] || getAssetDefaultSize(),
             size: "4K",
+            quick_channel: quickChannel,
           },
         });
         pushPendingAssetGenJob(projectId, {
@@ -694,6 +696,7 @@ export default function AssetsPage() {
           options: {
             aspect_ratio: assetSizes[activeAssetId] || getAssetDefaultSize(),
             size: "4K",
+            quick_channel: quickChannel,
           },
         });
         pushPendingAssetGenJob(projectId, {
@@ -942,7 +945,8 @@ export default function AssetsPage() {
             const selectOptions = [...imageModels];
             if (
               currentModel &&
-              !selectOptions.some((m) => m === currentModel)
+              !selectOptions.some((m) => m === currentModel) &&
+              ["nano-banana-2", "nano-banana-pro"].includes(currentModel)
             ) {
               selectOptions.unshift(currentModel);
             }
@@ -1312,6 +1316,15 @@ export default function AssetsPage() {
                 </option>
               ))}
             </select>
+            <label className="ml-2 inline-flex cursor-pointer items-center gap-2 text-xs text-slate-600">
+              <input
+                type="checkbox"
+                checked={quickChannel}
+                onChange={(e) => setQuickChannel(e.target.checked)}
+                className="h-4 w-4"
+              />
+              快速通道
+            </label>
           </div>
         </div>
         {status ? <div className="mt-2 text-blue-600">{status}</div> : null}
@@ -1349,7 +1362,7 @@ export default function AssetsPage() {
                 {renderAssetContent(
                   asset,
                   <div className="rounded-lg border border-slate-100 bg-slate-50 p-3">
-                    <div className="mb-2 text-xs font-semibold text-slate-600">角色音频（自动创建 Kling 自定义音色）</div>
+                    <div className="mb-2 text-xs font-semibold text-slate-600">角色音频（上传样本，不自动创建 Kling 音色）</div>
                     <VoiceSelector
                       projectId={projectId}
                       characterName={normalizeRoleKey(asset.name)}

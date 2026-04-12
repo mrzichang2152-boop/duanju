@@ -29,7 +29,7 @@ export default function RootLayout({
       <body className={`${geistSans.variable} ${geistMono.variable} antialiased`}>
         <div className="min-h-screen bg-slate-50 text-slate-900">
           <header className="border-b border-slate-200 bg-white">
-            <div className="mx-auto flex w-full max-w-6xl items-center justify-between px-6 py-4">
+            <div className="mx-auto flex w-full items-center justify-between px-6 py-4">
               <div className="flex items-center gap-4">
                 <div className="text-lg font-semibold">短剧生成 Web 应用</div>
                 <Link
@@ -42,7 +42,7 @@ export default function RootLayout({
               <TopNav />
             </div>
           </header>
-          <main className="mx-auto w-full max-w-6xl px-6 py-8">{children}</main>
+          <main className="mx-auto w-full px-6 py-8">{children}</main>
         </div>
       </body>
     </html>

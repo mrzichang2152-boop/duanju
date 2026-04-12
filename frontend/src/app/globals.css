@@ -25,6 +25,26 @@ body {
   font-family: Arial, Helvetica, sans-serif;
 }
 
+/* 分镜表格横向滚动条始终可见 */
+.storyboard-scroll::-webkit-scrollbar {
+  height: 8px;
+}
+.storyboard-scroll::-webkit-scrollbar-track {
+  background: #f1f5f9;
+  border-radius: 4px;
+}
+.storyboard-scroll::-webkit-scrollbar-thumb {
+  background: #94a3b8;
+  border-radius: 4px;
+}
+.storyboard-scroll::-webkit-scrollbar-thumb:hover {
+  background: #64748b;
+}
+.storyboard-scroll {
+  scrollbar-width: thin;
+  scrollbar-color: #94a3b8 #f1f5f9;
+}
+
 .markdown-preview table {
   width: 100%;
   border-collapse: collapse;

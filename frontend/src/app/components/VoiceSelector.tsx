@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
-import { CharacterVoice, uploadCharacterVoiceSample } from "@/lib/api";
+import { CharacterVoice, uploadCharacterVoiceSampleOnly } from "@/lib/api";
 import { getToken } from "@/lib/auth";
 
 interface VoiceSelectorProps {
@@ -86,14 +86,14 @@ export function VoiceSelector({
 
     try {
       setUploading(true);
-      setStatus("上传中，正在创建 Kling 自定义音色...");
-      const updated = await uploadCharacterVoiceSample(token, projectId, characterName, file, {
+      setStatus("上传中...");
+      const updated = await uploadCharacterVoiceSampleOnly(token, projectId, characterName, file, {
         title: `${characterName}-voice`,
         duration_sec: detectedDuration,
       });
       setCurrentVoice(updated);
       onVoiceUpdate(updated);
-      setStatus("音色创建成功");
+      setStatus("样本上传成功（未自动创建 Kling 音色）");
     } catch (err) {
       setError(err instanceof Error ? err.message : "上传失败");
       setStatus("");
@@ -112,11 +112,11 @@ export function VoiceSelector({
           disabled={uploading}
           className="shrink-0 rounded bg-indigo-600 px-3 py-1.5 text-xs text-white hover:bg-indigo-700 disabled:opacity-50"
         >
-          {uploading ? "创建中..." : "上传5-30秒音频"}
+          {uploading ? "上传中..." : "上传5-30秒音频"}
         </button>
       </div>
       <div className="text-[11px] text-slate-500">
-        仅支持 5-30 秒音频，上传后会自动创建 Kling 自定义音色并绑定当前角色。
+        仅支持 5-30 秒音频，上传后仅保存样本，不会自动创建 Kling 自定义音色。
       </div>
       {duration ? <div className="text-[11px] text-slate-500">最近音频时长：{duration.toFixed(1)} 秒</div> : null}
       {status ? <div className="text-[11px] text-emerald-600">{status}</div> : null}

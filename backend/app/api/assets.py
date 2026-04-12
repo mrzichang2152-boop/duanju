@@ -7,6 +7,7 @@ import uuid
 import asyncio
 import hashlib
 import httpx
+from typing import Optional
 from pydantic import BaseModel
 from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File
 from fastapi.responses import Response, RedirectResponse, FileResponse
@@ -1033,6 +1034,69 @@ async def upload_asset_image(
     return StatusResponse(status="ready")
 
 
+class UploadTempAssetImageResponse(StatusResponse):
+    image_url: str
+
+
+@router.post("/{project_id}/assets/upload-temp", response_model=UploadTempAssetImageResponse)
+async def upload_temp_asset_image(
+    project_id: str,
+    file: UploadFile = File(...),
+    user_id: str = Depends(get_current_user_id),
+    db: AsyncSession = Depends(get_db),
+) -> UploadTempAssetImageResponse:
+    project = await get_project(db, user_id, project_id)
+    if not project:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="项目不存在")
+    if not file.content_type or not file.content_type.startswith("image/"):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="仅支持图片文件")
+    raw = await file.read()
+    if not raw:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="上传文件为空")
+    if len(raw) > 15 * 1024 * 1024:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="图片大小不能超过15MB")
+
+    ext_map = {
+        "image/jpeg": ".jpg",
+        "image/jpg": ".jpg",
+        "image/png": ".png",
+        "image/webp": ".webp",
+        "image/gif": ".gif",
+        "image/bmp": ".bmp",
+    }
+    ext = ext_map.get((file.content_type or "").lower(), "")
+    if not ext and file.filename and "." in file.filename:
+        ext = os.path.splitext(file.filename)[1].lower()
+    if ext not in {".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp"}:
+        ext = ".png"
+    filename = f"temp_{uuid.uuid4().hex[:16]}{ext}"
+
+    if media_storage.cos_enabled():
+        try:
+            upload_url = await media_storage.upload_bytes_under_project_to_cos(
+                project_id,
+                "assets",
+                raw,
+                file.content_type or "application/octet-stream",
+                filename_hint=filename,
+            )
+        except Exception as exc:
+            raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=f"上传 COS 失败: {exc}") from exc
+        if not media_storage.is_cos_public_url(upload_url):
+            raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="上传 COS 失败：未返回 COS 地址")
+    else:
+        current_dir = os.path.dirname(os.path.abspath(__file__))
+        static_dir = os.path.join(os.path.dirname(os.path.dirname(current_dir)), "static", "assets")
+        os.makedirs(static_dir, exist_ok=True)
+        filepath = os.path.join(static_dir, filename)
+        with open(filepath, "wb") as out:
+            out.write(raw)
+        upload_url = f"/static/assets/{filename}"
+
+    await file.close()
+    return UploadTempAssetImageResponse(status="ready", image_url=upload_url)
+
+
 class GenerateSubjectResponse(StatusResponse):
     subject_id: str
 
@@ -1044,8 +1108,8 @@ class GenerateSubjectRequest(BaseModel):
 class GenerateImageSubjectRequest(BaseModel):
     image_url: str
     character_name: str
-    material_name: str | None = None
-    material_description: str | None = None
+    material_name: Optional[str] = None
+    material_description: Optional[str] = None
     allow_without_voice: bool = False
 
 
@@ -1180,7 +1244,7 @@ async def generate_image_subject(
 async def generate_asset_subject(
     project_id: str,
     asset_id: str,
-    payload: GenerateSubjectRequest | None = None,
+    payload: Optional[GenerateSubjectRequest] = None,
     user_id: str = Depends(get_current_user_id),
     db: AsyncSession = Depends(get_db),
 ) -> GenerateSubjectResponse:

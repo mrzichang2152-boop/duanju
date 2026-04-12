@@ -25,7 +25,10 @@ export const extractModels = (raw: unknown): string[] => {
   return [];
 };
 
-/** 从 /linkapi/models 响应中提取 GRSAI 绘画模型（kind=draw 或 id 以 nano-banana 开头） */
+/** 前端允许展示的绘画模型白名单 */
+const ALLOWED_DRAW_MODELS = new Set(["nano-banana-2", "nano-banana-pro"]);
+
+/** 从 /linkapi/models 响应中提取 GRSAI 绘画模型（kind=draw 或 id 以 nano-banana 开头），仅保留白名单模型 */
 export const extractDrawModels = (raw: unknown): string[] => {
   const ordered: string[] = [];
   const seen = new Set<string>();
@@ -34,6 +37,7 @@ export const extractDrawModels = (raw: unknown): string[] => {
     if (!t) return;
     const k = t.toLowerCase();
     if (seen.has(k)) return;
+    if (!ALLOWED_DRAW_MODELS.has(k)) return;
     seen.add(k);
     ordered.push(t);
   };
@@ -58,7 +62,8 @@ export const extractDrawModels = (raw: unknown): string[] => {
     const record = raw as Record<string, unknown>;
     walk(record.data ?? record.models ?? record.results);
   }
-  return ordered;
+  /* 若后端未返回白名单内的模型，兜底返回白名单列表 */
+  return ordered.length ? ordered : [...ALLOWED_DRAW_MODELS];
 };
 
 export const filterModels = (models: string[], kind: "text" | "image" | "video") => {

@@ -1290,3 +1290,205 @@
 - 2026-04-07 - 测试环境部署 - 已使用 `duanjutest.pem` 将最新 `backend/app/api/script.py` 同步至 `81.70.235.208:/home/ubuntu/video_gen_app`，并在远端执行 `sudo docker compose up -d --build backend` 发布最新 Step4 分镜表格提取修复。
 - 2026-04-07 - 测试环境验证 - 远端 `duanju-backend-1` 已重建并保持 Up；`curl http://127.0.0.1:8003/health` 返回 `{"status":"ok"}`；公网 `curl -I http://81.70.235.208` 返回 `HTTP/1.1 200 OK`；远端代码已包含 `_extract_first_markdown_table` 修复。
 - 2026-04-07 - 测试环境账号 - 在 `81.70.235.208` 创建测试账号 `back@front.com/123456`，并通过 `POST /auth/login` 实测登录成功。
+- 2026-04-08 - 后端修复 - 调整 `backend/app/services/linkapi.py` 的 Gemini/GRSAI 文本解析逻辑，优先提取真实 `message.content` / `data.choices` 正文，并将 `reasoning_content` 独立保留，避免把上游思考链误当成 Step4 分镜表格正文返回。
+- 2026-04-08 - 验证 - 本地 `read_lints` 检查 `backend/app/services/linkapi.py` 0 错误，`python3 -m py_compile backend/app/services/linkapi.py backend/app/api/script.py` 通过；后端热重载后 `curl http://127.0.0.1:8003/health` 返回 `{"status":"ok"}`；执行 `cd frontend && npm run dev` 仍提示既有 Next 实例占用 `.next/dev/lock`，但现有 `http://127.0.0.1:3000` 返回 `200 OK`。
+- 2026-04-08 - 后端修复 - 针对 Step4“非必现非表格返回”增强 `backend/app/api/script.py`：分镜任务新增最多 3 次自动重试，重试时追加“仅输出 Markdown 表格本体”强约束并降低温度；仅在 3 次都非表格时才失败，减少上游偶发思考文本污染导致的失败率。
+- 2026-04-08 - 验证 - 本地 `read_lints` 检查 `backend/app/api/script.py` 0 错误，`python3 -m py_compile backend/app/api/script.py backend/app/services/linkapi.py` 通过；`docker compose up -d backend` 后 `curl http://127.0.0.1:8003/health` 返回 `{"status":"ok"}`；执行 `cd frontend && npm run dev` 仍提示既有 Next 实例占用 `.next/dev/lock`，但现有 `http://127.0.0.1:3000` 返回 `200 OK`。
+- 2026-04-08 - 后端修复 - 修复 Seedance 勾选“使用前一条分镜尾帧”失败：在 `backend/app/services/linkapi.py` 中对上一条视频尾帧优先上传到腾讯云 COS 后再作为 `first_frame` 参考图传给 Seedance，避免使用本机 `http://82.156.124.215/static/...` 导致上游报 `content[1].image_url resource not found`。
+- 2026-04-08 - 验证 - 本地 `read_lints` 检查 `backend/app/services/linkapi.py` 0 错误，`python3 -m py_compile backend/app/services/linkapi.py` 通过；`docker compose up -d backend` 后 `curl http://127.0.0.1:8003/health` 返回 `{"status":"ok"}`；执行 `cd frontend && npm run dev` 仍提示既有 Next 实例占用 `.next/dev/lock`，但现有 `http://127.0.0.1:3000` 返回 `200 OK`。
+- 2026-04-08 - 测试环境部署 - 已将本地 `backend/` 与 `frontend/`（含当前修复）同步到 `81.70.235.208:/home/ubuntu/video_gen_app`，并执行 `docker compose up -d --build backend frontend nginx` 完成测试环境更新。
+- 2026-04-08 - 测试环境验证 - `81.70.235.208` 上 `docker compose ps` 显示 `backend/frontend/nginx` 均 `Up`；`curl http://127.0.0.1:8003/health` 返回 `{"status":"ok"}`；公网 `curl -I http://81.70.235.208` 返回 `HTTP/1.1 200 OK`。
+- 2026-04-08 - 后端修复 - 针对 Step4“分镜生成长期卡在 running”收敛超时：`backend/app/services/linkapi.py` 将 `GRSAI_TIMEOUT_SECONDS` 默认值从 `900` 降为 `120`，并限制在 `30~180` 秒；同时文本接口请求在 `trust_env=True/False` 双模式自动兜底，减少代理/网络路径异常导致的长时间挂起。
+- 2026-04-08 - 验证 - 本地 `read_lints` 检查 `backend/app/services/linkapi.py` 0 错误，`python3 -m py_compile backend/app/services/linkapi.py backend/app/api/script.py` 通过；`docker compose up -d backend` 后 `curl http://127.0.0.1:8003/health` 返回 `{"status":"ok"}`；执行 `cd frontend && npm run dev` 仍提示既有 Next 实例占用 `.next/dev/lock`，但现有 `http://127.0.0.1:3000` 返回 `200 OK`。
+- 2026-04-08 - 测试环境部署 - 已将 `backend/`（含 Step4 分镜超时收敛修复）同步到 `81.70.235.208:/home/ubuntu/video_gen_app/backend`，并执行 `docker compose up -d --build backend` 完成发布。
+- 2026-04-08 - 测试环境验证 - `81.70.235.208` 上 `duanju-backend-1` 已重建并 `Up`；`curl http://127.0.0.1:8003/health` 返回 `{"status":"ok"}`。
+- 2026-04-08 - 后端修复 - 针对 Step4 本地报错 `Server disconnected without sending a response`：在 `backend/app/services/linkapi.py` 的文本接口请求重试中新增 `httpx.RemoteProtocolError/ReadError/WriteError/NetworkError` 重试兜底，并在 `trust_env=True/False` 双模式下各增加 2 次网络重试，避免上游连接被动断开即直接失败。
+- 2026-04-08 - 验证 - 本地 `read_lints` 检查 `backend/app/services/linkapi.py` 0 错误，`python3 -m py_compile backend/app/services/linkapi.py backend/app/api/script.py` 通过；`docker compose up -d backend` 后 `curl http://127.0.0.1:8003/health` 返回 `{"status":"ok"}`；执行 `cd frontend && npm run dev` 仍提示既有 Next 实例占用 `.next/dev/lock`，但现有 `http://127.0.0.1:3000` 返回 `200 OK`。
+- 2026-04-08 - 后端修复 - 针对 Step4 持续报 `Gemini3Pro 网络异常：Server disconnected without sending a response`：修复 `backend/app/services/linkapi.py` 中网络异常重试提前抛错问题，改为外层 3 轮继续重试后再失败；同时保留 `trust_env=True/False` 双链路与 `RemoteProtocolError/NetworkError` 兜底。
+- 2026-04-08 - 后端修复 - 收敛 Step4 请求规模：`backend/app/api/script.py` 将分镜生成 `max_tokens` 从 `120000` 下调为 `16000`，降低上游连接被动断开的概率。
+- 2026-04-08 - 验证 - 本地 `read_lints` 检查 `backend/app/services/linkapi.py` 与 `backend/app/api/script.py` 均 0 错误，`python3 -m py_compile backend/app/services/linkapi.py backend/app/api/script.py` 通过；`docker compose up -d backend` 后 `curl http://127.0.0.1:8003/health` 返回 `{"status":"ok"}`；执行 `cd frontend && npm run dev` 仍提示既有 Next 实例占用 `.next/dev/lock`，但现有 `http://127.0.0.1:3000` 返回 `200 OK`。
+- 2026-04-08 - 后端调整 - 按需求恢复 Step4 分镜请求 `max_tokens=120000`（撤销临时下调到 `16000`）。
+- 2026-04-08 - 后端调整 - 按需求取消“外层 3 轮网络重试”放大行为，保留单轮双链路（`trust_env=True/False`）与每链路 2 次网络重试，避免“无限重试”体感。
+- 2026-04-08 - 排障结论 - 本地容器直连 `GRSAI_TEXT_ENDPOINT` 同一请求可复现“有时 200、有时 `ReadTimeout/Server disconnected`”抖动，且失败发生在 HTTP 响应返回前（连接层异常），初步判定为上游/链路稳定性问题，非请求参数格式错误。
+- 2026-04-08 - 验证 - 本地 `read_lints` 检查 `backend/app/services/linkapi.py` 与 `backend/app/api/script.py` 均 0 错误，`python3 -m py_compile backend/app/services/linkapi.py backend/app/api/script.py` 通过；`docker compose up -d backend` 后 `curl http://127.0.0.1:8003/health` 返回 `{"status":"ok"}`；执行 `cd frontend && npm run dev` 仍提示既有 Next 实例占用 `.next/dev/lock`，但现有 `http://127.0.0.1:3000` 返回 `200 OK`。
+- 2026-04-08 - 后端配置 - 将 Gemini 3.1 Pro 文本调用默认通道切换为 4sapi：`backend/app/services/linkapi.py` 优先读取 `FOURSAPI_TEXT_ENDPOINT`，默认端点设为 `https://4sapi.com/v1/chat/completions`；API Key 优先读取 `FOURSAPI_API_KEY`。
+- 2026-04-08 - 环境配置 - 在 `backend/.env` 新增 `FOURSAPI_TEXT_ENDPOINT=https://4sapi.com/v1/chat/completions` 与 `FOURSAPI_API_KEY`，用于本项目 Gemini 3.1 Pro 文本请求。
+- 2026-04-08 - 验证 - 本地 `read_lints` 检查 `backend/app/services/linkapi.py` 0 错误，`python3 -m py_compile backend/app/services/linkapi.py backend/app/api/script.py backend/app/services/assets.py` 通过；`docker compose up -d backend` 重建后容器内环境变量生效（`FOURSAPI_TEXT_ENDPOINT`/`FOURSAPI_API_KEY`），`curl http://127.0.0.1:8003/health` 返回 `{"status":"ok"}`；执行 `cd frontend && npm run dev` 后现有 `http://127.0.0.1:3000` 返回 `200 OK`。
+- 2026-04-08 - 后端配置 - 补充优先级：`backend/app/services/linkapi.py` 中 Gemini 3.1 Pro 文本请求密钥优先读取 `FOURSAPI_API_KEY`，确保文本请求稳定走 4sapi。
+- 2026-04-08 - 验证 - 本地 `read_lints` 检查 `backend/app/services/linkapi.py` 0 错误，`python3 -m py_compile backend/app/services/linkapi.py` 通过；`docker compose exec backend` 确认 `FOURSAPI_API_KEY=true` 且 `FOURSAPI_TEXT_ENDPOINT=https://4sapi.com/v1/chat/completions`。
+- 2026-04-08 - 后端修正 - 按用户反馈将 Gemini 文本模型名统一修正为 `gemini-3.1-pro-preview`：更新 `backend/app/services/linkapi.py`、`backend/app/api/script.py`、`backend/app/services/assets.py` 以及 `backend/app/models/settings.py` 默认文本模型。
+- 2026-04-08 - 前端修正 - `frontend/src/app/projects/[id]/script/storyboard/page.tsx` 默认模型、历史值迁移与下拉选项同步改为 `gemini-3.1-pro-preview`。
+- 2026-04-08 - 验证 - 本地 `read_lints` 检查上述后端/前端改动文件均 0 错误，`python3 -m py_compile backend/app/services/linkapi.py backend/app/api/script.py backend/app/services/assets.py backend/app/models/settings.py` 通过；`docker compose up -d backend` 后 `curl http://127.0.0.1:8003/health` 返回 `{"status":"ok"}`；容器内直连 `https://4sapi.com/v1/chat/completions` 使用 `gemini-3.1-pro-preview` 返回 `200`。
+- 2026-04-08 - 测试环境部署 - 已将本地本次 4sapi + `gemini-3.1-pro-preview` 相关改动同步到 `81.70.235.208:/home/ubuntu/video_gen_app`，并执行 `docker compose up -d --build backend frontend nginx` 完成发布。
+- 2026-04-08 - 测试环境验证 - `81.70.235.208` 上 `backend/frontend/nginx` 均 `Up`；`curl http://127.0.0.1:8003/health` 返回 `{"status":"ok"}`；公网 `curl -I http://81.70.235.208` 返回 `HTTP/1.1 200 OK`；远端容器直连 4sapi `gemini-3.1-pro-preview` 返回 `200`。
+- 2026-04-08 - 后端修复 - 修复 Step4 分镜生成在 4sapi 偶发 `HTTP 400 Invalid project resource name projects/projects/random-*` 直接失败：`backend/app/services/linkapi.py` 对该特定上游通道错误增加定向重试（最多 3 轮中的后续轮次自动重试），避免一次命中异常通道即任务失败。
+- 2026-04-08 - 验证 - 本地 `read_lints` 检查 `backend/app/services/linkapi.py` 0 错误，`python3 -m py_compile backend/app/services/linkapi.py backend/app/api/script.py` 通过；`docker compose up -d backend` 后 `curl http://127.0.0.1:8003/health` 返回 `{"status":"ok"}`；执行 `cd frontend && npm run dev` 后现有 `http://127.0.0.1:3000` 返回 `200 OK`。
+- 2026-04-08 - 后端修复 - 修复 Step3 图片生成误用 4sapi 文本 key：`backend/app/services/linkapi.py` 新增 `_resolve_grsai_draw_key`，`create_image` 改为仅走 GRSAI/Suchuang 侧 key 解析，不再优先读取 `FOURSAPI_API_KEY`，避免出现 `400: apikey error`。
+- 2026-04-08 - 功能新增 - Step3 素材生成新增“快速通道”开关：前端 `frontend/src/app/projects/[id]/script/assets/page.tsx` 增加“快速通道”勾选并透传 `options.quick_channel`；后端 `backend/app/services/linkapi.py` 在 `create_image` 中支持快速通道调用 `4sapi gemini-3.1-flash-image`（`/v1beta/models/gemini-3.1-flash-image:generateContent`）。
+- 2026-04-08 - 验证 - `python3 -m py_compile backend/app/services/linkapi.py` 通过；执行 `cd frontend && npm run dev` 启动成功（因 3000 占用自动切到 `http://localhost:3002`）。
+- 2026-04-08 - 功能增强 - “快速通道”支持图生图：`backend/app/services/linkapi.py` 的 `_create_image_via_fast_channel` 支持透传参考图（`fileData/inlineData`），`create_image` 开启 `quick_channel` 时不再拒绝参考图。
+- 2026-04-08 - 功能新增 - Step4 创建素材新增“快速通道”开关（位于模型选择右侧）：前端 `frontend/src/app/components/ScriptEditor.tsx` 新增勾选并透传 `quick_channel`，后端 `backend/app/schemas/segments.py` 与 `backend/app/api/segments.py` 增加该字段并传递到图片生成链路，支持文生图与图生图。
+- 2026-04-08 - 验证 - `python3 -m py_compile backend/app/services/linkapi.py backend/app/api/segments.py backend/app/schemas/segments.py` 通过；`read_lints` 检查 `backend/app/api/segments.py`、`backend/app/schemas/segments.py`、`frontend/src/app/components/ScriptEditor.tsx`、`frontend/src/lib/api.ts` 均 0 错误；执行 `cd frontend && npm run dev` 时检测到已有实例占用锁（已有 `3000` 服务可访问 `HTTP/1.1 200 OK`）。
+- 2026-04-08 - 功能调整 - 将 Gemini 参考图上限从 4 提升到 16：`backend/app/services/linkapi.py` 快速通道参考图透传改为 `[:_GEMINI_REFERENCE_IMAGE_LIMIT]`，`backend/app/api/segments.py` 的 `image_urls` 透传上限同步改为 16。
+- 2026-04-08 - 验证 - `python3 -m py_compile backend/app/services/linkapi.py backend/app/api/segments.py` 通过；执行 `cd frontend && npm run dev` 启动成功（3000 占用，自动使用 `http://localhost:3002`）。
+- 2026-04-08 - 测试环境部署 - 已按要求将本地最新代码同步到 `81.70.235.208:/home/ubuntu/video_gen_app`（使用 `duanjutest.pem`，`rsync` 同步，排除运行期目录 `data/` 与 `backend/static/`），并在远端执行 `sudo docker compose up -d --build backend frontend nginx` 完成重建发布。
+- 2026-04-08 - 验证 - 远端 `sudo docker compose ps` 显示 `duanju-backend-1/duanju-frontend-1/duanju-nginx-1` 均 `Up`；机内 `curl http://127.0.0.1:8003/health` 返回 `{"status":"ok"}`、`curl -I http://127.0.0.1` 返回 `HTTP/1.1 200 OK`；公网 `curl http://81.70.235.208:8003/health` 返回 `{"status":"ok"}`、`curl -I http://81.70.235.208` 返回 `HTTP/1.1 200 OK`。
+- 2026-04-08 - 修复 - 处理 Step4 分镜“长期生成中”卡死：`frontend/src/app/projects/[id]/script/storyboard/page.tsx` 在轮询任务状态报 `任务不存在/404` 时，自动将该分镜标记为 `failed` 并提示“任务状态丢失，请重新生成”，不再无限等待。
+- 2026-04-08 - 修复 - `backend/app/api/script.py` 的分镜任务状态接口增加兜底：当任务不在内存且脚本中仍为 `running/pending` 时，自动回写为 `failed`（任务状态丢失/过期），避免前端永久轮询。
+- 2026-04-08 - 测试环境部署 - 已将上述分镜任务卡死修复同步到 `81.70.235.208:/home/ubuntu/video_gen_app`，并执行 `sudo docker compose up -d --build backend frontend nginx` 发布。
+- 2026-04-08 - 验证 - 测试环境 `sudo docker compose ps` 显示 `duanju-backend-1/duanju-frontend-1/duanju-nginx-1` 均 `Up`；机内 `curl http://127.0.0.1:8003/health` 返回 `{"status":"ok"}`、`curl -I http://127.0.0.1` 返回 `HTTP/1.1 200 OK`；公网 `curl http://81.70.235.208:8003/health` 返回 `{"status":"ok"}`、`curl -I http://81.70.235.208` 返回 `HTTP/1.1 200 OK`。
+- 2026-04-08 - 修复 - `backend/app/api/script.py` 的 Step2 任务状态接口新增“僵尸任务兜底”：当任务 `PENDING/RUNNING` 且 `updated_at` 超过 10 分钟未变化时，自动回写为 `FAILED` 并返回“任务状态丢失（服务重启或任务中断），请重新执行”，避免前端长期“生成中”。
+- 2026-04-08 - 验证 - `python3 -m py_compile backend/app/api/script.py` 通过；执行 `cd frontend && npm run dev` 启动成功（3000 占用，自动使用 `http://localhost:3002`）。
+- 2026-04-08 - 测试环境部署 - 已将 Step2 任务状态兜底修复同步到 `81.70.235.208:/home/ubuntu/video_gen_app`，并执行 `sudo docker compose up -d --build backend frontend nginx` 发布。
+- 2026-04-08 - 验证 - 测试环境 `sudo docker compose ps` 显示 `duanju-backend-1/duanju-frontend-1/duanju-nginx-1` 均 `Up`；机内 `curl http://127.0.0.1:8003/health` 返回 `{"status":"ok"}`、`curl -I http://127.0.0.1` 返回 `HTTP/1.1 200 OK`；公网 `curl http://81.70.235.208:8003/health` 返回 `{"status":"ok"}`、`curl -I http://81.70.235.208` 返回 `HTTP/1.1 200 OK`。
+- 2026-04-08 - 修复 - 优化 4sapi 文本请求链路时延：`backend/app/services/linkapi.py` 将 `create_chat_completion` 的 `httpx` 环境代理尝试顺序从 `(True, False)` 调整为 `(False, True)`，优先直连 4sapi，避免代理链路超时导致前端长时间“生成中”。
+- 2026-04-08 - 验证 - `python3 -m py_compile backend/app/services/linkapi.py` 通过；执行 `cd frontend && npm run dev` 启动成功（3000 占用，自动使用 `http://localhost:3002`）。
+- 2026-04-08 - 测试环境部署 - 已将 4sapi 文本链路时延优化同步到 `81.70.235.208:/home/ubuntu/video_gen_app`，并执行 `sudo docker compose up -d --build backend frontend nginx` 发布。
+- 2026-04-08 - 验证 - 测试环境 `sudo docker compose ps` 显示 `duanju-backend-1/duanju-frontend-1/duanju-nginx-1` 均 `Up`；机内 `curl http://127.0.0.1:8003/health` 返回 `{"status":"ok"}`、`curl -I http://127.0.0.1` 返回 `HTTP/1.1 200 OK`；公网 `curl http://81.70.235.208:8003/health` 返回 `{"status":"ok"}`、`curl -I http://81.70.235.208` 返回 `HTTP/1.1 200 OK`。
+- 2026-04-08 - 修复 - `frontend/src/app/projects/[id]/script/storyboard/page.tsx` 新增分镜任务启动前端幂等锁（`storyboardStartInFlightRef`），同一分集在一次点击链路未结束前禁止重复触发 `startStoryboardTask`，降低“单次操作触发两次上游计费调用”的风险。
+- 2026-04-08 - 验证 - `cd frontend && npm run build` 通过；执行 `cd frontend && npm run dev` 启动成功（3000 占用，自动使用 `http://localhost:3002`）。
+- 2026-04-08 - 测试环境部署 - 已将 Step4 分镜任务前端幂等锁修复同步到 `81.70.235.208:/home/ubuntu/video_gen_app`，并执行 `sudo docker compose up -d --build backend frontend nginx` 发布。
+- 2026-04-08 - 验证 - 测试环境 `sudo docker compose ps` 显示 `duanju-backend-1/duanju-frontend-1/duanju-nginx-1` 均 `Up`；机内 `curl http://127.0.0.1:8003/health` 返回 `{"status":"ok"}`、`curl -I http://127.0.0.1` 返回 `HTTP/1.1 200 OK`；公网 `curl http://81.70.235.208:8003/health` 返回 `{"status":"ok"}`、`curl -I http://81.70.235.208` 返回 `HTTP/1.1 200 OK`。
+- 2026-04-11 - 修复 - 快速通道 400 报错修复与下拉框联动：`backend/app/services/linkapi.py` 中 `_create_image_via_fast_channel` 新增 `model` 参数，增加 `_FAST_CHANNEL_MODEL_MAP` 映射字典（nano-banana-2 → gemini-3.1-flash-image-preview，nano-banana-pro → gemini-3-pro-image-preview），动态构建 4sapi 端点 URL；`create_image` 在快速通道分支前提取 model 并传入。修复了原先硬编码端点导致的 400 报错，实现了前端下拉框选择与快速通道模型的联动。
+- 2026-04-11 - 优化 - 全局页面宽屏自适应：`frontend/src/app/layout.tsx` 移除 header 和 main 容器的 `max-w-6xl` 限制，页面内容不再局限于 1152px 固定宽度框内，改为全宽自适应布局。
+- 2026-04-11 - 优化 - Step4 分镜表格增加可见横向滚动条：`frontend/src/app/components/ScriptEditor.tsx` 外层容器由 `overflow-hidden` 改为 `overflow-x-auto`，table 增加 `min-w-max` 确保按列宽撑开；`frontend/src/app/globals.css` 新增 `.storyboard-scroll` 样式使滚动条始终可见（支持 Webkit 和 Firefox）。
+- 2026-04-11 - 验证 - 前端 `npm run lint`（0 errors）、`npm run typecheck`（通过）、后端 `python3 -m compileall app/`（通过）。
+- 2026-04-11 - 验证 - 快速通道连通性测试：gemini-3.1-flash-image-preview 和 gemini-3-pro-image-preview 均通过 4sapi 成功生成图片；后端 `python3 -m compileall app/` 编译通过；前端 `npm run lint` 0 errors、`npm run typecheck` 通过。
+- 2026-04-11 - 修复 - 快速通道引用素材不生效：`backend/app/services/linkapi.py` 中 `_create_image_via_fast_channel` 对 HTTP URL 类型的引用图片原先使用 Gemini `fileData.fileUri` 方式传递，但 Gemini API 的 `fileUri` 只接受 `gs://` 或 File API URI，不支持任意公网 HTTP URL，导致引用素材完全无效。修复为先通过 httpx 下载图片内容再转 base64 通过 `inlineData` 传递，与 `data:image` 类型引用走相同路径。影响 Step3 素材管理和 Step4 分镜表格两个场景的快速通道生图引用。
+- 2026-04-11 - 修复 - 快速通道生图网络稳态优化：`backend/app/services/linkapi.py` 的 `_create_image_via_fast_channel` 新增 `Connection: close`，并增加 `trust_env(False→True)` 双路径 + 网络异常短重试（`ReadTimeout/ConnectTimeout/RemoteProtocolError/ReadError/WriteError/NetworkError`），降低 `Server disconnected without sending a response` 导致的 400 失败。
+- 2026-04-11 - 验证 - `python3 -m py_compile backend/app/services/linkapi.py` 通过；执行 `cd frontend && npm run dev` 启动成功（3000 占用，自动使用 `http://localhost:3002`）。
+- 2026-04-11 - 测试环境部署 - 已将快速通道生图网络稳态修复同步到 `81.70.235.208:/home/ubuntu/video_gen_app/backend/app/services/linkapi.py`，并执行 `sudo docker compose restart backend` 生效。
+- 2026-04-11 - 验证 - 测试环境机内 `curl http://127.0.0.1:8003/health` 返回 `{"status":"ok"}`；公网 `curl http://81.70.235.208:8003/health` 返回 `{"status":"ok"}`，`curl -I http://81.70.235.208` 返回 `HTTP/1.1 200 OK`。
+- 2026-04-11 - 修复 - Step4 全局风格交互改造：`frontend/src/app/projects/[id]/script/storyboard/page.tsx` 将全局风格从下拉框改为“按钮 + 弹窗 + Tab”交互，Tab 顺序为“自定义风格 / 真人写实 / 3D风格 / 2D风格 / 导演风格”；内置子风格新增名称、占位描述与示例图卡片，点击卡片可直接切换全局风格。
+- 2026-04-11 - 修复 - Step4 新增自定义风格管理：支持在“自定义风格”Tab 中创建风格（上传示例图、输入风格名称、输入提示词并保存），保存后写入本地存储并可直接作为全局风格使用。
+- 2026-04-11 - 验证 - 执行 `cd frontend && npm run dev` 启动成功（3000 占用，自动使用 `http://localhost:3002`）；`frontend/src/app/projects/[id]/script/storyboard/page.tsx` lints 结果为 0。
+- 2026-04-11 - 修复 - Step4 增加“批量生成首帧图”入口：在分集卡片中“生成分镜”按钮左侧新增按钮，点击弹出批量生成首帧悬浮窗；悬浮窗顶部保留素材管理同风格头部交互（标题/关闭/参数区），不包含“创建新素材”按钮。
+- 2026-04-11 - 修复 - Step4 批量首帧悬浮窗新增分镜级 Tab：按当前集分镜表格行生成 `分镜一/分镜二/...` Tab，每个 Tab 内含提示词输入框与“生成首帧”按钮；输入框默认填入该行“分镜”列文本，生成成功后自动写回该行“首帧图片”列（Markdown 图片）。
+- 2026-04-11 - 验证 - 执行 `cd frontend && npm run dev` 启动成功（3000 占用，自动使用 `http://localhost:3002`）；`frontend/src/app/projects/[id]/script/storyboard/page.tsx` lints 结果为 0。
+- 2026-04-11 - 修复 - Step4 批量首帧弹窗改为素材管理同款上半区交互：新增素材类型 Tab（角色形象/基础角色/道具/场景/首帧/尾帧/远景位置关系图），支持“应用到提示词”与“应用到图像（references）”用于图生图。
+- 2026-04-11 - 修复 - Step4 批量首帧生成参数增强：在“快速通道”左侧增加图片比例下拉（9:16/3:4/1:1/4:3/16:9），生成请求透传 `aspect_ratio` 与 `references`。
+- 2026-04-11 - 修复 - Step4 批量首帧结果增强：新增“全部预览”聚合展示（<=4 每行2张、5-9每行3张、10-16每行4张、17-25每行5张），单图支持“应用/删除”；生成结果按行写入“首帧图片”列并保留，关闭弹窗后不丢失。
+- 2026-04-11 - 验证 - 执行 `cd frontend && npm run dev` 启动成功（3000 占用，自动使用 `http://localhost:3002`）；`frontend/src/app/projects/[id]/script/storyboard/page.tsx` lints 结果为 0。
+- 2026-04-11 - 修复 - Step4 批量首帧“应用到提示词”改为可视化素材引用：输入框隐藏 `[AssetID:...]` 原始标记，改为素材名胶囊展示并支持点击移除；编辑提示词时自动保留已选素材 ID。
+- 2026-04-11 - 验证 - 执行 `cd frontend && npm run dev` 启动成功（3000 占用，自动使用 `http://localhost:3002`）；`frontend/src/app/projects/[id]/script/storyboard/page.tsx` lints 结果为 0。
+- 2026-04-11 - 修复 - Step4 批量首帧细节对齐：应用素材到提示词时将“素材名称”写入提示框并可与文本混排；过滤表格分隔行修复分镜 Tab 数与错位问题；“已应用”按钮改为可切换取消应用。
+- 2026-04-11 - 修复 - Step4 批量首帧布局与预览调整：参数区改为“模型+快速通道+比例+生成首帧（左侧）/全部预览（右侧）”；全部预览仅展示各分镜已应用图，未生成或未应用显示占位卡。
+- 2026-04-11 - 验证 - 执行 `cd frontend && npm run dev` 启动成功（3000 占用，自动使用 `http://localhost:3002`）；`frontend/src/app/projects/[id]/script/storyboard/page.tsx` lints 结果为 0。
+- 2026-04-11 - 修复 - Step4 批量首帧运行时报错修复：补回 `isTableSeparatorLine` 函数定义，解决点击“批量生成首帧图”时报 `ReferenceError: isTableSeparatorLine is not defined`。
+- 2026-04-11 - 验证 - 执行 `cd frontend && npm run dev` 启动成功（3000 占用，自动使用 `http://localhost:3002`）；`frontend/src/app/projects/[id]/script/storyboard/page.tsx` lints 结果为 0。
+- 2026-04-11 - 修复 - Step4 批量首帧素材展示修正：素材类型映射与素材管理页对齐（`CHARACTER_LOOK→角色形象`、`CHARACTER/character→基础角色`）；图片预览 URL 统一做 trim 与后端地址补全，减少白图与错分组。
+- 2026-04-11 - 修复 - Step4 批量首帧分镜行识别修正：分镜表解析优先匹配包含“分镜”列的表格，避免误取其他表格导致 3 条分镜显示成 7 条。
+- 2026-04-11 - 验证 - 执行 `cd frontend && npm run dev` 启动成功（3000 占用，自动使用 `http://localhost:3002`）；`frontend/src/app/projects/[id]/script/storyboard/page.tsx` lints 结果为 0。
+- 2026-04-11 - 修复 - Step4 批量首帧分镜与写回行号修正：仅统计“分镜”列非空行生成 Tab，并持久化原始行号用于应用/删除/生成写回，避免空白行参与导致数量和内容错位。
+- 2026-04-11 - 修复 - Step4 批量首帧素材展示对齐素材管理：素材类型映射沿用素材管理规则，批量弹窗仅展示有有效预览图的素材，提示词区域恢复蓝色素材标签样式并保持 `AssetID` 绑定。
+- 2026-04-11 - 验证 - 执行 `cd frontend && npm run dev` 启动成功（3000 占用，自动使用 `http://localhost:3002`）；`frontend/src/app/projects/[id]/script/storyboard/page.tsx` lints 结果为 0。
+- 2026-04-11 - 修复 - Step4 批量首帧提示词编辑改为“文本内素材标签”交互：提示区域改为可编辑富文本，素材引用以蓝色标签直接出现在文本区域并保留 `AssetID` 绑定；分镜 Tab 增加“参考数/已应用”状态提示。
+- 2026-04-11 - 修复 - Step4 批量首帧会话状态持久化：新增本地持久化（按集+行）保存提示词、参考图、生成图与已应用图，关闭弹窗后未删除素材再次打开仍可展示。
+- 2026-04-11 - 修复 - 分镜脚本表格新增行间操作：在每两行交界左侧增加行操作按钮，支持“插入行”（在两行之间插入空行）与“合并行”（逐列按先后换行拼接并删除下一行）。
+- 2026-04-11 - 验证 - 执行 `cd /Users/wrf/Documents/视频生成/frontend && npm run dev`，Next.js 正常启动（3000 占用自动切换到 `http://localhost:3002`）；`frontend/src/app/components/ScriptEditor.tsx` 与 `frontend/src/app/projects/[id]/script/storyboard/page.tsx` lints 结果均为 0。
+- 2026-04-11 - 修复 - Step4 批量首帧“应用到提示词”改为按光标位置插入素材标签：在可编辑文本中保留内联 `AssetID` 标签顺序，不再统一追加到文本末尾；点击标签/按钮可移除。
+- 2026-04-11 - 验证 - 执行 `cd /Users/wrf/Documents/视频生成/frontend && npm run dev` 启动成功（3000 占用，自动使用 `http://localhost:3002`）；`frontend/src/app/projects/[id]/script/storyboard/page.tsx` lints 结果为 0。
+- 2026-04-11 - 修复 - Step4 分镜表行操作语义修正：行间按钮改为作用于“当前行与上方行”，`插入行`改为在当前行上方插入空行，`合并行`改为与上方行逐列按先后换行拼接并删除当前行。
+- 2026-04-11 - 验证 - 执行 `cd /Users/wrf/Documents/视频生成/frontend && npm run dev` 启动成功（3000 占用，自动使用 `http://localhost:3002`）；`frontend/src/app/components/ScriptEditor.tsx` lints 结果为 0。
+- 2026-04-11 - 修复 - Step4 批量首帧“应用”后素材联动：应用首帧写回为标准 `MATERIAL_REF` 块（含素材类型/素材名/素材描述），并将已应用首帧作为“首帧”素材注入批量弹窗素材区，确保立即可见。
+- 2026-04-11 - 修复 - Step4 素材管理弹窗联动：分镜脚本单元格写回 `MATERIAL_REF` 后，素材管理弹窗可从脚本中解析并显示该首帧素材。
+- 2026-04-11 - 验证 - 执行 `cd /Users/wrf/Documents/视频生成/frontend && npm run dev` 启动成功（3000 占用，自动使用 `http://localhost:3002`）；`frontend/src/app/projects/[id]/script/storyboard/page.tsx` lints 结果为 0。
+- 2026-04-12 - 修复 - Step4 批量首帧交互与表格写回修正：批量弹窗标题改为“批量生成首帧”；按钮顺序调整为“按要求生成分镜”右侧显示“批量生成首帧图”；分镜表重建逻辑支持转义分隔符与换行（`\|`/`<br>`），避免应用首帧后 Markdown 表格错乱；批量生成首帧写回首帧列时同步标准素材块并写入当前生成图，确保素材管理“首帧”tab可见。
+- 2026-04-12 - 修复 - 素材管理应用后展示优化：表格单元格渲染隐藏 `素材名` 与 `素材描述` 文本，仅展示图片与业务内容，避免灰色元信息干扰。
+- 2026-04-12 - 验证 - 执行 `cd /Users/wrf/Documents/视频生成/frontend && npm run dev` 启动成功（3000 占用，自动使用 `http://localhost:3002`）；`frontend/src/app/projects/[id]/script/storyboard/page.tsx` 与 `frontend/src/app/components/ScriptEditor.tsx` lints 结果均为 0。
+- 2026-04-12 - 修复 - Step4 批量首帧流程调整：生成首帧仅进入“已生成列表”，不再自动写回分镜首帧列；仅在点击“应用”时才写入 `MATERIAL_REF` 并进入素材管理可见范围。
+- 2026-04-12 - 验证 - 执行 `cd /Users/wrf/Documents/视频生成/frontend && npm run dev` 启动成功（3000 占用，自动使用 `http://localhost:3002`）；`frontend/src/app/projects/[id]/script/storyboard/page.tsx` lints 结果为 0。
+- 2026-04-12 - 修复 - Step4 素材管理“应用至剧本”写入列匹配增强：首帧列识别支持“首帧图片/首帧/首位帧/起始帧”，避免点击应用后未写入表格。
+- 2026-04-12 - 修复 - Step4 批量首帧输入框光标稳定性修复：输入区状态同步改为“内容一致则不重建 DOM”，避免打字/删除/插入素材后光标跳到表格首行。
+- 2026-04-12 - 验证 - 执行 `cd /Users/wrf/Documents/视频生成/frontend && npm run dev` 启动成功（3000 占用，自动使用 `http://localhost:3002`）；`frontend/src/app/components/ScriptEditor.tsx` 与 `frontend/src/app/projects/[id]/script/storyboard/page.tsx` lints 结果均为 0。
+- 2026-04-12 - 修复 - Step4 素材管理“应用至剧本”写入兜底：若按素材类型未定位到目标列，则回落写入当前打开素材管理的单元格，确保点击“应用至剧本”后图片必然出现在表格。
+- 2026-04-12 - 修复 - Step4 素材弹窗生成图持久化修复：新增帧图状态 hydration 保护，避免页面刷新时先写空缓存覆盖旧缓存，修复“角色形象过一段时间消失”问题。
+- 2026-04-12 - 验证 - 执行 `cd /Users/wrf/Documents/视频生成/frontend && npm run dev` 启动成功（3000 占用，自动使用 `http://localhost:3002`）；`frontend/src/app/components/ScriptEditor.tsx` lints 结果为 0。
+- 2026-04-12 - 修复 - Step4 素材弹窗状态持久化补丁落地：`frameStateHydratedRef` 启用后仅在状态完成回填后写入 localStorage，避免刷新时空状态覆盖历史生成图。
+- 2026-04-12 - 验证 - 再次执行 `cd /Users/wrf/Documents/视频生成/frontend && npm run dev` 启动成功（3000 占用，自动使用 `http://localhost:3002`）；`frontend/src/app/components/ScriptEditor.tsx` lints 结果为 0。
+- 2026-04-12 - 修复 - Step4 表格素材展示修复：表格解析反转义 `\|`，避免素材图片 URL 被保留反斜杠导致渲染失败；同时在单元格渲染中增加内嵌图片 URL 直出兜底，确保“应用至剧本”后图片可见。
+- 2026-04-12 - 验证 - 执行 `cd /Users/wrf/Documents/视频生成/frontend && npm run dev` 启动成功（3000 占用，自动使用 `http://localhost:3002`）；`frontend/src/app/components/ScriptEditor.tsx` lints 结果为 0。
+- 2026-04-12 - 体验优化 - Step4 批量首帧弹窗交互语义更新：下方按钮改为“应用至素材库/已入素材库”，点击后将当前首帧写入首帧素材块并标记入库状态，确保在批量弹窗上方“首帧”tab与素材管理弹窗“首帧”tab可见。
+- 2026-04-12 - 验证 - 执行 `cd /Users/wrf/Documents/视频生成/frontend && npm run dev` 启动成功（3000 占用时自动切换到 `http://localhost:3001`）；`frontend/src/app/projects/[id]/script/storyboard/page.tsx` lints 结果为 0。
+- 2026-04-12 - 修复 - 本地后端启动失败修复：将 `backend/app/models/character_image_binding.py`、`backend/app/api/assets.py`、`backend/app/api/script.py`、`backend/app/api/segments.py` 中触发 Python3.9 运行时错误的 `| None` 注解改为 `Optional[...]`，恢复 Uvicorn 启动能力。
+- 2026-04-12 - 验证 - 本地后端已成功启动在 `http://localhost:8003`（Uvicorn startup complete）；`curl http://localhost:3000/api/projects/359e827c-434c-4399-8663-c12ab459dbb1/script` 返回 403（未登录）而非 500，确认代理链路恢复。
+- 2026-04-12 - 验证 - 执行 `cd /Users/wrf/Documents/视频生成/frontend && npm run dev` 启动成功（3000 占用时自动切换到 `http://localhost:3001`）；本次修改相关文件 lints 结果为 0。
+- 2026-04-12 - 调整 - 按用户要求恢复 LinkAPI 全局 Key 优先策略：`backend/app/services/linkapi.py` 中文本与绘图 key 解析逻辑回退为“环境变量优先，用户设置兜底”。
+- 2026-04-12 - 验证 - 通过后端环境变量对 `FOURSAPI_TEXT_ENDPOINT` 发起探测请求返回 HTTP 200；重启后端 `http://localhost:8003` 健康检查通过。
+- 2026-04-12 - 验证 - 重新执行 `cd /Users/wrf/Documents/视频生成/frontend && npm run dev` 启动成功并固定在 `http://localhost:3000`。
+- 2026-04-12 - 修复 - 分镜 401 根因修复：`backend/app/core/config.py` 新增 `foursapi_api_key` 配置项，`backend/app/services/linkapi.py` 文本 key 解析优先级改为 `FOURSAPI_API_KEY(环境/配置) -> SUCHUANG -> GRSAI`，避免进程未导出环境变量时误用绘图 key 调用文本接口。
+- 2026-04-12 - 验证 - 本地运行时校验通过：`os.FOURSAPI_API_KEY` 为空时仍能从配置读取到 `settings.foursapi_api_key` 并被选中为文本通道 key。
+- 2026-04-12 - 验证 - 按文本通道实际探测 `FOURSAPI_TEXT_ENDPOINT` 返回 HTTP 200；后端 `http://localhost:8003/health` 正常。
+- 2026-04-12 - 验证 - 执行 `cd /Users/wrf/Documents/视频生成/frontend && npm run dev` 时发现已有进程占用（3000 监听正常），再次确认 `http://localhost:3000/api/projects/d51750e6-9ce2-418a-9139-09a7a8468776/script` 返回 403（未登录）且代理链路正常。
+- 2026-04-13 - 修复 - Step4 批量首帧失败根因修复：补装后端依赖 `cos-python-sdk-v5`（提供 `qcloud_cos`），解决生成成功后上传 COS 阶段 `ModuleNotFoundError: No module named 'qcloud_cos'` 导致任务失败。
+- 2026-04-13 - 验证 - 执行 `./venv/bin/python -c "import qcloud_cos"` 导入成功；重启后端 `uvicorn` 至 `8003` 并确认监听正常。
+- 2026-04-13 - 体验优化 - Step4 批量首帧弹窗交互更新：`frontend/src/app/projects/[id]/script/storyboard/page.tsx` 将“应用到图像”改为“应用至剧本/取消应用”，点击即同步写入或移除分镜表格首帧素材块，并高亮已应用素材卡片。
+- 2026-04-13 - 修复 - 素材管理首帧 tab 取消应用不再丢素材：`frontend/src/app/components/ScriptEditor.tsx` 在“取消应用”时保留首帧素材到本地首帧素材池，避免素材从首帧 tab 消失。
+- 2026-04-13 - 验证 - 本次改动相关文件 lints 为 0；执行 `cd /Users/wrf/Documents/视频生成/frontend && npm run dev` 已修复锁冲突并成功启动在 `http://localhost:3000`。
+- 2026-04-13 - 修复 - 批量首帧弹窗崩溃修复：`frontend/src/app/projects/[id]/script/storyboard/page.tsx` 补回 `scriptApplied` 变量定义并统一卡片/按钮状态来源，解决点击“批量生成首帧”后 Runtime ReferenceError（`scriptApplied is not defined`）。
+- 2026-04-13 - 验证 - 执行 `cd /Users/wrf/Documents/视频生成/frontend && npm run dev` 成功启动（`http://localhost:3000`），相关文件 lints 结果为 0。
+- 2026-04-13 - 体验优化 - Step4 批量首帧交互语义分离：`frontend/src/app/projects/[id]/script/storyboard/page.tsx` 将“应用至素材库”与“应用至剧本”状态解耦，下方生成区按钮改为“应用至素材库/从素材库中移除”，仅控制素材库入库状态。
+- 2026-04-13 - 修复 - Step4 首帧素材应用逻辑调整：上方素材库卡片默认未应用，点击“应用至剧本/取消应用”才写入或移除分镜表格首帧列；新增 `scriptAppliedImageUrl` 持久化字段，刷新后仍保持正确状态。
+- 2026-04-13 - 验证 - 执行 `cd /Users/wrf/Documents/视频生成/frontend && npm run dev` 启动成功（`http://localhost:3000`），`frontend/src/app/projects/[id]/script/storyboard/page.tsx` lints 结果为 0。
+- 2026-04-13 - 体验优化 - Step4 批量首帧弹窗图片预览能力补齐：`frontend/src/app/projects/[id]/script/storyboard/page.tsx` 为上方素材库区、下方生成图区、全部预览区图片统一增加点击放大预览层。
+- 2026-04-13 - 修复 - Step4 首帧写入内容清洗：`frontend/src/app/projects/[id]/script/storyboard/page.tsx` 在写入首帧素材块时将素材名/描述标准化为单行，避免应用到剧本后在图片下方出现多余结构化文本（json/jaso 类内容）。
+- 2026-04-13 - 验证 - 执行 `cd /Users/wrf/Documents/视频生成/frontend && npm run dev` 启动成功（`http://localhost:3000`），相关文件 lints 结果为 0。
+- 2026-04-13 - 修复 - 批量首帧弹窗预览崩溃修复：`frontend/src/app/projects/[id]/script/storyboard/page.tsx` 补回 `batchImagePreviewUrl/batchImagePreviewTitle` 状态定义，解决 Runtime ReferenceError（`batchImagePreviewUrl is not defined`）。
+- 2026-04-13 - 体验优化 - 批量首帧上方素材库图片补齐点击预览能力，确保弹窗内各图片区（素材库/生成区/全部预览）交互一致。
+- 2026-04-13 - 验证 - 执行 `cd /Users/wrf/Documents/视频生成/frontend && npm run dev` 启动成功（`http://localhost:3000`），`frontend/src/app/projects/[id]/script/storyboard/page.tsx` lints 结果为 0。
+- 2026-04-13 - 修复 - 批量首帧“应用至素材库”同步素材管理：`frontend/src/app/projects/[id]/script/storyboard/page.tsx` 新增与 `script_editor_frame_state_v2` 共用的首帧状态同步逻辑，入库后自动写入素材管理 `首帧` tab 数据源。
+- 2026-04-13 - 体验优化 - 批量首帧“从素材库中移除”同步清理素材管理 `首帧` tab 对应条目，避免两处素材显示不一致。
+- 2026-04-13 - 验证 - 执行 `cd /Users/wrf/Documents/视频生成/frontend && npm run dev` 启动成功（`http://localhost:3000`），`frontend/src/app/projects/[id]/script/storyboard/page.tsx` lints 结果为 0。
+- 2026-04-13 - 修复 - 素材库实时联动补全：`frontend/src/app/projects/[id]/script/storyboard/page.tsx` 在批量首帧入库/移除时增加 `script-editor-frame-state-updated` 事件广播，解决同页内素材管理弹窗不刷新的问题。
+- 2026-04-13 - 修复 - `frontend/src/app/components/ScriptEditor.tsx` 新增对 `script-editor-frame-state-updated` 事件监听，实时重载 `firstImageMap` 与 `generatedMetaMap`，确保批量首帧与素材管理共用同一素材库并即时可见。
+- 2026-04-13 - 验证 - 执行 `cd /Users/wrf/Documents/视频生成/frontend && npm run dev` 启动成功（`http://localhost:3000`），相关文件 lints 结果为 0。
+- 2026-04-13 - 修复 - 批量首帧与素材管理“首帧”同库展示硬联通：`frontend/src/app/projects/[id]/script/storyboard/page.tsx` 从批量首帧持久化数据构建 `sharedBatchFirstFrameEntries` 并传入 `ScriptEditor`。
+- 2026-04-13 - 修复 - `frontend/src/app/components/ScriptEditor.tsx` 新增 `externalFirstFrameEntries` 入参并并入 `materialAssetsByTab.first`，确保批量首帧“应用至素材库”的图片在素材管理弹窗 `首帧` tab 必定可见。
+- 2026-04-13 - 验证 - 执行 `cd /Users/wrf/Documents/视频生成/frontend && npm run dev` 启动成功（`http://localhost:3000`），`storyboard/page.tsx` 与 `ScriptEditor.tsx` lints 结果为 0。
+- 2026-04-13 - 修复 - Runtime 崩溃修复：`frontend/src/app/components/ScriptEditor.tsx` 补回 `externalFirstFrameEntries` 的函数参数解构默认值，解决 `externalFirstFrameEntries is not defined`。
+- 2026-04-13 - 验证 - 执行 `cd /Users/wrf/Documents/视频生成/frontend && npm run dev` 启动成功（`http://localhost:3000`），相关文件 lints 结果为 0。
+- 2026-04-13 - 修复 - Step3 音频上传改为“仅上传样本”：`backend/app/api/voices.py` 新增 `/voices/{character_name}/upload-sample-only`，`frontend/src/app/components/VoiceSelector.tsx` 改用该接口，上传时不再自动创建 Kling 自定义音色。
+- 2026-04-13 - 修复 - 素材管理创建区“先展示后入库”：`frontend/src/app/components/ScriptEditor.tsx` 将创建/编辑生成图改为进入草稿展示区，按钮改为“应用至素材库”，仅点击后写入素材库，避免自动出现在素材库中。
+- 2026-04-13 - 体验优化 - 素材管理新增手动上传：`backend/app/api/assets.py` 新增 `/assets/upload-temp`（上传到 COS/静态并返回 URL），`frontend/src/app/components/ScriptEditor.tsx` 在生成按钮旁新增“上传素材”按钮；上传成功自动展示在下方展示区。
+- 2026-04-13 - 体验优化 - 应用至素材库前名称校验：`frontend/src/app/components/ScriptEditor.tsx` 在“应用至素材库”时强制校验素材名称，未填写时弹出 toast 提示。
+- 2026-04-13 - 验证 - 相关文件 lints 结果为 0；执行 `cd /Users/wrf/Documents/视频生成/frontend && npm run dev` 启动成功（`http://localhost:3000`，返回 200）。
+- 2026-04-13 - 修复 - Step4 Seedance 鉴权增强：`backend/app/services/linkapi.py` 增加 Seedance API Key 归一化与占位符拦截，过滤 `primary_key` / `Bearer ...` / `key=value` 等无效格式，避免将占位符提交至火山接口导致 401。
+- 2026-04-13 - 修复 - Step4 Seedance 查询链路同步修复：`backend/app/api/segments.py` 的 `_resolve_seedance_key` 同步加入占位符与格式清洗，避免任务状态查询继续使用无效 key。
+- 2026-04-13 - 验证 - 执行 `python3 -m py_compile backend/app/services/linkapi.py backend/app/api/segments.py` 通过；重启后端 `uvicorn app.main:app --port 8003` 成功；执行 `cd /Users/wrf/Documents/视频生成/frontend && npm run dev` 启动成功（`http://localhost:3000` 返回 200）。
+- 2026-04-13 - 修复 - 素材管理“应用至素材库”按钮改为双向切换：`frontend/src/app/components/ScriptEditor.tsx` 入库后按钮显示“从素材库中移除”，点击后执行移除并同步本地持久化状态。
+- 2026-04-13 - 修复 - 手动上传素材名称校验收紧：`frontend/src/app/components/ScriptEditor.tsx` 上传后不再使用文件名兜底素材名称，点击“应用至素材库”时若未填写名称则提示“需要先输入素材名称才能应用至素材库”。
+- 2026-04-13 - 验证 - `frontend/src/app/components/ScriptEditor.tsx` lints 结果为 0；执行 `cd /Users/wrf/Documents/视频生成/frontend && npm run dev` 启动成功（`http://localhost:3000` 返回 200）。
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+- 2026-04-13 - 修复 - Seedance 鉴权键解析收紧：`backend/app/services/linkapi.py` 与 `backend/app/api/segments.py` 对 JSON 结构 key 做白名单提取，仅接受 `api_key/ark_api_key/volcengine_ark_api_key/primary_key/token`，避免将 Kling AK/SK JSON 误作为 Bearer 发起请求。
+- 2026-04-13 - 验证 - 执行 `python3 -m py_compile backend/app/services/linkapi.py backend/app/api/segments.py` 通过；执行 `cd /Users/wrf/Documents/视频生成/frontend && npm run dev` 启动成功（`http://localhost:3000` 返回 200）。
+- 2026-04-13 - 配置 - 已按用户提供值注入 `ARK_API_KEY` 并重启后端 `uvicorn app.main:app --port 8003`，用于 Seedance 鉴权。
+- 2026-04-13 - 验证 - 后端健康检查 `http://127.0.0.1:8003/docs` 返回 200，服务进程正常。
+- 2026-04-13 - 修复 - Step4 自定义风格本地存储防崩溃：`frontend/src/app/projects/[id]/script/storyboard/page.tsx` 为 `storyboard-custom-styles-*` 增加容量保护（超大 dataURL 过滤、数量上限、写入失败自动降级），避免 localStorage quota exceeded 触发运行时异常。
+- 2026-04-13 - 修复 - Step4 自定义风格上传新增图片体积校验，超限时提示并阻止保存。
+- 2026-04-13 - 验证 - `storyboard/page.tsx` lints 为 0；执行 `cd /Users/wrf/Documents/视频生成/frontend && npm run dev` 启动成功，分镜页路由返回 200。
+- 2026-04-13 - 修复 - Step4 风格弹窗交互优化：`frontend/src/app/projects/[id]/script/storyboard/page.tsx` 自定义风格上传支持自动压缩，解决点击保存后无展示的问题；保存后风格卡片展示图片+名称+提示词。
+- 2026-04-13 - 修复 - Step4 全部风格卡片新增右下角“应用”按钮，点击后应用全局风格并自动关闭悬浮窗；顶部全局风格按钮同步显示已应用风格名称。
+- 2026-04-13 - 修复 - Step4 全部风格卡片图片支持点击预览，复用现有图片预览浮层。
+- 2026-04-13 - 验证 - `storyboard/page.tsx` lints 为 0；执行 `cd /Users/wrf/Documents/视频生成/frontend && npm run dev` 启动成功，`/projects/d51750e6-9ce2-418a-9139-09a7a8468776/script/storyboard` 返回 200。
+- 2026-04-13 - 修复 - Step4 批量首帧弹窗控制区新增风格选择入口：在“快速通道”右侧添加“风格 + 当前风格名称按钮”，复用 Step4 全局风格状态与同一套风格弹窗交互。
+- 2026-04-13 - 修复 - 调整风格弹窗层级为 `z-[70]`，确保在批量首帧弹窗内打开时可见可操作。
+- 2026-04-13 - 验证 - `storyboard/page.tsx` lints 为 0；执行 `cd /Users/wrf/Documents/视频生成/frontend && npm run dev` 启动成功，分镜页路由返回 200。
+- 2026-04-13 - 修复 - Step4 素材管理创建素材区（`ScriptEditor.tsx`）在“快速通道”右侧新增“风格+风格名称按钮”，复用 Step4 同一套全局风格弹窗与状态。
+- 2026-04-13 - 修复 - 批量首帧生成与素材管理生成素材请求统一携带“参考图 references + 全局风格提示词”：`storyboard/page.tsx` 与 `ScriptEditor.tsx` 对 prompt 进行风格化拼装并保持 references 结构化传参。
+- 2026-04-13 - 修复 - `storyboard/page.tsx` 抽取统一 `globalStylePromptText` 并透传给 `ScriptEditor`，保证 Step4 各入口风格约束一致。
+- 2026-04-13 - 验证 - `ScriptEditor.tsx` 与 `storyboard/page.tsx` lints 均为 0；执行 `cd /Users/wrf/Documents/视频生成/frontend && npm run dev` 启动成功，分镜页路由返回 200。
+- 2026-04-13 - 修复 - `ScriptEditor.tsx` 修正素材管理“创建素材”生成回写逻辑：生成成功后改为写入草稿展示区（`appendDraftFrameImage`），解决生成完成后不展示图片的问题。
+- 2026-04-13 - 验证 - `ScriptEditor.tsx` lints 为 0；执行 `cd /Users/wrf/Documents/视频生成/frontend && npm run dev` 启动成功，分镜页路由返回 200。

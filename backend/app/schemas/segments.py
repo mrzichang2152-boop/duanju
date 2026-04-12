@@ -40,6 +40,7 @@ class SegmentFrameGenerateRequest(BaseModel):
     frame_type: Optional[str] = "first"
     aspect_ratio: Optional[str] = "16:9"
     model: Optional[str] = None
+    quick_channel: Optional[bool] = False
 
 
 class SegmentFrameGenerateResponse(BaseModel):

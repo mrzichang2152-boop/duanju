@@ -735,6 +735,32 @@ export const uploadAssetImage = async (
   return response.json() as Promise<{ status: string }>;
 };
 
+export const uploadTemporaryMaterialImage = async (
+  token: string,
+  projectId: string,
+  file: File
+) => {
+  const normalizedToken = normalizeToken(token);
+  const formData = new FormData();
+  formData.append("file", file);
+  const response = await fetch(`${baseUrl}/projects/${projectId}/assets/upload-temp`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${normalizedToken}`,
+    },
+    body: formData,
+  });
+  if (response.status === 401) {
+    const bodyText = await response.text();
+    throw new Error(parseApiErrorMessage(bodyText, response.status, "登录状态校验失败，请重试"));
+  }
+  if (!response.ok) {
+    const bodyText = await response.text();
+    throw new Error(parseApiErrorMessage(bodyText, response.status, "上传素材失败"));
+  }
+  return response.json() as Promise<{ status: string; image_url: string }>;
+};
+
 export const selectAssetVersion = (token: string, projectId: string, assetId: string, versionId: string) =>
   request<{ status: string }>(
     `/projects/${projectId}/assets/${assetId}/select`,
@@ -998,6 +1024,39 @@ export const uploadCharacterVoiceSample = async (
   return response.json() as Promise<CharacterVoice>;
 };
 
+export const uploadCharacterVoiceSampleOnly = async (
+  token: string,
+  projectId: string,
+  characterName: string,
+  file: File,
+  payload?: { title?: string; duration_sec?: number }
+) => {
+  const normalizedToken = normalizeToken(token);
+  const formData = new FormData();
+  formData.append("file", file);
+  if (payload?.title) {
+    formData.append("title", payload.title);
+  }
+  if (typeof payload?.duration_sec === "number" && Number.isFinite(payload.duration_sec)) {
+    formData.append("duration_sec", String(payload.duration_sec));
+  }
+  const response = await fetch(`${baseUrl}/projects/${projectId}/voices/${characterName}/upload-sample-only`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${normalizedToken}`,
+    },
+    body: formData,
+  });
+  if (response.status === 401) {
+    const bodyText = await response.text();
+    throw new Error(parseApiErrorMessage(bodyText, response.status, "登录状态校验失败，请重试"));
+  }
+  if (!response.ok) {
+    const bodyText = await response.text();
+    throw new Error(parseApiErrorMessage(bodyText, response.status, "上传音频失败"));
+  }
+  return response.json() as Promise<CharacterVoice>;
+};
 export const generateTTS = (
   token: string,
   projectId: string,
@@ -1084,7 +1143,7 @@ export const generateSegment = (
 export const generateSegmentFrameImage = (
   token: string,
   projectId: string,
-  payload: { prompt: string; references?: string[]; frame_type?: string; aspect_ratio?: string; model?: string }
+  payload: { prompt: string; references?: string[]; frame_type?: string; aspect_ratio?: string; model?: string; quick_channel?: boolean }
 ) =>
   request<AsyncTaskStatusResponse>(
     `/projects/${projectId}/segments/frame-images/generate`,

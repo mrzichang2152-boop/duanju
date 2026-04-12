@@ -10,6 +10,7 @@ class Settings(BaseSettings):
     fish_audio_api_key: str = ""
     elevenlabs_api_key: str = ""
     openrouter_api_key: str = ""
+    foursapi_api_key: str = ""
     suchuang_api_key: str = ""
     grsai_api_key: str = ""
 

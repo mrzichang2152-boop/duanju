@@ -649,6 +649,93 @@ async def upload_character_voice_sample(
     return voice
 
 
+@router.post("/{project_id}/voices/{character_name}/upload-sample-only", response_model=CharacterVoiceResponse)
+async def upload_character_voice_sample_only(
+    project_id: str,
+    character_name: str,
+    file: UploadFile = File(...),
+    title: Optional[str] = Form(None),
+    duration_sec: Optional[float] = Form(None),
+    user_id: str = Depends(get_current_user_id),
+    db: AsyncSession = Depends(get_db),
+):
+    result = await db.execute(select(Project).where(Project.id == project_id, Project.user_id == user_id))
+    project = result.scalars().first()
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    ext = os.path.splitext(file.filename or "")[1].lower()
+    if ext not in {".mp3", ".wav", ".mp4", ".mov"}:
+        raise HTTPException(status_code=400, detail="仅支持 .mp3/.wav/.mp4/.mov 文件")
+
+    raw = await file.read()
+    if not raw:
+        raise HTTPException(status_code=400, detail="上传文件为空")
+    if len(raw) > 200 * 1024 * 1024:
+        raise HTTPException(status_code=400, detail="文件大小不能超过200MB")
+
+    backend_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    static_dir = os.path.join(backend_dir, "static", "voice_samples", project_id)
+    os.makedirs(static_dir, exist_ok=True)
+    local_name = f"{uuid.uuid4().hex}{ext}"
+    local_path = os.path.join(static_dir, local_name)
+    with open(local_path, "wb") as fp:
+        fp.write(raw)
+
+    resolved_duration = duration_sec if isinstance(duration_sec, (int, float)) and duration_sec > 0 else None
+    if resolved_duration is None:
+        resolved_duration = _extract_audio_duration_seconds(local_path)
+    if resolved_duration is not None and (resolved_duration < 5 or resolved_duration > 30):
+        raise HTTPException(status_code=400, detail="音频时长需在 5-30 秒")
+
+    sample_url = f"/static/voice_samples/{project_id}/{local_name}"
+    try:
+        sample_url = await media_storage.publish_local_file_under_static(project_id, local_path)
+    except Exception:
+        pass
+    if sample_url.startswith("/"):
+        public_base = str(os.getenv("PUBLIC_BASE_URL") or os.getenv("KLING_PUBLIC_BASE_URL") or "").strip().rstrip("/")
+        if public_base:
+            sample_url = f"{public_base}{sample_url}"
+
+    result = await db.execute(
+        select(CharacterVoice).where(
+            CharacterVoice.project_id == project_id,
+            CharacterVoice.character_name == character_name,
+        )
+    )
+    voice = result.scalars().first()
+
+    sample_title = (title or f"{character_name}-voice").strip()[:32]
+    cfg = {
+        "provider": "kling",
+        "title": sample_title,
+        "source": "uploaded_sample_only",
+        "duration_sec": round(float(resolved_duration), 3) if isinstance(resolved_duration, (int, float)) else None,
+        "sample_url": sample_url,
+        "auto_create_kling_voice": False,
+    }
+
+    if voice:
+        voice.preview_url = sample_url
+        merged_cfg = voice.config if isinstance(voice.config, dict) else {}
+        voice.config = {**merged_cfg, **cfg}
+    else:
+        voice = CharacterVoice(
+            project_id=project_id,
+            character_name=character_name,
+            voice_id=f"sample-{uuid.uuid4().hex[:12]}",
+            voice_type="SAMPLE_ONLY",
+            preview_url=sample_url,
+            config=cfg,
+        )
+        db.add(voice)
+
+    await db.commit()
+    await db.refresh(voice)
+    return voice
+
+
 @router.post("/{project_id}/tts", response_model=TTSResponse)
 async def generate_tts(
     project_id: str,

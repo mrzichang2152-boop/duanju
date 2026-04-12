@@ -17,7 +17,7 @@ class UserSettings(Base):
     endpoint: Mapped[str] = mapped_column(String(255), default="https://api.wuyinkeji.com")
     api_key_encrypted: Mapped[Optional[str]] = mapped_column(String(2048), nullable=True)
     default_model_text: Mapped[str] = mapped_column(
-        String(128), default="gemini-3.1-pro"
+        String(128), default="gemini-3.1-pro-preview"
     )
     default_model_image: Mapped[str] = mapped_column(
         String(128), default="nano-banana-2"

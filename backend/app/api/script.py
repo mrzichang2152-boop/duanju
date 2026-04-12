@@ -73,7 +73,7 @@ router = APIRouter()
 logger = logging.getLogger(__name__)
 _storyboard_task_lock = asyncio.Lock()
 _storyboard_tasks: dict[str, dict[str, Any]] = {}
-_OPENROUTER_TEXT_MODEL = "gemini-3.1-pro"
+_OPENROUTER_TEXT_MODEL = "gemini-3.1-pro-preview"
 
 
 def _build_storyboard_text_from_episodes(episodes: list[dict[str, Any]]) -> str:
@@ -864,79 +864,113 @@ async def _run_storyboard_task(task_id: str) -> None:
                 task.get("instruction"),
                 int(task.get("episode_index") or 0),
             )
-            content_chunks: list[str] = []
-            reasoning_chunks: list[str] = []
-            async for chunk in create_chat_completion_stream(
-                session,
-                task["user_id"],
-                {
-                    "model": task["model"],
-                    "messages": [
-                        {"role": "system", "content": PROMPT_STORYBOARD},
-                        {"role": "user", "content": user_prompt},
-                    ],
-                    "temperature": 0.2,
-                    "max_tokens": 120000,
-                    "thinking": {"type": "disabled"},
-                },
-            ):
-                if isinstance(chunk, str):
-                    if chunk.startswith("Error:"):
-                        raise RuntimeError(chunk[6:].strip() or "分镜生成失败")
-                    continue
-                if not isinstance(chunk, dict):
-                    continue
-                choices = chunk.get("choices") if isinstance(chunk, dict) else None
-                if not choices:
-                    continue
-                first_choice = choices[0] if isinstance(choices[0], dict) else {}
-                delta = first_choice.get("delta") if isinstance(first_choice, dict) else None
-                piece = None
-                reason_piece = None
-                if isinstance(delta, dict):
-                    piece = delta.get("content")
-                    reason_piece = delta.get("reasoning_content")
-                if isinstance(first_choice.get("message"), dict):
-                    msg_obj = first_choice.get("message")
-                    if not piece:
-                        piece = msg_obj.get("content")
-                    if not reason_piece:
-                        reason_piece = msg_obj.get("reasoning_content")
-                if piece:
-                    content_chunks.append(str(piece))
-                if reason_piece:
-                    reasoning_chunks.append(str(reason_piece))
+            max_storyboard_attempts = 3
+            generated = ""
+            thinking_text = ""
+            success_attempt = 0
 
-            raw_content = "".join(content_chunks)
-            raw_reasoning = "".join(reasoning_chunks)
-            thinking_text = _extract_storyboard_thinking_text(raw_content, raw_reasoning)
-            generated = _sanitize_storyboard_markdown(raw_content)
-            if (not generated or not _contains_markdown_table(generated)) and thinking_text:
-                combined_candidate = _sanitize_storyboard_markdown(f"{raw_content}\n\n{thinking_text}")
-                if _contains_markdown_table(combined_candidate):
-                    generated = combined_candidate
-            if not generated:
-                if raw_content.strip() or thinking_text.strip():
+            for attempt in range(max_storyboard_attempts):
+                retry_tip = ""
+                if attempt > 0:
+                    retry_tip = (
+                        "\n\n【重试强约束】\n"
+                        "你上一轮输出未通过格式校验。"
+                        "本轮必须且只能输出 Markdown 表格本体（含表头分隔线与数据行），"
+                        "禁止输出解释、思考、过程描述、标题、段落、代码块标记。"
+                    )
+                attempt_user_prompt = f"{user_prompt}{retry_tip}"
+                content_chunks: list[str] = []
+                reasoning_chunks: list[str] = []
+                async for chunk in create_chat_completion_stream(
+                    session,
+                    task["user_id"],
+                    {
+                        "model": task["model"],
+                        "messages": [
+                            {"role": "system", "content": PROMPT_STORYBOARD},
+                            {"role": "user", "content": attempt_user_prompt},
+                        ],
+                        "temperature": 0.2 if attempt == 0 else 0.1,
+                        "max_tokens": 120000,
+                        "thinking": {"type": "disabled"},
+                    },
+                ):
+                    if isinstance(chunk, str):
+                        if chunk.startswith("Error:"):
+                            raise RuntimeError(chunk[6:].strip() or "分镜生成失败")
+                        continue
+                    if not isinstance(chunk, dict):
+                        continue
+                    choices = chunk.get("choices") if isinstance(chunk, dict) else None
+                    if not choices:
+                        continue
+                    first_choice = choices[0] if isinstance(choices[0], dict) else {}
+                    delta = first_choice.get("delta") if isinstance(first_choice, dict) else None
+                    piece = None
+                    reason_piece = None
+                    if isinstance(delta, dict):
+                        piece = delta.get("content")
+                        reason_piece = delta.get("reasoning_content")
+                    if isinstance(first_choice.get("message"), dict):
+                        msg_obj = first_choice.get("message")
+                        if not piece:
+                            piece = msg_obj.get("content")
+                        if not reason_piece:
+                            reason_piece = msg_obj.get("reasoning_content")
+                    if piece:
+                        content_chunks.append(str(piece))
+                    if reason_piece:
+                        reasoning_chunks.append(str(reason_piece))
+
+                raw_content = "".join(content_chunks)
+                raw_reasoning = "".join(reasoning_chunks)
+                thinking_candidate = _extract_storyboard_thinking_text(raw_content, raw_reasoning)
+                generated_candidate = _sanitize_storyboard_markdown(raw_content)
+                if (not generated_candidate or not _contains_markdown_table(generated_candidate)) and thinking_candidate:
+                    combined_candidate = _sanitize_storyboard_markdown(f"{raw_content}\n\n{thinking_candidate}")
+                    if _contains_markdown_table(combined_candidate):
+                        generated_candidate = combined_candidate
+
+                if not generated_candidate:
                     logger.warning(
-                        "Storyboard empty after sanitize task_id=%s episode_index=%s raw_content_head=%s raw_reasoning_head=%s",
+                        "Storyboard empty after sanitize task_id=%s episode_index=%s attempt=%s/%s raw_content_head=%s raw_reasoning_head=%s",
                         task_id,
                         task.get("episode_index"),
+                        attempt + 1,
+                        max_storyboard_attempts,
                         raw_content[:300].replace("\n", "\\n"),
-                        thinking_text[:300].replace("\n", "\\n"),
+                        thinking_candidate[:300].replace("\n", "\\n"),
                     )
-                    raise RuntimeError("分镜生成失败：上游仅返回思考内容，未返回可用表格，请重试")
-                raise RuntimeError("分镜生成结果为空（上游返回空内容）")
-            if not _contains_markdown_table(generated):
-                logger.warning(
-                    "Storyboard non-table task_id=%s episode_index=%s content_head=%s reasoning_head=%s",
-                    task_id,
-                    task.get("episode_index"),
-                    generated[:300].replace("\n", "\\n"),
-                    thinking_text[:300].replace("\n", "\\n"),
-                )
-                raise RuntimeError("分镜生成失败：模型返回非表格内容，请重试")
+                    if attempt < max_storyboard_attempts - 1:
+                        continue
+                    if raw_content.strip() or thinking_candidate.strip():
+                        raise RuntimeError("分镜生成失败：上游仅返回思考内容，未返回可用表格，请重试")
+                    raise RuntimeError("分镜生成结果为空（上游返回空内容）")
+
+                if not _contains_markdown_table(generated_candidate):
+                    logger.warning(
+                        "Storyboard non-table task_id=%s episode_index=%s attempt=%s/%s content_head=%s reasoning_head=%s",
+                        task_id,
+                        task.get("episode_index"),
+                        attempt + 1,
+                        max_storyboard_attempts,
+                        generated_candidate[:300].replace("\n", "\\n"),
+                        thinking_candidate[:300].replace("\n", "\\n"),
+                    )
+                    if attempt < max_storyboard_attempts - 1:
+                        continue
+                    raise RuntimeError("分镜生成失败：模型返回非表格内容，请重试")
+
+                generated = generated_candidate
+                thinking_text = thinking_candidate
+                success_attempt = attempt + 1
+                break
+
+            if not generated:
+                raise RuntimeError("分镜生成失败：模型未返回可用表格，请重试")
+
             generated = _ensure_storyboard_system_columns(generated)
-            logger.info("Storyboard task completed task_id=%s project_id=%s episode_index=%s content_len=%s thinking_len=%s", task_id, task["project_id"], task["episode_index"], len(generated), len(thinking_text))
+            logger.info("Storyboard task completed task_id=%s project_id=%s episode_index=%s content_len=%s thinking_len=%s attempt=%s", task_id, task["project_id"], task["episode_index"], len(generated), len(thinking_text), success_attempt)
 
             script = await get_active_script(session, task["project_id"])
             episodes: list[dict[str, Any]] = []
@@ -1058,11 +1092,22 @@ async def get_step2_task_status(
     )
     if not task:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="任务不存在")
+
+    status_upper = str(task.status or "PENDING").upper()
+    if status_upper in {"PENDING", "RUNNING"}:
+        now = datetime.utcnow()
+        updated_at = task.updated_at or task.created_at or now
+        stale_seconds = (now - updated_at).total_seconds()
+        if stale_seconds > 600:
+            fail_message = "任务状态丢失（服务重启或任务中断），请重新执行"
+            task = await mark_async_task_failed(db, task, fail_message)
+            status_upper = "FAILED"
+
     return AsyncTaskStatusResponse(
         task_id=task.id,
         project_id=project_id,
         task_type=task.task_type,
-        status=str(task.status or "PENDING").upper(),
+        status=status_upper,
         result=parse_task_result(task),
         error=(str(task.error or "").strip() or None),
     )
@@ -1229,7 +1274,7 @@ async def start_storyboard_task(
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="分集内容为空，无法生成分镜")
     model = _normalize_mode_model("generate_storyboard", payload.model)
 
-    existing_task: dict[str, Any] | None = None
+    existing_task: Optional[dict[str, Any]] = None
     async with _storyboard_task_lock:
         for item in _storyboard_tasks.values():
             if (
@@ -1324,6 +1369,16 @@ async def get_storyboard_task_status(
             status_value = str(episode.get("storyboardTaskStatus") or "running")
             if status_value not in {"pending", "running", "completed", "failed"}:
                 status_value = "running"
+            if status_value in {"pending", "running"}:
+                fail_message = "任务状态丢失（服务重启或任务过期），请重新生成"
+                patched = dict(episode)
+                patched["storyboardTaskStatus"] = "failed"
+                patched["storyboardTaskError"] = fail_message
+                patched["storyboardTaskThinking"] = str(patched.get("storyboardTaskThinking") or "")
+                episodes[index] = patched
+                await save_script(db, project_id, None, None, None, None, episodes)
+                status_value = "failed"
+                episode = patched
             return StoryboardTaskStatusResponse(
                 task_id=task_id,
                 project_id=project_id,

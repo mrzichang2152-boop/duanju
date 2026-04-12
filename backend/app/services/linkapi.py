@@ -28,14 +28,16 @@ from app.models.asset_version import AssetVersion
 from app.models.character_voice import CharacterVoice
 from app.models.kling_subject import KlingSubject
 from app.services.character_image_bindings import resolve_image_bound_base_character_name
+from app.services.media_storage import cos_enabled, upload_bytes_under_project_to_cos
 from app.services.settings import get_api_key, get_or_create_settings
 
 logger = logging.getLogger(__name__)
 
 _KLING_ELEMENT_CACHE_TTL_SECONDS = 24 * 60 * 60
 _KLING_ELEMENT_CACHE: dict[str, tuple[str, float]] = {}
-_OPENROUTER_TEXT_MODEL = "gemini-3.1-pro"
+_OPENROUTER_TEXT_MODEL = "gemini-3.1-pro-preview"
 _OPENROUTER_IMAGE_MODEL = "nano-banana-2"
+_GEMINI_REFERENCE_IMAGE_LIMIT = 16
 
 # GRSAI /v1/draw/nano-banana 文档列出的绘画 model 值（用于 /linkapi/models 与前端 datalist）
 _GRSAI_DRAW_MODEL_ENTRIES: tuple[tuple[str, str], ...] = (
@@ -109,6 +111,25 @@ def _map_openrouter_model(model: str) -> str:
 
 async def _resolve_openrouter_key(session: AsyncSession, user_id: str) -> str:
     env_key = (
+        os.getenv("FOURSAPI_API_KEY", "").strip()
+        or str(getattr(app_settings, "foursapi_api_key", "") or "").strip()
+        or app_settings.suchuang_api_key.strip()
+        or os.getenv("SUCHUANG_API_KEY", "").strip()
+        or str(getattr(app_settings, "grsai_api_key", "") or "").strip()
+        or os.getenv("GRSAI_API_KEY", "").strip()
+    )
+    if env_key:
+        return env_key
+    try:
+        configured_key = await get_api_key(session, user_id)
+    except Exception as exc:
+        logger.warning("读取用户配置 API Key 失败，回退到环境变量: %s", exc)
+        configured_key = ""
+    return str(configured_key or "").strip()
+
+
+async def _resolve_grsai_draw_key(session: AsyncSession, user_id: str) -> str:
+    env_key = (
         str(getattr(app_settings, "grsai_api_key", "") or "").strip()
         or os.getenv("GRSAI_API_KEY", "").strip()
         or app_settings.suchuang_api_key.strip()
@@ -180,11 +201,11 @@ def _build_suchuang_content(payload: dict[str, Any]) -> str:
     return fallback
 
 
-def _extract_suchuang_text(value: Any) -> str:
+def _extract_suchuang_primary_content(value: Any) -> str:
     if isinstance(value, str):
         return value.strip()
     if isinstance(value, list):
-        parts = [_extract_suchuang_text(item) for item in value]
+        parts = [_extract_suchuang_primary_content(item) for item in value]
         return "\n".join([item for item in parts if item]).strip()
     if isinstance(value, dict):
         choices = value.get("choices")
@@ -194,29 +215,74 @@ def _extract_suchuang_text(value: Any) -> str:
                     continue
                 message = item.get("message")
                 if isinstance(message, dict):
-                    for message_key in ("content", "reasoning_content", "parts", "text"):
-                        message_text = _extract_suchuang_text(message.get(message_key))
+                    for message_key in ("content", "parts", "text"):
+                        message_text = _extract_suchuang_primary_content(message.get(message_key))
                         if message_text:
                             return message_text
                 delta = item.get("delta")
                 if isinstance(delta, dict):
-                    delta_text = _extract_suchuang_text(delta.get("content"))
-                    if delta_text:
-                        return delta_text
-                    delta_reasoning = _extract_suchuang_text(delta.get("reasoning_content"))
-                    if delta_reasoning:
-                        return delta_reasoning
-                for item_key in ("content", "text", "reasoning_content", "output", "result", "answer"):
-                    item_text = _extract_suchuang_text(item.get(item_key))
+                    for delta_key in ("content", "parts", "text"):
+                        delta_text = _extract_suchuang_primary_content(delta.get(delta_key))
+                        if delta_text:
+                            return delta_text
+                for item_key in ("content", "text", "output", "result", "answer"):
+                    item_text = _extract_suchuang_primary_content(item.get(item_key))
                     if item_text:
                         return item_text
-        for key in ("content", "text", "result", "output", "answer", "reasoning_content", "data", "message"):
+        for key in ("data", "message"):
             if key not in value:
                 continue
-            extracted = _extract_suchuang_text(value.get(key))
+            extracted = _extract_suchuang_primary_content(value.get(key))
+            if extracted:
+                return extracted
+        for key in ("content", "text", "result", "output", "answer"):
+            if key not in value:
+                continue
+            extracted = _extract_suchuang_primary_content(value.get(key))
             if extracted:
                 return extracted
     return ""
+
+
+def _extract_suchuang_reasoning_text(value: Any) -> str:
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, list):
+        parts = [_extract_suchuang_reasoning_text(item) for item in value]
+        return "\n".join([item for item in parts if item]).strip()
+    if isinstance(value, dict):
+        choices = value.get("choices")
+        if isinstance(choices, list):
+            for item in choices:
+                if not isinstance(item, dict):
+                    continue
+                message = item.get("message")
+                if isinstance(message, dict):
+                    reasoning_text = _extract_suchuang_reasoning_text(message.get("reasoning_content"))
+                    if reasoning_text:
+                        return reasoning_text
+                delta = item.get("delta")
+                if isinstance(delta, dict):
+                    delta_reasoning = _extract_suchuang_reasoning_text(delta.get("reasoning_content"))
+                    if delta_reasoning:
+                        return delta_reasoning
+                reasoning_text = _extract_suchuang_reasoning_text(item.get("reasoning_content"))
+                if reasoning_text:
+                    return reasoning_text
+        for key in ("data", "message", "reasoning_content"):
+            if key not in value:
+                continue
+            extracted = _extract_suchuang_reasoning_text(value.get(key))
+            if extracted:
+                return extracted
+    return ""
+
+
+def _extract_suchuang_text(value: Any) -> str:
+    content_text = _extract_suchuang_primary_content(value)
+    if content_text:
+        return content_text
+    return _extract_suchuang_reasoning_text(value)
 
 
 async def create_chat_completion(
@@ -227,7 +293,12 @@ async def create_chat_completion(
     if not api_key:
         raise RuntimeError("GRSAI_API_KEY 未配置，请先在后端环境变量中设置")
     request_model = _map_openrouter_model(str(payload.get("model") or ""))
-    endpoint = str(os.getenv("GRSAI_TEXT_ENDPOINT", "https://grsai.dakka.com.cn/v1/chat/completions")).strip()
+    endpoint = str(
+        os.getenv(
+            "FOURSAPI_TEXT_ENDPOINT",
+            os.getenv("GRSAI_TEXT_ENDPOINT", "https://4sapi.com/v1/chat/completions"),
+        )
+    ).strip()
     request_messages = payload.get("messages")
     if not isinstance(request_messages, list) or len(request_messages) == 0:
         content = _build_suchuang_content(payload)
@@ -250,29 +321,63 @@ async def create_chat_completion(
     if payload.get("thinking") is not None:
         request_payload["thinking"] = payload.get("thinking")
     timeout_seconds_raw = str(
-        os.getenv("GRSAI_TIMEOUT_SECONDS", os.getenv("SUCHUANG_TIMEOUT_SECONDS", "900"))
+        os.getenv("GRSAI_TIMEOUT_SECONDS", os.getenv("SUCHUANG_TIMEOUT_SECONDS", "120"))
     ).strip()
     try:
         timeout_seconds = float(timeout_seconds_raw)
     except Exception:
-        timeout_seconds = 900.0
-    timeout_seconds = max(60.0, timeout_seconds)
+        timeout_seconds = 120.0
+    timeout_seconds = max(30.0, min(180.0, timeout_seconds))
     timeout = httpx.Timeout(timeout_seconds, connect=15.0)
+    retryable_network_exceptions = (
+        httpx.ReadTimeout,
+        httpx.ConnectTimeout,
+        httpx.RemoteProtocolError,
+        httpx.ReadError,
+        httpx.WriteError,
+        httpx.NetworkError,
+    )
     for content_attempt in range(3):
         last_exc: Exception | None = None
-        for _ in range(2):
-            try:
-                async with httpx.AsyncClient(timeout=timeout, trust_env=True) as client:
-                    response = await client.post(endpoint, headers=headers, json=request_payload)
+        response: httpx.Response | None = None
+        for trust_env_mode in (False, True):
+            for network_attempt in range(2):
+                try:
+                    async with httpx.AsyncClient(timeout=timeout, trust_env=trust_env_mode) as client:
+                        response = await client.post(endpoint, headers=headers, json=request_payload)
+                    break
+                except retryable_network_exceptions as exc:
+                    last_exc = exc
+                    logger.warning(
+                        "Gemini3.1Pro 请求网络异常(attempt=%s/3 trust_env=%s retry=%s/2): %s",
+                        content_attempt + 1,
+                        trust_env_mode,
+                        network_attempt + 1,
+                        exc,
+                    )
+                    await asyncio.sleep(0.6)
+            if response is not None:
                 break
-            except (httpx.ReadTimeout, httpx.ConnectTimeout) as exc:
-                last_exc = exc
-                await asyncio.sleep(1.0)
-        else:
-            raise RuntimeError(f"Gemini3Pro 调用超时（>{int(timeout_seconds)}秒）") from last_exc
+        if response is None:
+            if isinstance(last_exc, (httpx.ReadTimeout, httpx.ConnectTimeout)):
+                raise RuntimeError(f"Gemini3Pro 调用超时（>{int(timeout_seconds)}秒）") from last_exc
+            raise RuntimeError(f"Gemini3Pro 网络异常：{last_exc or 'unknown error'}") from last_exc
 
         if response.status_code != 200:
-            raise RuntimeError(f"Gemini3.1Pro 调用失败：HTTP {response.status_code} {response.text}")
+            response_text = str(response.text or "")
+            if (
+                response.status_code == 400
+                and "Invalid project resource name projects/projects/" in response_text
+                and content_attempt < 2
+            ):
+                logger.warning(
+                    "Gemini3.1Pro 命中上游无效项目名通道错误，自动重试(attempt=%s/3): %s",
+                    content_attempt + 1,
+                    response_text[:300],
+                )
+                await asyncio.sleep(0.8 * (content_attempt + 1))
+                continue
+            raise RuntimeError(f"Gemini3.1Pro 调用失败：HTTP {response.status_code} {response_text}")
         try:
             response_json = response.json()
         except Exception as exc:
@@ -286,18 +391,24 @@ async def create_chat_completion(
             if isinstance(data_obj, dict) and data_obj.get("choices"):
                 response_json = data_obj
 
-        content_text = _extract_suchuang_text(response_json)
+        content_text = _extract_suchuang_primary_content(response_json)
         if not content_text and isinstance(response_json, dict):
-            content_text = _extract_suchuang_text(response_json.get("data"))
+            content_text = _extract_suchuang_primary_content(response_json.get("data"))
+        reasoning_text = _extract_suchuang_reasoning_text(response_json)
+        if not reasoning_text and isinstance(response_json, dict):
+            reasoning_text = _extract_suchuang_reasoning_text(response_json.get("data"))
         if content_text:
+            message_payload: dict[str, Any] = {
+                "role": "assistant",
+                "content": content_text,
+            }
+            if reasoning_text:
+                message_payload["reasoning_content"] = reasoning_text
             return {
                 "choices": [
                     {
                         "index": 0,
-                        "message": {
-                            "role": "assistant",
-                            "content": content_text,
-                        },
+                        "message": message_payload,
                         "finish_reason": "stop",
                     }
                 ]
@@ -857,10 +968,158 @@ def _is_retryable_grsai_image_error(exc: BaseException) -> bool:
     return any(m in text for m in markers)
 
 
+_FAST_CHANNEL_MODEL_MAP: dict[str, str] = {
+    "nano-banana-2": "gemini-3.1-flash-image-preview",
+    "nano-banana-pro": "gemini-3-pro-image-preview",
+}
+
+
+async def _create_image_via_fast_channel(
+    session: AsyncSession,
+    user_id: str,
+    prompt: str,
+    references: Optional[list[str]] = None,
+    *,
+    model: str = "",
+) -> dict[str, Any]:
+    env_override = os.getenv("FOURSAPI_IMAGE_ENDPOINT", "").strip()
+    if env_override:
+        endpoint = env_override
+    else:
+        gemini_model = _FAST_CHANNEL_MODEL_MAP.get(
+            model.lower().strip(), "gemini-3-pro-image-preview"
+        )
+        endpoint = f"https://4sapi.com/v1beta/models/{gemini_model}:generateContent"
+    api_key = (
+        os.getenv("FOURSAPI_API_KEY", "").strip()
+        or await _resolve_openrouter_key(session, user_id)
+    )
+    if not api_key:
+        raise RuntimeError("FOURSAPI_API_KEY 未配置，无法使用快速通道")
+
+    def _infer_ref_mime(url_text: str) -> str:
+        lower = str(url_text or "").strip().lower()
+        if lower.endswith(".png"):
+            return "image/png"
+        if lower.endswith(".webp"):
+            return "image/webp"
+        if lower.endswith(".gif"):
+            return "image/gif"
+        return "image/jpeg"
+
+    parts: list[dict[str, Any]] = [{"text": prompt}]
+    for ref in (references or [])[:_GEMINI_REFERENCE_IMAGE_LIMIT]:
+        ref_url = str(ref or "").strip()
+        if not ref_url:
+            continue
+        if ref_url.startswith("data:image"):
+            header, _, b64_data = ref_url.partition(",")
+            mime_type = "image/jpeg"
+            header_match = re.match(r"^data:(image/[a-zA-Z0-9.+-]+);base64$", header)
+            if header_match:
+                mime_type = str(header_match.group(1) or "image/jpeg").strip() or "image/jpeg"
+            if b64_data:
+                parts.append({"inlineData": {"mimeType": mime_type, "data": b64_data}})
+            continue
+        if ref_url.startswith(("http://", "https://")):
+            # Gemini API 的 fileData.fileUri 只接受 gs:// 或 File API URI，
+            # 不支持任意公网 HTTP URL，必须先下载图片转 base64 通过 inlineData 传入
+            try:
+                async with httpx.AsyncClient(
+                    timeout=httpx.Timeout(30.0, connect=10.0), trust_env=False
+                ) as _dl:
+                    _resp = await _dl.get(ref_url)
+                    _resp.raise_for_status()
+                ct = (_resp.headers.get("content-type") or "").split(";")[0].strip()
+                _mime = ct if ct.startswith("image/") else _infer_ref_mime(ref_url)
+                _b64 = base64.b64encode(_resp.content).decode("ascii")
+                parts.append({"inlineData": {"mimeType": _mime, "data": _b64}})
+            except Exception as _dl_exc:
+                logger.warning("快速通道下载参考图失败 url=%s: %s", ref_url, _dl_exc)
+
+    req_payload: dict[str, Any] = {
+        "contents": [
+            {
+                "parts": parts,
+            }
+        ]
+    }
+    headers = {
+        "x-goog-api-key": api_key,
+        "Content-Type": "application/json",
+        "Connection": "close",
+    }
+
+    retryable_network_exceptions = (
+        httpx.ReadTimeout,
+        httpx.ConnectTimeout,
+        httpx.RemoteProtocolError,
+        httpx.ReadError,
+        httpx.WriteError,
+        httpx.NetworkError,
+    )
+    response: httpx.Response | None = None
+    last_exc: Exception | None = None
+    for trust_env_mode in (False, True):
+        for network_attempt in range(2):
+            try:
+                async with httpx.AsyncClient(
+                    timeout=httpx.Timeout(300.0, connect=30.0),
+                    trust_env=trust_env_mode,
+                    http1=True,
+                    http2=False,
+                ) as client:
+                    response = await client.post(endpoint, headers=headers, json=req_payload)
+                break
+            except retryable_network_exceptions as exc:
+                last_exc = exc
+                logger.warning(
+                    "快速通道请求网络异常 trust_env=%s retry=%s/2 type=%s: %s",
+                    trust_env_mode,
+                    network_attempt + 1,
+                    type(exc).__name__,
+                    exc,
+                )
+                await asyncio.sleep(0.6)
+        if response is not None:
+            break
+
+    if response is None:
+        logger.error("快速通道请求异常（网络重试后仍失败）last=%s", last_exc)
+        raise RuntimeError(f"快速通道请求失败：{type(last_exc).__name__ if last_exc else 'NetworkError'}: {last_exc or 'unknown error'}") from last_exc
+    if response.status_code != 200:
+        raise RuntimeError(f"快速通道调用失败：HTTP {response.status_code} {response.text}")
+
+    try:
+        body = response.json()
+    except Exception as exc:
+        raise RuntimeError(f"快速通道返回非 JSON：{response.text}") from exc
+
+    candidates = body.get("candidates") if isinstance(body, dict) else None
+    if isinstance(candidates, list):
+        for candidate in candidates:
+            if not isinstance(candidate, dict):
+                continue
+            content = candidate.get("content") if isinstance(candidate.get("content"), dict) else {}
+            parts = content.get("parts") if isinstance(content, dict) else None
+            if not isinstance(parts, list):
+                continue
+            for part in parts:
+                if not isinstance(part, dict):
+                    continue
+                inline_data = part.get("inlineData") if isinstance(part.get("inlineData"), dict) else {}
+                b64_data = str(inline_data.get("data") or "").strip()
+                mime_type = str(inline_data.get("mimeType") or "image/jpeg").strip() or "image/jpeg"
+                if b64_data:
+                    return {"data": [{"url": f"data:{mime_type};base64,{b64_data}"}]}
+
+    raise RuntimeError("快速通道未返回图片数据")
+
+
 async def create_image(
     session: AsyncSession, user_id: str, payload: dict[str, Any]
 ) -> dict[str, Any]:
-    api_key = await _resolve_openrouter_key(session, user_id)
+    api_key = await _resolve_grsai_draw_key(session, user_id)
     if not api_key:
         raise RuntimeError("GRSAI_API_KEY 未配置，请先在后端环境变量中设置")
     endpoint = str(os.getenv("GRSAI_DRAW_ENDPOINT", "https://grsai.dakka.com.cn/v1/draw/nano-banana")).strip()
@@ -920,6 +1179,19 @@ async def create_image(
     # 避免 GRSAI 侧处理 data URL 异常导致任务卡在 running 状态）。
 
     prompt = str(payload.get("prompt") or "").strip() or "生成一张高质量图片"
+    raw_model_for_channel = str(payload.get("model") or "").strip()
+    quick_channel_raw = payload.pop("quick_channel", False)
+    quick_channel = quick_channel_raw is True or str(quick_channel_raw).strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    if quick_channel:
+        return await _create_image_via_fast_channel(
+            session, user_id, prompt, resolved_references, model=raw_model_for_channel
+        )
+
     ratio = _resolve_image_aspect_ratio(payload) or "auto"
     raw_model_str = str(payload.get("model") or "").strip()
     draw_model = _normalize_grsai_draw_model(raw_model_str or None)
@@ -2232,13 +2504,60 @@ async def create_video(
         else:
             raise RuntimeError("Kling 鉴权未配置，请联系管理员配置系统 Key（KLING_AK/KLING_SK 或 KLING_API_KEY）")
     elif is_seedance_model:
-        env_seedance_key = str(os.getenv("ARK_API_KEY") or os.getenv("VOLCENGINE_ARK_API_KEY") or "").strip()
-        configured_seedance_key = configured_key_normalized
-        if configured_seedance_key.startswith("sk-") or configured_seedance_key.startswith("eyJ"):
-            configured_seedance_key = ""
+        def _normalize_seedance_api_key(raw_value: str) -> str:
+            text = str(raw_value or "").strip().strip('"').strip("'")
+            if not text:
+                return ""
+            lowered = text.lower()
+            if lowered.startswith("bearer "):
+                text = text[7:].strip().strip('"').strip("'")
+                lowered = text.lower()
+            if lowered in {"primary_key", "<primary_key>", "your_primary_key", "api_key", "apikey"}:
+                return ""
+            if lowered.startswith("{") and lowered.endswith("}"):
+                try:
+                    parsed = json.loads(text)
+                except Exception:
+                    parsed = {}
+                if isinstance(parsed, dict):
+                    extracted = ""
+                    for key in ("api_key", "ark_api_key", "volcengine_ark_api_key", "primary_key", "token"):
+                        candidate = str(parsed.get(key) or "").strip().strip('"').strip("'")
+                        if candidate and "primary_key" not in candidate.lower():
+                            extracted = candidate
+                            break
+                    if not extracted:
+                        return ""
+                    text = extracted
+                    lowered = text.lower()
+            if "=" in text and any(flag in lowered for flag in ("primary_key", "api_key", "ark_api_key", "token")):
+                text = text.split("=", 1)[1].strip().strip('"').strip("'")
+                lowered = text.lower()
+            if ":" in text and any(flag in lowered for flag in ("primary_key", "api_key", "ark_api_key", "token")):
+                text = text.split(":", 1)[1].strip().strip('"').strip("'")
+                lowered = text.lower()
+            if "primary_key" in lowered:
+                return ""
+            if text.startswith("<") and text.endswith(">"):
+                return ""
+            if len(text) < 16:
+                return ""
+            return text
+
+        env_seedance_key = _normalize_seedance_api_key(
+            str(os.getenv("ARK_API_KEY") or os.getenv("VOLCENGINE_ARK_API_KEY") or "")
+        )
+        configured_seedance_key = _normalize_seedance_api_key(configured_key_normalized)
         seedance_key = env_seedance_key or configured_seedance_key
         if not seedance_key:
-            raise RuntimeError("Seedance 鉴权未配置，请在设置页填写 API Key，或配置环境变量 ARK_API_KEY")
+            lowered_configured_key = configured_key_normalized.lower()
+            if "primary_key" in lowered_configured_key:
+                raise RuntimeError("Seedance 鉴权无效：检测到占位符 primary_key，请在设置页填写真实 ARK API Key")
+            if lowered_configured_key.startswith("{") and lowered_configured_key.endswith("}") and any(flag in lowered_configured_key for flag in ("\"ak\"", "\"sk\"", "access_key", "secret_key")):
+                raise RuntimeError("Seedance 鉴权无效：当前配置是 Kling AK/SK，不可用于 Seedance。请在设置页填写真实 ARK API Key（Primary Key）")
+            if configured_key_normalized:
+                raise RuntimeError("Seedance 鉴权无效：当前 Key 不是有效 ARK API Key，请在设置页填写真实 ARK API Key（Primary Key）")
+            raise RuntimeError("Seedance 鉴权未配置，请在设置页填写真实 ARK API Key，或配置环境变量 ARK_API_KEY")
         api_key = seedance_key
         key_source = "env" if env_seedance_key else "configured"
     elif use_configured_video_provider and configured_key_normalized:
@@ -2565,8 +2884,22 @@ async def create_video(
             if previous_segment_video_url and not custom_first_frame_url:
                 tail_frame_b64 = await _extract_video_tail_frame_base64(previous_segment_video_url)
                 if tail_frame_b64:
+                    tail_frame_image_src = f"data:image/jpeg;base64,{tail_frame_b64}"
+                    if project_id and cos_enabled():
+                        try:
+                            tail_frame_bytes = base64.b64decode(tail_frame_b64, validate=False)
+                            if tail_frame_bytes:
+                                tail_frame_image_src = await upload_bytes_under_project_to_cos(
+                                    project_id,
+                                    "segment_frame_images/first_frame",
+                                    tail_frame_bytes,
+                                    "image/jpeg",
+                                    filename_hint="previous_segment_tail.jpg",
+                                )
+                        except Exception as exc:
+                            logger.warning("Seedance previous tail frame upload to COS failed, fallback to local static: %s", exc)
                     first_frame_reference_url = await _append_seedance_image_reference(
-                        f"data:image/jpeg;base64,{tail_frame_b64}",
+                        tail_frame_image_src,
                         "first_frame",
                     )
             for item in [*resolved_assets, *resolved_inline_assets]:

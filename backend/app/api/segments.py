@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 from uuid import uuid4
 
 import httpx
+from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -53,6 +54,7 @@ from app.services.async_tasks import (
 router = APIRouter()
 logger = logging.getLogger(__name__)
 OPENROUTER_IMAGE_MODEL = "nano-banana-2"
+_GEMINI_REFERENCE_IMAGE_LIMIT = 16
 _FRAME_TASK_TYPE = "FRAME_GENERATE"
 _SEGMENT_TASK_PROCESSING_TIMEOUT_SECONDS = max(
     300,
@@ -86,7 +88,7 @@ def _is_kling_pending_status(value: str) -> bool:
     )
 
 
-def _is_seedance_task(task_id: str | None) -> bool:
+def _is_seedance_task(task_id: Optional[str]) -> bool:
     return str(task_id or "").strip().lower().startswith("seedance|")
 
 
@@ -100,12 +102,48 @@ def _is_version_processing_timed_out(version) -> bool:
 
 
 async def _resolve_seedance_key(db: AsyncSession, user_id: str) -> str:
-    env_key = str(os.getenv("ARK_API_KEY") or os.getenv("VOLCENGINE_ARK_API_KEY") or "").strip()
+    def _normalize_seedance_api_key(raw_value: str) -> str:
+        text = str(raw_value or "").strip().strip('"').strip("'")
+        if not text:
+            return ""
+        lowered = text.lower()
+        if lowered.startswith("bearer "):
+            text = text[7:].strip().strip('"').strip("'")
+            lowered = text.lower()
+        if lowered in {"primary_key", "<primary_key>", "your_primary_key", "api_key", "apikey"}:
+            return ""
+        if lowered.startswith("{") and lowered.endswith("}"):
+            try:
+                parsed = json.loads(text)
+            except Exception:
+                parsed = {}
+            if isinstance(parsed, dict):
+                extracted = ""
+                for key in ("api_key", "ark_api_key", "volcengine_ark_api_key", "primary_key", "token"):
+                    candidate = str(parsed.get(key) or "").strip().strip('"').strip("'")
+                    if candidate and "primary_key" not in candidate.lower():
+                        extracted = candidate
+                        break
+                if not extracted:
+                    return ""
+                text = extracted
+                lowered = text.lower()
+        if "=" in text and any(flag in lowered for flag in ("primary_key", "api_key", "ark_api_key", "token")):
+            text = text.split("=", 1)[1].strip().strip('"').strip("'")
+            lowered = text.lower()
+        if ":" in text and any(flag in lowered for flag in ("primary_key", "api_key", "ark_api_key", "token")):
+            text = text.split(":", 1)[1].strip().strip('"').strip("'")
+            lowered = text.lower()
+        if "primary_key" in lowered or (text.startswith("<") and text.endswith(">")):
+            return ""
+        if len(text) < 16:
+            return ""
+        return text
+
+    env_key = _normalize_seedance_api_key(str(os.getenv("ARK_API_KEY") or os.getenv("VOLCENGINE_ARK_API_KEY") or ""))
     if env_key:
         return env_key
-    configured = str(await get_api_key(db, user_id) or "").strip()
-    if configured.startswith("sk-") or configured.startswith("eyJ"):
-        return ""
+    configured = _normalize_seedance_api_key(str(await get_api_key(db, user_id) or ""))
     return configured
 
 
@@ -355,9 +393,10 @@ async def _generate_segment_frame_image_sync(
         "prompt": prompt,
         "aspect_ratio": str(payload.aspect_ratio or "16:9"),
         "size": "4K",
+        "quick_channel": bool(payload.quick_channel),
     }
     if references:
-        request_payload["image_urls"] = references[:4]
+        request_payload["image_urls"] = references[:_GEMINI_REFERENCE_IMAGE_LIMIT]
     try:
         result = await create_image(db, user_id, request_payload)
     except Exception as exc:

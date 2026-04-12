@@ -3,13 +3,21 @@ import Image from "next/image";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { getToken } from "@/lib/auth";
-import { deleteSegmentFrameImage, generateImageSubject, generateSegmentFrameImage, getModels, getSegmentFrameImageTaskStatus, generateTTS, getProjectVoices, type Asset, type CharacterVoice } from "@/lib/api";
+import { deleteSegmentFrameImage, generateImageSubject, generateSegmentFrameImage, getModels, getSegmentFrameImageTaskStatus, generateTTS, getProjectVoices, uploadTemporaryMaterialImage, type Asset, type CharacterVoice } from "@/lib/api";
 import { extractDrawModels } from "@/lib/models";
+
+type ExternalFirstFrameEntry = {
+  id: string;
+  name: string;
+  description?: string;
+  imageUrl: string;
+};
 
 interface ScriptEditorProps {
   content: string;
   onChange: (newContent: string) => void;
   projectId?: string;
+  externalFirstFrameEntries?: ExternalFirstFrameEntry[];
   dialogueCellAudioMap?: Record<string, AppliedVoiceSegment[]>;
   onDialogueCellAudioMapChange?: (map: Record<string, AppliedVoiceSegment[]>) => void;
   rowStartIndex?: number;
@@ -190,8 +198,10 @@ const LEGACY_KLING_COLUMN = "Kling视频生成";
 const STORYBOARD_SYSTEM_COLUMNS = ["场景", "道具", "远景位置关系图", "首帧图片", KLING_COLUMN] as const;
 const FRAME_DEFAULT_IMAGE_MODEL = "nano-banana-2";
 const getFrameStateStorageKey = (projectId: string) => `script_editor_frame_state_v2:${projectId}`;
+const FRAME_STATE_UPDATED_EVENT = "script-editor-frame-state-updated";
 const FRAME_PENDING_MAX_AGE_MS = 30 * 60 * 1000;
 const buildFramePendingKey = (rowIndex: number, frameType: FrameGenerationTab) => `${rowIndex}:${frameType}`;
+const buildFrameDraftKey = (rowIndex: number, frameType: FrameGenerationTab) => `${rowIndex}:${frameType}`;
 const FRAME_GENERATE_TAB_ORDER: FrameGenerationTab[] = ["character", "first", "last", "scene", "prop", "wide"];
 const FRAME_GENERATE_TAB_META: Record<FrameGenerationTab, {
   label: string;
@@ -393,6 +403,10 @@ export function ScriptEditor({
   content,
   onChange,
   projectId,
+  externalFirstFrameEntries = [],
+  globalStyleName = "",
+  globalStylePromptText = "",
+  onOpenStyleSelector,
   dialogueCellAudioMap: dialogueCellAudioMapProp,
   onDialogueCellAudioMapChange,
   rowStartIndex = 0,
@@ -462,9 +476,11 @@ export function ScriptEditor({
   const [framePromptInput, setFramePromptInput] = useState("");
   const [frameReferences, setFrameReferences] = useState<FrameReference[]>([]);
   const [frameGeneratedMetaMap, setFrameGeneratedMetaMap] = useState<Record<string, FrameGeneratedMeta>>({});
+  const [frameDraftImageMap, setFrameDraftImageMap] = useState<Record<string, string[]>>({});
   const [frameGeneratingType, setFrameGeneratingType] = useState<FrameGenerationTab | null>(null);
   const [frameImageModels, setFrameImageModels] = useState<string[]>([FRAME_DEFAULT_IMAGE_MODEL]);
   const [frameImageModel, setFrameImageModel] = useState(FRAME_DEFAULT_IMAGE_MODEL);
+  const [frameQuickChannel, setFrameQuickChannel] = useState(false);
   const [frameCharacterImageMap, setFrameCharacterImageMap] = useState<Record<number, string[]>>({});
   const [frameFirstImageMap, setFrameFirstImageMap] = useState<Record<number, string[]>>({});
   const [frameLastImageMap, setFrameLastImageMap] = useState<Record<number, string[]>>({});
@@ -476,6 +492,8 @@ export function ScriptEditor({
   const [previewFrameUrl, setPreviewFrameUrl] = useState<string | null>(null);
   const [frameError, setFrameError] = useState("");
   const [frameNotice, setFrameNotice] = useState("");
+  const [frameUploadLoading, setFrameUploadLoading] = useState(false);
+  const [frameActionToast, setFrameActionToast] = useState<{ type: "error" | "success"; text: string } | null>(null);
   const [frameSubjectCreatingImageUrl, setFrameSubjectCreatingImageUrl] = useState<string | null>(null);
   const [frameEditTarget, setFrameEditTarget] = useState<{ frameType: FrameGenerationTab; imageUrl: string } | null>(null);
   const [frameEditInput, setFrameEditInput] = useState("");
@@ -483,6 +501,7 @@ export function ScriptEditor({
   const [frameGeneratePanelOpen, setFrameGeneratePanelOpen] = useState(false);
   const [frameDeletingImageUrl, setFrameDeletingImageUrl] = useState<string | null>(null);
   const [frameScriptAppliedThisSession, setFrameScriptAppliedThisSession] = useState(false);
+  const [tableRowActionMenu, setTableRowActionMenu] = useState<{ blockIndex: number; rowIndex: number } | null>(null);
   const [voiceError, setVoiceError] = useState("");
   const [usePreviousEndFrameMap, setUsePreviousEndFrameMap] = useState<Record<number, boolean>>({});
   const [voiceSelection, setVoiceSelection] = useState<{ start: number; end: number; text: string }>({ start: 0, end: 0, text: "" });
@@ -491,7 +510,9 @@ export function ScriptEditor({
   const frameEditorRef = useRef<HTMLDivElement | null>(null);
   const videoEditEditorRef = useRef<HTMLDivElement | null>(null);
   const frameModalRowIndexRef = useRef<number | null>(null);
+  const frameStateHydratedRef = useRef(false);
   const previewAudioRef = useRef<HTMLAudioElement | null>(null);
+  const frameUploadInputRef = useRef<HTMLInputElement | null>(null);
   // Initialize with specific value to ensure first sync happens if content is present
   const lastSerializedRef = useRef<string>('__INITIAL_EMPTY__'); 
   const isInternalUpdate = useRef(false);
@@ -606,6 +627,7 @@ export function ScriptEditor({
   }, [frameModalRowIndex]);
 
   useEffect(() => {
+    frameStateHydratedRef.current = false;
     if (!projectId) {
       setFrameCharacterImageMap({});
       setFrameFirstImageMap({});
@@ -632,6 +654,7 @@ export function ScriptEditor({
         setUsePreviousEndFrameMap({});
         setFramePendingMap({});
         setFrameGeneratedMetaMap({});
+        frameStateHydratedRef.current = true;
         return;
       }
       const parsed = JSON.parse(raw) as PersistedFrameState;
@@ -679,6 +702,7 @@ export function ScriptEditor({
         nextPendingMap[key] = value;
       });
       setFramePendingMap(nextPendingMap);
+      frameStateHydratedRef.current = true;
     } catch {
       setFrameCharacterImageMap({});
       setFrameFirstImageMap({});
@@ -690,11 +714,12 @@ export function ScriptEditor({
       setUsePreviousEndFrameMap({});
       setFramePendingMap({});
       setFrameGeneratedMetaMap({});
+      frameStateHydratedRef.current = true;
     }
   }, [projectId]);
 
   useEffect(() => {
-    if (!projectId) return;
+    if (!projectId || !frameStateHydratedRef.current) return;
     const payload: PersistedFrameState = {
       characterImageMap: frameCharacterImageMap,
       firstImageMap: frameFirstImageMap,
@@ -711,6 +736,25 @@ export function ScriptEditor({
       localStorage.setItem(getFrameStateStorageKey(projectId), JSON.stringify(payload));
     } catch {}
   }, [projectId, frameCharacterImageMap, frameFirstImageMap, frameLastImageMap, frameSceneImageMap, framePropImageMap, frameWideImageMap, frameAppliedMap, usePreviousEndFrameMap, framePendingMap, frameGeneratedMetaMap]);
+
+  useEffect(() => {
+    if (!projectId || typeof window === "undefined") return;
+    const handleFrameStateUpdated = (event: Event) => {
+      const detail = (event as CustomEvent<{ projectId?: string }>).detail;
+      if (detail?.projectId && detail.projectId !== projectId) return;
+      try {
+        const raw = localStorage.getItem(getFrameStateStorageKey(projectId));
+        if (!raw) return;
+        const parsed = JSON.parse(raw) as PersistedFrameState;
+        setFrameFirstImageMap(parsed.firstImageMap || {});
+        setFrameGeneratedMetaMap(parsed.generatedMetaMap || {});
+      } catch {}
+    };
+    window.addEventListener(FRAME_STATE_UPDATED_EVENT, handleFrameStateUpdated as EventListener);
+    return () => {
+      window.removeEventListener(FRAME_STATE_UPDATED_EVENT, handleFrameStateUpdated as EventListener);
+    };
+  }, [projectId]);
 
   // Parse markdown content into blocks
   const stripThinkingContent = useCallback((markdown: string) => {
@@ -821,7 +865,6 @@ export function ScriptEditor({
         }
         if (ch === "\\") {
           escaped = true;
-          current += ch;
           continue;
         }
         if (ch === "[") {
@@ -992,6 +1035,43 @@ export function ScriptEditor({
       }
       return b;
     }));
+  };
+
+  const insertTableRowAbove = (blockIndex: number, rowIndex: number) => {
+    isInternalUpdate.current = true;
+    setBlocks((prev) => prev.map((b, i) => {
+      if (i !== blockIndex || b.type !== "table") return b;
+      if (rowIndex <= 0 || rowIndex > b.rows.length - 1) return b;
+      const nextRows = [...b.rows];
+      const colCount = b.headers.length;
+      const emptyRow = Array.from({ length: colCount }, () => "");
+      nextRows.splice(rowIndex, 0, emptyRow);
+      return { ...b, rows: nextRows };
+    }));
+    setTableRowActionMenu(null);
+  };
+
+  const mergeTableRowWithPrevious = (blockIndex: number, rowIndex: number) => {
+    isInternalUpdate.current = true;
+    setBlocks((prev) => prev.map((b, i) => {
+      if (i !== blockIndex || b.type !== "table") return b;
+      if (rowIndex <= 0 || rowIndex >= b.rows.length) return b;
+      const nextRows = [...b.rows];
+      const previousRow = [...(nextRows[rowIndex - 1] || [])];
+      const currentRow = [...(nextRows[rowIndex] || [])];
+      const colCount = b.headers.length;
+      const mergedRow = Array.from({ length: colCount }, (_, colIndex) => {
+        const first = String(previousRow[colIndex] || "").trim();
+        const second = String(currentRow[colIndex] || "").trim();
+        if (!first) return second;
+        if (!second) return first;
+        return `${first}\n${second}`;
+      });
+      nextRows[rowIndex - 1] = mergedRow;
+      nextRows.splice(rowIndex, 1);
+      return { ...b, rows: nextRows };
+    }));
+    setTableRowActionMenu(null);
   };
 
   const makeDialogueCellKey = (rowIndex: number, colIndex: number) => `${rowIndex}:${colIndex}`;
@@ -1475,8 +1555,17 @@ export function ScriptEditor({
     appendGeneratedEntriesFromMap("scene", frameSceneImageMap);
     appendGeneratedEntriesFromMap("prop", framePropImageMap);
     appendGeneratedEntriesFromMap("wide", frameWideImageMap);
+    (externalFirstFrameEntries || []).forEach((entry) => {
+      appendEntry("first", {
+        id: entry.id,
+        name: entry.name,
+        description: String(entry.description || "").trim(),
+        imageUrl: String(entry.imageUrl || "").trim(),
+        source: "generated",
+      });
+    });
     return initial;
-  }, [blocks, projectAssets, resolveAssetImageUrl, resolveAssetType, frameModalCellTarget, frameModalRowIndex, frameCharacterImageMap, frameFirstImageMap, frameLastImageMap, frameSceneImageMap, framePropImageMap, frameWideImageMap, frameGeneratedMetaMap]);
+  }, [blocks, projectAssets, resolveAssetImageUrl, resolveAssetType, frameModalCellTarget, frameModalRowIndex, frameCharacterImageMap, frameFirstImageMap, frameLastImageMap, frameSceneImageMap, framePropImageMap, frameWideImageMap, frameGeneratedMetaMap, externalFirstFrameEntries]);
 
   const frameReferenceOptionMap = useMemo(() => {
     const map: Record<string, FrameReference> = {};
@@ -1756,6 +1845,55 @@ export function ScriptEditor({
     });
   }, []);
 
+  const showFrameToast = useCallback((type: "error" | "success", text: string) => {
+    setFrameActionToast({ type, text });
+    window.setTimeout(() => {
+      setFrameActionToast((current) => (current?.text === text ? null : current));
+    }, 2200);
+  }, []);
+
+  const appendDraftFrameImage = useCallback((
+    rowIndex: number,
+    frameType: FrameGenerationTab,
+    imageUrl: string,
+    meta?: { name: string; description: string; baseCharacterName?: string }
+  ) => {
+    if (!imageUrl) return;
+    const key = buildFrameDraftKey(rowIndex, frameType);
+    setFrameDraftImageMap((prev) => {
+      const list = prev[key] || [];
+      return { ...prev, [key]: [imageUrl, ...list.filter((item) => item !== imageUrl)] };
+    });
+    if (meta) {
+      setFrameGeneratedMetaMap((prev) => ({
+        ...prev,
+        [imageUrl]: {
+          name: String(meta.name || "").trim(),
+          description: String(meta.description || "").trim(),
+          frameType,
+          baseCharacterName: String(meta.baseCharacterName || "").trim() || undefined,
+        },
+      }));
+    }
+  }, []);
+
+  const removeDraftFrameImage = useCallback((rowIndex: number, frameType: FrameGenerationTab, imageUrl: string) => {
+    const key = buildFrameDraftKey(rowIndex, frameType);
+    setFrameDraftImageMap((prev) => {
+      const list = prev[key] || [];
+      const nextList = list.filter((item) => item !== imageUrl);
+      if (nextList.length === list.length) return prev;
+      const next = { ...prev };
+      if (nextList.length > 0) next[key] = nextList;
+      else delete next[key];
+      return next;
+    });
+  }, []);
+
+  const getDraftFrameImagesForRow = useCallback((rowIndex: number, frameType: FrameGenerationTab) => {
+    return frameDraftImageMap[buildFrameDraftKey(rowIndex, frameType)] || [];
+  }, [frameDraftImageMap]);
+
   const appendGeneratedFrameImage = useCallback((
     rowIndex: number,
     frameType: FrameGenerationTab,
@@ -1873,6 +2011,18 @@ export function ScriptEditor({
     throw new Error("生成超时，请稍后刷新查看");
   }, [projectId]);
 
+  const buildFramePromptWithStyle = useCallback((basePrompt: string, references: string[]) => {
+    const promptText = String(basePrompt || "").trim();
+    const styleText = String(globalStylePromptText || "").trim();
+    const referenceCount = references.length;
+    return [
+      styleText ? `【全局风格】\n${styleText}` : "",
+      "【素材生成要求】请同时遵循全局风格与参考图，仅输出本次所需素材画面。",
+      referenceCount > 0 ? `【参考图】共 ${referenceCount} 张，请保持主体与构图一致性。` : "【参考图】本次未提供参考图，仅依据提示词与风格生成。",
+      promptText ? `【提示词】\n${promptText}` : "",
+    ].filter(Boolean).join("\n\n");
+  }, [globalStylePromptText]);
+
   const generateFrameImage = async (frameType: FrameGenerationTab) => {
     if (!projectId || frameModalRowIndex === null) return;
     const rowIndex = frameModalRowIndex;
@@ -1895,15 +2045,17 @@ export function ScriptEditor({
     setFrameNotice("");
     try {
       const references = Array.from(new Set(frameReferences.map((item) => item.imageUrl))).filter(Boolean);
+      const promptWithStyle = buildFramePromptWithStyle(prompt, references);
       const task = await generateSegmentFrameImage(token, projectId, {
-        prompt,
+        prompt: promptWithStyle,
         references,
         frame_type: frameType,
         aspect_ratio: "16:9",
         model: frameImageModel,
+        quick_channel: frameQuickChannel,
       });
       const generated = await waitForFrameTask(task.task_id);
-      appendGeneratedFrameImage(rowIndex, frameType, generated, {
+      appendDraftFrameImage(rowIndex, frameType, generated, {
         name: materialName,
         description: materialDescription,
         baseCharacterName: frameType === "character" ? resolveBaseCharacterNameFromReferences(frameReferences) : undefined,
@@ -1953,6 +2105,45 @@ export function ScriptEditor({
       setFrameSubjectCreatingImageUrl(null);
     }
   };
+
+  const ensureFrameImageRetained = useCallback((
+    rowIndex: number,
+    frameType: FrameGenerationTab,
+    entry: FrameMaterialEntry
+  ) => {
+    const imageUrl = String(entry.imageUrl || "").trim();
+    if (!imageUrl) return;
+    const appendUnique = (input: Record<number, string[]>) => {
+      const existing = input[rowIndex] || [];
+      if (existing.includes(imageUrl)) return input;
+      return { ...input, [rowIndex]: [imageUrl, ...existing] };
+    };
+    if (frameType === "character") {
+      setFrameCharacterImageMap((prev) => appendUnique(prev));
+    } else if (frameType === "first") {
+      setFrameFirstImageMap((prev) => appendUnique(prev));
+    } else if (frameType === "last") {
+      setFrameLastImageMap((prev) => appendUnique(prev));
+    } else if (frameType === "scene") {
+      setFrameSceneImageMap((prev) => appendUnique(prev));
+    } else if (frameType === "prop") {
+      setFramePropImageMap((prev) => appendUnique(prev));
+    } else {
+      setFrameWideImageMap((prev) => appendUnique(prev));
+    }
+    setFrameGeneratedMetaMap((prev) => {
+      if (Object.prototype.hasOwnProperty.call(prev, imageUrl)) return prev;
+      return {
+        ...prev,
+        [imageUrl]: {
+          name: String(entry.name || "").trim(),
+          description: String(entry.description || "").trim(),
+          frameType,
+          baseCharacterName: String(entry.baseCharacterName || "").trim() || undefined,
+        },
+      };
+    });
+  }, []);
 
   const applyFrameForRow = (rowIndex: number, frameType: FrameGenerationTab, imageUrl: string) => {
     setFrameAppliedMap((prev) => {
@@ -2059,7 +2250,7 @@ export function ScriptEditor({
     } else if (tab === "wide") {
       colIndex = findHeaderIndex((header) => header.includes("远景位置关系图"));
     } else if (tab === "first") {
-      colIndex = findHeaderIndex((header) => header.includes("首帧图片"));
+      colIndex = findHeaderIndex((header) => header.includes("首帧图片") || header.includes("首帧") || header.includes("首位帧") || header.includes("起始帧"));
     }
     if (colIndex < 0) return null;
     return {
@@ -2091,11 +2282,21 @@ export function ScriptEditor({
     if (frameModalRowIndex === null) return;
     const frameType = resolveFrameTypeFromMaterialTab(tab);
     if (frameType && entry.imageUrl) {
+      if (tab === "first") {
+        ensureFrameImageRetained(frameModalRowIndex, frameType, entry);
+      }
       applyFrameForRow(frameModalRowIndex, frameType, entry.imageUrl);
     }
-    const target = resolveScriptTargetForMaterialTab(frameModalRowIndex, tab);
-    if (target) {
-      const currentValue = getTableCellValueByTarget(target);
+    const resolvedTarget = resolveScriptTargetForMaterialTab(frameModalRowIndex, tab);
+    const effectiveTarget = resolvedTarget || (frameModalCellTarget
+      ? {
+          blockIndex: frameModalCellTarget.blockIndex,
+          rowIndex: frameModalCellTarget.rowIndex,
+          colIndex: frameModalCellTarget.colIndex,
+        }
+      : null);
+    if (effectiveTarget) {
+      const currentValue = getTableCellValueByTarget(effectiveTarget);
       const imagePattern = new RegExp(`!\\[[^\\]]*\\]\\(${escapeRegExp(entry.imageUrl)}\\)`);
       const isApplied = imagePattern.test(currentValue);
       if (isApplied) {
@@ -2109,7 +2310,7 @@ export function ScriptEditor({
           nextValue = nextValue.replace(imageLinePattern, "");
         }
         nextValue = nextValue.replace(/\n{3,}/g, "\n\n").trim();
-        updateTable(target.blockIndex, target.rowIndex, target.colIndex, nextValue);
+        updateTable(effectiveTarget.blockIndex, effectiveTarget.rowIndex, effectiveTarget.colIndex, nextValue);
         setFrameScriptAppliedThisSession(true);
         setFrameError("");
         return;
@@ -2120,7 +2321,7 @@ export function ScriptEditor({
         .join("\n\n")
         .replace(/\n{3,}/g, "\n\n")
         .trim();
-      updateTable(target.blockIndex, target.rowIndex, target.colIndex, nextValue);
+      updateTable(effectiveTarget.blockIndex, effectiveTarget.rowIndex, effectiveTarget.colIndex, nextValue);
       setFrameScriptAppliedThisSession(true);
       setFrameError("");
       return;
@@ -2131,7 +2332,7 @@ export function ScriptEditor({
       return;
     }
     setFrameError("当前行缺少可写入的对应剧本列");
-  }, [frameModalRowIndex, frameModalTab, buildMaterialScriptValue, getTableCellValueByTarget, resolveScriptTargetForMaterialTab, applyFrameForRow]);
+  }, [frameModalRowIndex, frameModalTab, frameModalCellTarget, buildMaterialScriptValue, getTableCellValueByTarget, resolveScriptTargetForMaterialTab, applyFrameForRow]);
 
   const removeFrameReferenceTokensByImageUrl = useCallback((imageUrl: string) => {
     const editor = frameEditorRef.current;
@@ -2160,7 +2361,9 @@ export function ScriptEditor({
       }
       return next;
     };
-    if (frameType === "first") {
+    if (frameType === "character") {
+      setFrameCharacterImageMap((prev) => removeFromMap(prev));
+    } else if (frameType === "first") {
       setFrameFirstImageMap((prev) => removeFromMap(prev));
     } else if (frameType === "last") {
       setFrameLastImageMap((prev) => removeFromMap(prev));
@@ -2184,7 +2387,68 @@ export function ScriptEditor({
       }
       return next;
     });
-  }, []);
+    if (projectId) {
+      try {
+        const raw = localStorage.getItem(getFrameStateStorageKey(projectId));
+        const parsed = raw ? (JSON.parse(raw) as PersistedFrameState) : {};
+        const removeFromPersistedMap = (input: Record<number, string[]>) => {
+          const existing = input[rowIndex] || [];
+          const nextList = existing.filter((item) => item !== imageUrl);
+          if (nextList.length > 0) {
+            input[rowIndex] = nextList;
+          } else {
+            delete input[rowIndex];
+          }
+        };
+        const characterImageMap = parsed.characterImageMap || {};
+        const firstImageMap = parsed.firstImageMap || {};
+        const lastImageMap = parsed.lastImageMap || {};
+        const sceneImageMap = parsed.sceneImageMap || {};
+        const propImageMap = parsed.propImageMap || {};
+        const wideImageMap = parsed.wideImageMap || {};
+        const appliedMap = parsed.appliedMap || {};
+
+        if (frameType === "character") {
+          removeFromPersistedMap(characterImageMap);
+        } else if (frameType === "first") {
+          removeFromPersistedMap(firstImageMap);
+        } else if (frameType === "last") {
+          removeFromPersistedMap(lastImageMap);
+        } else if (frameType === "scene") {
+          removeFromPersistedMap(sceneImageMap);
+        } else if (frameType === "prop") {
+          removeFromPersistedMap(propImageMap);
+        } else {
+          removeFromPersistedMap(wideImageMap);
+        }
+
+        const currentAppliedRow = appliedMap[rowIndex] || {};
+        if (currentAppliedRow[frameType] === imageUrl) {
+          const nextAppliedRow = { ...currentAppliedRow };
+          delete nextAppliedRow[frameType];
+          if (Object.keys(nextAppliedRow).length > 0) {
+            appliedMap[rowIndex] = nextAppliedRow;
+          } else {
+            delete appliedMap[rowIndex];
+          }
+        }
+
+        localStorage.setItem(
+          getFrameStateStorageKey(projectId),
+          JSON.stringify({
+            ...parsed,
+            characterImageMap,
+            firstImageMap,
+            lastImageMap,
+            sceneImageMap,
+            propImageMap,
+            wideImageMap,
+            appliedMap,
+          })
+        );
+      } catch {}
+    }
+  }, [projectId]);
 
   const deleteFrameImage = useCallback(async (frameType: FrameGenerationTab, imageUrl: string) => {
     if (!projectId || frameModalRowIndex === null || !imageUrl) return;
@@ -2194,6 +2458,7 @@ export function ScriptEditor({
     setFrameError("");
     try {
       await deleteSegmentFrameImage(token, projectId, imageUrl);
+      removeDraftFrameImage(frameModalRowIndex, frameType, imageUrl);
       removeGeneratedFrameImage(frameModalRowIndex, frameType, imageUrl);
       setFrameGeneratedMetaMap((prev) => {
         if (!Object.prototype.hasOwnProperty.call(prev, imageUrl)) return prev;
@@ -2214,7 +2479,7 @@ export function ScriptEditor({
     } finally {
       setFrameDeletingImageUrl(null);
     }
-  }, [projectId, frameModalRowIndex, removeGeneratedFrameImage, removeFrameReferenceTokensByImageUrl, previewFrameUrl, frameEditTarget]);
+  }, [projectId, frameModalRowIndex, removeDraftFrameImage, removeGeneratedFrameImage, removeFrameReferenceTokensByImageUrl, previewFrameUrl, frameEditTarget]);
 
   const closeFrameModalAndApply = () => {
     if (!frameScriptAppliedThisSession && frameModalCellTarget && frameModalRowIndex !== null) {
@@ -2293,15 +2558,17 @@ export function ScriptEditor({
     try {
       const references = Array.from(new Set([editTarget.imageUrl, ...extraRefs])).filter(Boolean);
       const mergedPrompt = `${basePrompt}\n修改意见：${editPrompt}`.trim();
+      const promptWithStyle = buildFramePromptWithStyle(mergedPrompt, references);
       const task = await generateSegmentFrameImage(token, projectId, {
-        prompt: mergedPrompt,
+        prompt: promptWithStyle,
         references,
         frame_type: editTarget.frameType,
         aspect_ratio: "16:9",
         model: frameImageModel,
+        quick_channel: frameQuickChannel,
       });
       const generated = await waitForFrameTask(task.task_id);
-      appendGeneratedFrameImage(rowIndex, editTarget.frameType, generated, {
+      appendDraftFrameImage(rowIndex, editTarget.frameType, generated, {
         name: materialName,
         description: materialDescription,
         baseCharacterName: editTarget.frameType === "character" ? resolveBaseCharacterNameFromReferences(frameReferences) : undefined,
@@ -2320,9 +2587,65 @@ export function ScriptEditor({
     }
   };
 
+  const applyDraftImageToMaterialLibrary = useCallback((rowIndex: number, frameType: FrameGenerationTab, imageUrl: string) => {
+    const inLibrary = getFrameImagesForRow(rowIndex, frameType).includes(imageUrl);
+    if (inLibrary) {
+      removeGeneratedFrameImage(rowIndex, frameType, imageUrl);
+      showFrameToast("success", "已从素材库中移除");
+      setFrameError("");
+      return;
+    }
+    const meta = frameGeneratedMetaMap[imageUrl];
+    const materialName = String(meta?.name || "").trim() || frameMaterialNameInput.trim();
+    const materialDescription = String(meta?.description || "").trim() || frameMaterialDescriptionInput.trim();
+    if (!materialName) {
+      const toastText = "需要先输入素材名称才能应用至素材库";
+      showFrameToast("error", toastText);
+      setFrameError(toastText);
+      return;
+    }
+    appendGeneratedFrameImage(rowIndex, frameType, imageUrl, {
+      name: materialName,
+      description: materialDescription,
+      baseCharacterName: meta?.baseCharacterName,
+    });
+    showFrameToast("success", "已应用至素材库");
+    setFrameError("");
+  }, [appendGeneratedFrameImage, frameGeneratedMetaMap, frameMaterialDescriptionInput, frameMaterialNameInput, getFrameImagesForRow, removeGeneratedFrameImage, showFrameToast]);
+
+  const handleFrameMaterialUploadChange = useCallback(async (event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0] || null;
+    event.target.value = "";
+    if (!file || !projectId || frameModalRowIndex === null) return;
+    if (!file.type.startsWith("image/")) {
+      showFrameToast("error", "仅支持图片文件");
+      return;
+    }
+    const token = getToken();
+    if (!token) return;
+    setFrameUploadLoading(true);
+    setFrameError("");
+    try {
+      const response = await uploadTemporaryMaterialImage(token, projectId, file);
+      const uploadedUrl = String(response.image_url || "").trim();
+      if (!uploadedUrl) throw new Error("上传成功但未返回图片地址");
+      appendDraftFrameImage(frameModalRowIndex, frameGenerateTab, uploadedUrl, {
+        name: frameMaterialNameInput.trim(),
+        description: frameMaterialDescriptionInput.trim(),
+        baseCharacterName: frameGenerateTab === "character" ? resolveBaseCharacterNameFromReferences(frameReferences) : undefined,
+      });
+      showFrameToast("success", "上传成功，已加入下方展示区");
+    } catch (error) {
+      setFrameError(error instanceof Error ? error.message : "上传素材失败");
+      showFrameToast("error", "上传素材失败");
+    } finally {
+      setFrameUploadLoading(false);
+    }
+  }, [appendDraftFrameImage, frameGenerateTab, frameMaterialDescriptionInput, frameMaterialNameInput, frameModalRowIndex, frameReferences, projectId, resolveBaseCharacterNameFromReferences, showFrameToast]);
+
   return (
     <>
-    <div className="w-full bg-white rounded-xl border border-slate-200 overflow-hidden shadow-sm">
+    <div className="w-full bg-white rounded-xl border border-slate-200 overflow-x-auto shadow-sm storyboard-scroll" onClick={() => setTableRowActionMenu(null)}>
       {(() => {
         let globalRowCursor = rowStartIndex;
         return blocks.map((block, index) => {
@@ -2339,9 +2662,10 @@ export function ScriptEditor({
           globalRowCursor += block.rows.length;
           return (
             <div key={index} className="overflow-x-auto">
-              <table className="w-full text-sm text-left">
+              <table className="w-full min-w-max text-sm text-left">
                 <thead className="text-xs text-slate-500 uppercase bg-slate-50 border-b border-slate-100">
                   <tr>
+                    <th className="w-8 min-w-[32px] px-1 py-3" />
                     {block.headers.map((header, i) => (
                       <th 
                         key={i} 
@@ -2355,6 +2679,48 @@ export function ScriptEditor({
                 <tbody className="divide-y divide-slate-100">
                   {block.rows.map((row, rowIndex) => (
                     <tr key={rowIndex} className="hover:bg-slate-50 group">
+                      <td className="relative w-8 min-w-[32px] px-1 align-top">
+                        {rowIndex > 0 ? (
+                          <div className="relative flex w-full justify-center">
+                            <button
+                              type="button"
+                              onClick={(event) => {
+                                event.stopPropagation();
+                                setTableRowActionMenu((prev) => (
+                                  prev && prev.blockIndex === index && prev.rowIndex === rowIndex
+                                    ? null
+                                    : { blockIndex: index, rowIndex }
+                                ));
+                              }}
+                              className="absolute -top-3 z-10 inline-flex h-5 w-5 items-center justify-center rounded-full border border-slate-300 bg-white text-[10px] text-slate-600 shadow-sm hover:border-slate-400"
+                              title="行操作"
+                            >
+                              ⋯
+                            </button>
+                            {tableRowActionMenu?.blockIndex === index && tableRowActionMenu?.rowIndex === rowIndex ? (
+                              <div
+                                className="absolute left-5 top-2 z-20 w-28 overflow-hidden rounded-md border border-slate-200 bg-white shadow"
+                                onClick={(event) => event.stopPropagation()}
+                              >
+                                <button
+                                  type="button"
+                                  onClick={() => mergeTableRowWithPrevious(index, rowIndex)}
+                                  className="block w-full px-3 py-2 text-left text-xs text-slate-700 hover:bg-slate-50"
+                                >
+                                  合并行
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => insertTableRowAbove(index, rowIndex)}
+                                  className="block w-full border-t border-slate-100 px-3 py-2 text-left text-xs text-slate-700 hover:bg-slate-50"
+                                >
+                                  插入行
+                                </button>
+                              </div>
+                            ) : null}
+                          </div>
+                        ) : null}
+                      </td>
                       {block.headers.map((header, colIndex) => {
                         const normalizedHeader = header.replace(/\s+/g, '');
                         const isKlingColumn = isKlingColumnHeader(normalizedHeader);
@@ -2770,7 +3136,7 @@ export function ScriptEditor({
               <div className="overflow-hidden rounded-xl border border-slate-200 bg-slate-50">
                 <div className="flex items-center justify-between border-b border-slate-200 bg-white px-4 py-3">
                   <div>
-                    <div className="text-sm font-semibold text-slate-800">生成素材</div>
+                    <div className="text-sm font-semibold text-slate-800">创建素材</div>
                     <div className="text-xs text-slate-500">可按当前类型创建新素材，并在下方管理生成结果。</div>
                   </div>
                   <button
@@ -2808,6 +3174,26 @@ export function ScriptEditor({
                           ))}
                         </select>
                       </label>
+                      <label className="ml-1 inline-flex items-center gap-1 text-xs text-slate-600">
+                        <input
+                          type="checkbox"
+                          checked={frameQuickChannel}
+                          onChange={(event) => setFrameQuickChannel(event.target.checked)}
+                          className="h-3.5 w-3.5"
+                        />
+                        快速通道
+                      </label>
+                      <div className="ml-1 flex items-center gap-1 text-xs text-slate-600">
+                        <span>风格</span>
+                        <button
+                          type="button"
+                          onClick={() => onOpenStyleSelector?.()}
+                          className="rounded border border-slate-300 bg-white px-2 py-1 text-xs text-slate-700 hover:bg-slate-50"
+                          title="使用与 Step4 相同的风格选择"
+                        >
+                          {globalStyleName || "选择风格"}
+                        </button>
+                      </div>
                     </div>
                     <div className="grid grid-cols-1 gap-2 md:grid-cols-2">
                       <input
@@ -2846,6 +3232,14 @@ export function ScriptEditor({
                       >
                         {frameGeneratingType === frameGenerateTab || (frameModalRowIndex !== null && Boolean(framePendingMap[buildFramePendingKey(frameModalRowIndex, frameGenerateTab)])) ? "生成中..." : FRAME_GENERATE_TAB_META[frameGenerateTab].buttonIdleText}
                       </button>
+                      <button
+                        type="button"
+                        onClick={() => frameUploadInputRef.current?.click()}
+                        disabled={frameUploadLoading}
+                        className="rounded border border-slate-300 px-3 py-1.5 text-xs text-slate-700 hover:bg-slate-50 disabled:opacity-50"
+                      >
+                        {frameUploadLoading ? "上传中..." : "上传素材"}
+                      </button>
                       {frameError ? <span className="text-xs text-rose-600">{frameError}</span> : null}
                       {!frameError && frameNotice ? <span className="text-xs text-emerald-600">{frameNotice}</span> : null}
                     </div>
@@ -2853,8 +3247,8 @@ export function ScriptEditor({
                   <div className="space-y-2">
                     <div className="text-xs font-semibold text-slate-600">{FRAME_GENERATE_TAB_META[frameGenerateTab].previewTitle}</div>
                     <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 xl:grid-cols-4">
-                      {getFrameImagesForRow(frameModalRowIndex, frameGenerateTab).map((imageUrl) => {
-                        const applied = frameAppliedMap[frameModalRowIndex]?.[frameGenerateTab] === imageUrl;
+                      {getDraftFrameImagesForRow(frameModalRowIndex, frameGenerateTab).map((imageUrl) => {
+                        const inLibrary = getFrameImagesForRow(frameModalRowIndex, frameGenerateTab).includes(imageUrl);
                         const editing = frameEditTarget?.frameType === frameGenerateTab && frameEditTarget?.imageUrl === imageUrl;
                         const deleting = frameDeletingImageUrl === imageUrl;
                         return (
@@ -2879,10 +3273,10 @@ export function ScriptEditor({
                               ) : null}
                               <button
                                 type="button"
-                                onClick={() => applyFrameForRow(frameModalRowIndex, frameGenerateTab, imageUrl)}
-                                className={`rounded px-2 py-1 text-xs ${applied ? FRAME_GENERATE_TAB_META[frameGenerateTab].appliedClass : FRAME_GENERATE_TAB_META[frameGenerateTab].idleClass}`}
+                                onClick={() => applyDraftImageToMaterialLibrary(frameModalRowIndex, frameGenerateTab, imageUrl)}
+                                className={`rounded px-2 py-1 text-xs ${inLibrary ? "border border-emerald-200 bg-emerald-50 text-emerald-700" : "border border-indigo-200 text-indigo-700 hover:bg-indigo-50"}`}
                               >
-                                {applied ? "已应用" : "应用"}
+                                {inLibrary ? "从素材库中移除" : "应用至素材库"}
                               </button>
                               <button
                                 type="button"
@@ -2904,7 +3298,7 @@ export function ScriptEditor({
                         );
                       })}
                     </div>
-                    {getFrameImagesForRow(frameModalRowIndex, frameGenerateTab).length === 0 ? (
+                    {getDraftFrameImagesForRow(frameModalRowIndex, frameGenerateTab).length === 0 ? (
                       <div className="rounded-lg border border-dashed border-slate-200 bg-slate-50 px-3 py-6 text-center text-xs text-slate-400">
                         当前暂无{FRAME_GENERATE_TAB_META[frameGenerateTab].label}图片
                       </div>
@@ -2946,6 +3340,20 @@ export function ScriptEditor({
             ) : null}
             {!frameGeneratePanelOpen && frameError ? <div className="border-t border-slate-200 px-4 py-3 text-xs text-rose-600">{frameError}</div> : null}
           </div>
+        </div>
+      </div>
+    ) : null}
+    <input
+      ref={frameUploadInputRef}
+      type="file"
+      accept="image/*"
+      onChange={handleFrameMaterialUploadChange}
+      className="hidden"
+    />
+    {frameActionToast ? (
+      <div className="fixed right-6 top-6 z-[60]">
+        <div className={`rounded-lg px-3 py-2 text-xs text-white shadow ${frameActionToast.type === "error" ? "bg-rose-500" : "bg-emerald-500"}`}>
+          {frameActionToast.text}
         </div>
       </div>
     ) : null}
@@ -3321,7 +3729,7 @@ function TableCell({
     return "";
   }, []);
 
-  const { displayText, assetRefs } = React.useMemo(() => {
+  const { displayText, assetRefs, embeddedImageUrls } = React.useMemo(() => {
     const normalizeMarkdownText = (input: string) =>
       String(input || "")
         .replace(/<br\s*\/?>/gi, "\n")
@@ -3332,8 +3740,11 @@ function TableCell({
     const refs: Array<{ raw: string; id?: string; name: string }> = [];
     const seenRefKey = new Set<string>();
     const trimmedValue = normalizeMarkdownText(value || "");
+    const embeddedImageUrls = Array.from(new Set(
+      Array.from(trimmedValue.matchAll(/!\[[^\]]*\]\(([^)]+)\)/g)).map((match) => String(match[1] || "").trim()).filter(Boolean)
+    ));
     if (!enableAssetBindingAssist) {
-      return { displayText: trimmedValue, assetRefs: refs };
+      return { displayText: trimmedValue, assetRefs: refs, embeddedImageUrls };
     }
     const allAssets = projectAssets || [];
     const typeFiltered =
@@ -3424,9 +3835,10 @@ function TableCell({
       .replace(/^\s*MATERIAL_REF_START\s*$/gim, "")
       .replace(/^\s*MATERIAL_REF_END\s*$/gim, "")
       .replace(/^\s*<\s*!\s*--\s*MATERIAL_REF_END\s*$/gim, "")
+      .replace(/^\s*!\[[^\]]*\]\(([^)]+)\)\s*$/gim, "")
       .replace(/\n{3,}/g, "\n\n")
       .trim();
-    return { displayText: text, assetRefs: refs };
+    return { displayText: text, assetRefs: refs, embeddedImageUrls };
   }, [enableAssetBindingAssist, generatedMetaMap, normalizeAssetKey, preferredAssetTypes, projectAssets, value]);
   const pickerAssetData = React.useMemo<{
     items: Array<{ id: string; name: string; hasImage: boolean; imageUrl: string }>;
@@ -3603,6 +4015,24 @@ function TableCell({
           </div>
         ) : null}
         <div className="text-slate-700 leading-relaxed">
+          {embeddedImageUrls.length > 0 ? (
+            <div className="mb-1 space-y-1">
+              {embeddedImageUrls.map((imageUrl, index) => (
+                // eslint-disable-next-line jsx-a11y/no-noninteractive-element-interactions, @next/next/no-img-element
+                <img
+                  key={`${imageUrl}-${index}`}
+                  src={imageUrl}
+                  alt={`素材图${index + 1}`}
+                  onClick={(event) => {
+                    event.stopPropagation();
+                    setPreviewTitle(`素材图${index + 1}`);
+                    setPreviewUrl(imageUrl);
+                  }}
+                  className="my-1 block h-auto w-full max-w-full cursor-zoom-in rounded border border-slate-200 object-contain"
+                />
+              ))}
+            </div>
+          ) : null}
           {displayText ? (
             <ReactMarkdown
               remarkPlugins={[remarkGfm]}
@@ -3616,10 +4046,7 @@ function TableCell({
                   if (/MATERIAL_REF_START|MATERIAL_REF_END/i.test(plainText)) return null;
                   if (/^<\s*!\s*--\s*>?$/.test(plainText) || /^--\s*>$/.test(plainText)) return null;
                   if (/^素材类型\s*[：:]/.test(plainText)) return null;
-                  if (/^素材名\s*[：:]/.test(plainText)) {
-                    const name = plainText.replace(/^素材名\s*[：:]\s*/, "").trim();
-                    return name ? <p className="mb-0.5 text-[11px] text-slate-400">{name}</p> : null;
-                  }
+                  if (/^素材名\s*[：:]/.test(plainText)) return null;
                   if (/^素材描述\s*[：:]/.test(plainText)) return null;
                   return <p className="whitespace-pre-wrap mb-1 last:mb-0">{children}</p>;
                 },

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from typing import Optional
 from uuid import uuid4
 
 from sqlalchemy import DateTime, String, Text, UniqueConstraint
@@ -19,7 +20,7 @@ class CharacterImageBinding(Base):
     project_id: Mapped[str] = mapped_column(String(36), index=True)
     image_url: Mapped[str] = mapped_column(Text)
     base_character_name: Mapped[str] = mapped_column(String(255), index=True)
-    asset_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
-    source_image_url: Mapped[str | None] = mapped_column(Text, nullable=True)
+    asset_id: Mapped[Optional[str]] = mapped_column(String(36), nullable=True, index=True)
+    source_image_url: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)

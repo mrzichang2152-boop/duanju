@@ -730,7 +730,7 @@ async def extract_assets_from_script(
                 session,
                 user_id,
                 {
-                    "model": "gemini-3.1-pro",
+                    "model": "gemini-3.1-pro-preview",
                     "messages": [
                         {"role": "system", "content": system_prompt},
                         {"role": "user", "content": script.content},
