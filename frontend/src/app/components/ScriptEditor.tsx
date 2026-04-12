@@ -18,6 +18,9 @@ interface ScriptEditorProps {
   onChange: (newContent: string) => void;
   projectId?: string;
   externalFirstFrameEntries?: ExternalFirstFrameEntry[];
+  globalStyleName?: string;
+  globalStylePromptText?: string;
+  onOpenStyleSelector?: () => void;
   dialogueCellAudioMap?: Record<string, AppliedVoiceSegment[]>;
   onDialogueCellAudioMapChange?: (map: Record<string, AppliedVoiceSegment[]>) => void;
   rowStartIndex?: number;
