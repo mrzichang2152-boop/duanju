@@ -5,6 +5,7 @@ import { useParams, useRouter } from "next/navigation";
 import { deleteSegmentFrameImage, deleteSegmentVersion, generateSegment, generateSegmentFrameImage, getAssets, getScript, getSegmentFrameImageTaskStatus, getSegments, getStoryboardTaskStatus, mergeEpisodeOnServer, saveScript, selectSegmentVersion, startStoryboardTask, type Asset, type Episode, type Segment, type SegmentVersion } from "@/lib/api";
 import { getToken } from "@/lib/auth";
 import { ScriptEditor } from "@/app/components/ScriptEditor";
+import { DEFAULT_GLOBAL_STYLE, getGlobalStylePrompt } from "@/lib/global-style";
 
 const SEPARATOR = "\n\n=== 原文剧本 (请勿删除此行) ===\n\n";
 
@@ -72,7 +73,7 @@ const compressCustomStyleImage = async (dataUrl: string): Promise<string> => {
 };
 
 const REALISTIC_STYLE_PRESETS: StylePresetItem[] = [
-  { name: "徐克武侠", description: "占位描述：强调写意武打、强动势镜头与冷暖对比光影。", image: "https://picsum.photos/seed/xu-ke-wuxia/480/280" },
+  { name: "通用写实风格", description: "电影级写实，强调真实皮肤、自然光影与物理运动细节。", image: "https://picsum.photos/seed/general-cinematic-realistic/480/280" },
   { name: "赛博朋克", description: "占位描述：霓虹高对比、雨夜反光、科技与街头混合视觉。", image: "https://picsum.photos/seed/cyberpunk-neon/480/280" },
   { name: "胶片质感", description: "占位描述：颗粒、偏色、柔和高光与复古曝光风格。", image: "https://picsum.photos/seed/film-grain-look/480/280" },
 ];
@@ -123,9 +124,6 @@ const STYLE_PRESET_TABS: Array<{ key: Exclude<StyleTabKey, "custom">; label: str
 ];
 
 const PRESET_STYLE_NAMES = STYLE_PRESET_TABS.flatMap((tab) => tab.styles.map((item) => item.name));
-const PRESET_STYLE_PROMPT_MAP: Record<string, string> = Object.fromEntries(
-  PRESET_STYLE_NAMES.map((style) => [style, `全局视觉风格：${style}。请保持整集分镜在美术气质、光影语气、镜头审美上的统一。`])
-);
 const KLING_COLUMN = "生成视频";
 const LEGACY_KLING_COLUMN = "Kling视频生成";
 const STEP4_VIDEO_MODEL_OPTIONS = [
@@ -139,6 +137,22 @@ function resolveStep4VideoModel(model: Step4VideoModel): string {
   if (model === "klingv3omni") return "kling-v3-omni";
   return "doubao-seedance-2-0-260128";
 }
+
+function isSeedanceMissingVoiceErrorMessage(message: string): boolean {
+  const text = String(message || "");
+  return text.includes("Seedance 角色有声视频缺少对应角色音频");
+}
+
+function extractSeedanceMissingVoiceRoleNames(message: string): string {
+  const text = String(message || "").trim();
+  if (!text) return "该";
+  const match = text.match(/缺少对应角色音频[：:]\s*([^。\n]+)/);
+  const roleText = String(match?.[1] || "").trim();
+  if (!roleText) return "该";
+  const normalized = roleText.replace(/[，、\s]+/g, "、").replace(/^、+|、+$/g, "");
+  return normalized || "该";
+}
+
 const TABLE_HEADER_KEYWORDS = ["时间轴", "分镜", "分段时长", "镜头", "景别", "机位", "运镜", "内容", "台词", "画面", "提示词", "prompt", "角色", "场景", "道具", "备注"];
 const COLUMN_MEANING_MAP: Record<string, string> = {
   分镜: "当前连续镜头的起始画面与场景基底说明",
@@ -172,6 +186,12 @@ type VideoGenerateRowPayload = {
   usePreviousSegmentEndFrame?: boolean;
   customFirstFrameUrl?: string;
   customLastFrameUrl?: string;
+  skipVoiceReferenceAudio?: boolean;
+};
+
+type SeedanceMissingVoicePromptState = {
+  roleNamesText: string;
+  payload: VideoGenerateRowPayload;
 };
 const VIDEO_ASSET_ROLE_PRIORITY: Record<KlingAssetRole, number> = {
   first_frame: 4,
@@ -895,7 +915,7 @@ export default function ScriptStoryboardPage() {
   const [actionToast, setActionToast] = useState<{ type: "error" | "success" | "info"; text: string } | null>(null);
   const [selectedModel, setSelectedModel] = useState("gemini-3.1-pro-preview");
   const [customStyles, setCustomStyles] = useState<CustomStyleItem[]>([]);
-  const [globalStyle, setGlobalStyle] = useState("徐克武侠");
+  const [globalStyle, setGlobalStyle] = useState(DEFAULT_GLOBAL_STYLE);
   const [isStyleModalOpen, setIsStyleModalOpen] = useState(false);
   const [activeStyleTab, setActiveStyleTab] = useState<StyleTabKey>("realistic");
   const [showCreateCustomStyle, setShowCreateCustomStyle] = useState(false);
@@ -904,9 +924,9 @@ export default function ScriptStoryboardPage() {
   const [newCustomStyleImage, setNewCustomStyleImage] = useState("");
   const [isScriptCollapsed, setIsScriptCollapsed] = useState(false);
   const [videoResolution, setVideoResolution] = useState<"720p" | "1080p">("720p");
-  const [videoAspectRatio, setVideoAspectRatio] = useState<"9:16" | "16:9" | "1:1">("9:16");
-  const [videoAudioMode, setVideoAudioMode] = useState<"silent" | "with_audio">("with_audio");
-  const [selectedVideoModel, setSelectedVideoModel] = useState<Step4VideoModel>("klingv3omni");
+  const [videoAspectRatio, setVideoAspectRatio] = useState<"9:16" | "16:9" | "1:1">("16:9");
+  const [videoAudioMode, setVideoAudioMode] = useState<"silent" | "with_audio">("silent");
+  const [selectedVideoModel, setSelectedVideoModel] = useState<Step4VideoModel>("seedance2.0");
   const [segments, setSegments] = useState<Segment[]>([]);
   const [projectAssets, setProjectAssets] = useState<Asset[]>([]);
   const [generatingGlobalRowIndex, setGeneratingGlobalRowIndex] = useState<number | null>(null);
@@ -936,6 +956,7 @@ export default function ScriptStoryboardPage() {
   const [batchFirstFrameShowAllPreview, setBatchFirstFrameShowAllPreview] = useState(false);
   const [batchImagePreviewUrl, setBatchImagePreviewUrl] = useState<string | null>(null);
   const [batchImagePreviewTitle, setBatchImagePreviewTitle] = useState("图片预览");
+  const [seedanceMissingVoicePrompt, setSeedanceMissingVoicePrompt] = useState<SeedanceMissingVoicePromptState | null>(null);
 
   const saveTimeoutRef = useRef<NodeJS.Timeout | null>(null);
   const lastSavedContentRef = useRef("");
@@ -1033,7 +1054,7 @@ export default function ScriptStoryboardPage() {
       setGlobalStyle(saved);
       return;
     }
-    setGlobalStyle("徐克武侠");
+    setGlobalStyle(DEFAULT_GLOBAL_STYLE);
   }, [projectId, customStyles]);
 
   useEffect(() => {
@@ -1047,7 +1068,7 @@ export default function ScriptStoryboardPage() {
     if (customStyle) {
       return `全局视觉风格：${customStyle.name}。风格提示：${customStyle.prompt || customStyle.description || "请保持统一的视觉审美"}。请保持整集分镜在美术气质、光影语气、镜头审美上的统一。`;
     }
-    return PRESET_STYLE_PROMPT_MAP[globalStyle] || `全局视觉风格：${globalStyle}`;
+    return getGlobalStylePrompt(globalStyle);
   }, [customStyles, globalStyle]);
 
   useEffect(() => {
@@ -2108,7 +2129,19 @@ export default function ScriptStoryboardPage() {
     )));
 
     try {
-      const references = Array.from(new Set((targetItem.references || []).map((item) => String(item || "").trim()).filter(Boolean)));
+      const manualReferences = Array.from(new Set((targetItem.references || []).map((item) => String(item || "").trim()).filter(Boolean)));
+      const tokenAssetIds = extractAssetTokensFromCell(targetItem.prompt || "");
+      const tokenReferences = tokenAssetIds
+        .map((assetId) => projectAssets.find((asset) => asset.id === assetId))
+        .map((asset) => (asset ? getAssetPreviewUrl(asset) : ""))
+        .map((url) => String(url || "").trim())
+        .filter(Boolean);
+      const scriptAppliedReference = String(targetItem.scriptAppliedImageUrl || "").trim();
+      const references = Array.from(new Set([
+        ...manualReferences,
+        ...tokenReferences,
+        ...(scriptAppliedReference ? [scriptAppliedReference] : []),
+      ]));
       const promptWithStyle = [
         `【全局风格】\n${globalStylePromptText}`,
         "【首帧生成要求】请同时参考参考图与风格提示词，保证画面风格统一、主体一致。",
@@ -2229,11 +2262,13 @@ export default function ScriptStoryboardPage() {
     usePreviousSegmentEndFrame,
     customFirstFrameUrl,
     customLastFrameUrl,
+    skipVoiceReferenceAudio,
   }: VideoGenerateRowPayload) => {
     setGeneratingGlobalRowIndex(globalRowIndex);
     setMessage("正在提交视频生成请求...");
     let submitted = false;
     let pendingRowIndex = globalRowIndex;
+    let requestedWithAudio = false;
     try {
       if (!projectId) {
         throw new Error("项目 ID 无效，请刷新页面后重试");
@@ -2250,9 +2285,11 @@ export default function ScriptStoryboardPage() {
       const mode = videoResolution === "1080p" ? "pro" : "std";
       const duration = normalizeKlingDuration(totalDurationSeconds);
       const modelToUse = resolveStep4VideoModel(selectedVideoModel);
-      const withAudio = videoAudioMode === "with_audio";
+      requestedWithAudio = videoAudioMode === "with_audio";
+      const withAudio = skipVoiceReferenceAudio ? false : requestedWithAudio;
       const targetRowIndex = globalRowIndex;
       pendingRowIndex = targetRowIndex;
+      setSeedanceMissingVoicePrompt(null);
 
       await flushStoryboardChangesBeforeVideoGenerate(token);
       const refreshedSegments = await getSegments(token, projectId);
@@ -2307,6 +2344,9 @@ export default function ScriptStoryboardPage() {
       if (!effectiveCustomFirstFrameUrl && usePreviousSegmentEndFrame && typeof previousGlobalRowIndex === "number" && previousGlobalRowIndex >= 0) {
         const previousSegment = findSegmentForRow(refreshedSegments, previousGlobalRowIndex);
         previousSegmentVideoUrl = rowVideoUrlMap[previousGlobalRowIndex] || getSelectedOrLatestSegmentVideoUrl(previousSegment);
+        if (!previousSegmentVideoUrl) {
+          throw new Error("已勾选使用前一条分镜尾帧，但上一条分镜还没有可用视频，请先生成并选择上一条视频版本");
+        }
       }
       const usePreviousTailFrame = Boolean(previousSegmentVideoUrl) && !effectiveCustomFirstFrameUrl;
 
@@ -2327,7 +2367,7 @@ export default function ScriptStoryboardPage() {
 
       const systemPrompt = [
         "你是短剧分镜视频生成模型的执行器。",
-        `全局视觉风格：${globalStyle}。`,
+        globalStylePromptText,
         "只根据【镜头调度与内容】和参考素材生成，不要额外引用“分镜”列或其他表格说明文本。",
         "当前任务是单段生成：严格执行当前段的镜头调度与内容。",
         "仅保留当前段的定格画面描述。",
@@ -2413,6 +2453,22 @@ export default function ScriptStoryboardPage() {
         });
       }
       const text = error instanceof Error ? error.message : "视频生成失败";
+      if (!skipVoiceReferenceAudio && requestedWithAudio && selectedVideoModel === "seedance2.0" && isSeedanceMissingVoiceErrorMessage(text)) {
+        const roleNamesText = extractSeedanceMissingVoiceRoleNames(text);
+        setSeedanceMissingVoicePrompt({
+          roleNamesText,
+          payload: {
+            globalRowIndex,
+            previousGlobalRowIndex,
+            headers,
+            row,
+            usePreviousSegmentEndFrame,
+            customFirstFrameUrl,
+            customLastFrameUrl,
+          },
+        });
+        return;
+      }
       setMessage(text);
       setActionToast({ type: "error", text });
     } finally {
@@ -2520,7 +2576,7 @@ export default function ScriptStoryboardPage() {
 
       const systemPrompt = [
         "你是短剧分镜视频编辑模型的执行器。",
-        `全局视觉风格：${globalStyle}。`,
+        globalStylePromptText,
         "你将基于当前视频进行编辑，严格保留镜头结构与叙事连续性。",
         "优先保证人物动作、表情、台词、道具、场景与时间轴一致。",
       ].join("\n");
@@ -2816,7 +2872,7 @@ export default function ScriptStoryboardPage() {
   const batchAllPreviewEntries = useMemo(
     () => batchFirstFrameItems.map((item, index) => ({
       tabLabel: item.tabLabel || `分镜${index + 1}`,
-      imageUrl: String(item.scriptAppliedImageUrl || "").trim(),
+      imageUrl: String(item.appliedImageUrl || item.scriptAppliedImageUrl || "").trim(),
     })),
     [batchFirstFrameItems]
   );
@@ -3213,7 +3269,12 @@ export default function ScriptStoryboardPage() {
                           />
                         </div>
                         {newCustomStyleImage ? (
-                          <img src={newCustomStyleImage} alt="custom-style-preview" className="mt-3 h-32 w-56 rounded-lg border border-slate-200 object-cover" />
+                          <img
+                            src={newCustomStyleImage}
+                            alt="custom-style-preview"
+                            onClick={() => handlePreviewStyleImage("自定义风格预览", newCustomStyleImage)}
+                            className="mt-3 aspect-video w-56 cursor-zoom-in rounded-lg border border-slate-200 object-cover"
+                          />
                         ) : null}
                         <div className="mt-3">
                           <button
@@ -3246,7 +3307,7 @@ export default function ScriptStoryboardPage() {
                               className="block w-full"
                               title="点击预览风格图"
                             >
-                              <img src={style.image} alt={style.name} className="h-28 w-full object-cover" />
+                              <img src={style.image} alt={style.name} className="aspect-video w-full object-cover" />
                             </button>
                             <div className="p-3">
                               <div className="text-sm font-semibold text-slate-900">{style.name}</div>
@@ -3283,7 +3344,7 @@ export default function ScriptStoryboardPage() {
                           className="block w-full"
                           title="点击预览风格图"
                         >
-                          <img src={style.image} alt={style.name} className="h-28 w-full object-cover" />
+                          <img src={style.image} alt={style.name} className="aspect-video w-full object-cover" />
                         </button>
                         <div className="p-3">
                           <div className="text-sm font-semibold text-slate-900">{style.name}</div>
@@ -3349,7 +3410,16 @@ export default function ScriptStoryboardPage() {
                   const scriptApplied = currentBatchItem ? String(currentBatchItem.scriptAppliedImageUrl || "").trim() === imageUrl : false;
                   return (
                     <div key={asset.id} className={`overflow-hidden rounded-lg border bg-white ${scriptApplied ? "border-emerald-500 ring-2 ring-emerald-200" : "border-slate-200"}`}>
-                      <img src={imageUrl || "https://via.placeholder.com/320x180?text=No+Image"} alt={asset.name} className="h-28 w-full object-cover bg-slate-100" />
+                      <img
+                        src={imageUrl || "https://via.placeholder.com/320x180?text=No+Image"}
+                        alt={asset.name}
+                        onClick={() => {
+                          if (!imageUrl) return;
+                          setBatchImagePreviewTitle(`素材预览 - ${asset.name || "未命名素材"}`);
+                          setBatchImagePreviewUrl(imageUrl);
+                        }}
+                        className="aspect-video w-full cursor-zoom-in object-cover bg-slate-100"
+                      />
                       <div className="truncate px-2 pt-2 text-xs text-slate-700">{asset.name}</div>
                       {asset.description ? <div className="line-clamp-2 px-2 pb-2 text-[11px] text-slate-500">{asset.description}</div> : <div className="px-2 pb-2 text-[11px] text-slate-300">&nbsp;</div>}
                       <div className="flex items-center justify-end gap-2 border-t border-slate-100 p-2">
@@ -3593,7 +3663,7 @@ export default function ScriptStoryboardPage() {
       ) : null}
 
       {batchImagePreviewUrl ? (
-        <div className="fixed inset-0 z-[60] flex items-center justify-center bg-black/70 p-4" onClick={() => setBatchImagePreviewUrl(null)}>
+        <div className="fixed inset-0 z-[120] flex items-center justify-center bg-black/70 p-4" onClick={() => setBatchImagePreviewUrl(null)}>
           <div className="max-h-[90vh] w-full max-w-5xl rounded-xl bg-white p-3" onClick={(event) => event.stopPropagation()}>
             <div className="mb-2 flex items-center justify-between">
               <div className="truncate pr-3 text-sm font-medium text-slate-700">{batchImagePreviewTitle}</div>
@@ -3606,6 +3676,51 @@ export default function ScriptStoryboardPage() {
               </button>
             </div>
             <img src={batchImagePreviewUrl} alt={batchImagePreviewTitle} className="max-h-[78vh] w-full rounded-lg border border-slate-200 object-contain bg-slate-100" />
+          </div>
+        </div>
+      ) : null}
+
+      {seedanceMissingVoicePrompt ? (
+        <div className="fixed inset-0 z-[130] flex items-center justify-center bg-black/45 p-4" onClick={() => setSeedanceMissingVoicePrompt(null)}>
+          <div className="w-full max-w-xl rounded-xl bg-white p-5 shadow-xl" onClick={(event) => event.stopPropagation()}>
+            <div className="text-base font-semibold text-slate-900">缺少角色音色配置</div>
+            <div className="mt-3 text-sm leading-6 text-slate-700">
+              当前{seedanceMissingVoicePrompt.roleNamesText}角色未在
+              <button
+                type="button"
+                onClick={() => {
+                  setSeedanceMissingVoicePrompt(null);
+                  router.push(`/projects/${projectId}/script/assets`);
+                }}
+                className="mx-1 text-blue-600 hover:text-blue-700 hover:underline"
+              >
+                step3
+              </button>
+              中配置音色，是否继续生成？
+            </div>
+            <div className="mt-5 flex justify-end gap-2">
+              <button
+                type="button"
+                onClick={() => setSeedanceMissingVoicePrompt(null)}
+                className="rounded-lg border border-slate-200 px-4 py-2 text-sm text-slate-600 hover:bg-slate-50"
+              >
+                取消
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  const payload = seedanceMissingVoicePrompt.payload;
+                  setSeedanceMissingVoicePrompt(null);
+                  void handleGenerateKlingRow({
+                    ...payload,
+                    skipVoiceReferenceAudio: true,
+                  });
+                }}
+                className="rounded-lg bg-emerald-600 px-4 py-2 text-sm text-white hover:bg-emerald-700"
+              >
+                继续生成
+              </button>
+            </div>
           </div>
         </div>
       ) : null}

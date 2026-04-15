@@ -23,6 +23,7 @@ import { extractDrawModels } from "@/lib/models";
 import { getToken } from "@/lib/auth";
 import { VoiceSelector } from "@/app/components/VoiceSelector";
 import { applyTemplate } from "@/lib/templates";
+import { DEFAULT_GLOBAL_STYLE, DIRECTOR_STYLE_OPTIONS, STEP3_STYLE_OPTIONS, getGlobalStylePrompt } from "@/lib/global-style";
 
 const normalizeRoleKey = (name: string) => {
   const value = (name || "").trim();
@@ -176,6 +177,7 @@ export default function AssetsPage() {
   const [status, setStatus] = useState<string | null>(null);
   const [assets, setAssets] = useState<Asset[]>([]);
   const [error, setError] = useState<string | null>(null);
+  const [assetsLoadFailed, setAssetsLoadFailed] = useState(false);
   const [assetPrompts, setAssetPrompts] = useState<Record<string, string>>({});
   const [assetModels, setAssetModels] = useState<Record<string, string>>({});
   const [assetSizes, setAssetSizes] = useState<Record<string, string>>({});
@@ -212,12 +214,11 @@ export default function AssetsPage() {
   }, [actionToast]);
 
   const STYLE_OPTIONS = [
-    "真人电影写实", "3D 写实渲染", "3D 超写实渲染", "3D 虚幻引擎风", "3D 游戏 CG",
-    "3D 半写实", "3D 皮克斯风", "3D 迪士尼风", "3D 萌系 Q 版", "3D 粘土风",
-    "3D 三渲二", "3D Low Poly", "2D 动画", "2D 日式动漫", "2D 国漫风",
-    "2D 美式卡通", "2D Q 版卡通", "2D 水彩油画", "2D 水墨国风", "2D 赛博风格"
+    DEFAULT_GLOBAL_STYLE,
+    ...STEP3_STYLE_OPTIONS,
+    ...DIRECTOR_STYLE_OPTIONS,
   ];
-  const [globalStyle, setGlobalStyle] = useState<string>("真人电影写实");
+  const [globalStyle, setGlobalStyle] = useState<string>(DEFAULT_GLOBAL_STYLE);
   const [quickChannel, setQuickChannel] = useState<boolean>(false);
   const [assetStyles, setAssetStyles] = useState<Record<string, string>>({});
   const [voicesByCharacter, setVoicesByCharacter] = useState<Record<string, CharacterVoice>>({});
@@ -255,8 +256,26 @@ export default function AssetsPage() {
     [projectId]
   );
 
+  useEffect(() => {
+    if (!projectId) return;
+    const key = `storyboard-style-${projectId}`;
+    const saved = String(localStorage.getItem(key) || "").trim();
+    if (!saved) return;
+    if (STYLE_OPTIONS.includes(saved)) {
+      setGlobalStyle(saved);
+    }
+  }, [projectId]);
+
+  useEffect(() => {
+    if (!projectId || !globalStyle) return;
+    localStorage.setItem(`storyboard-style-${projectId}`, globalStyle);
+  }, [projectId, globalStyle]);
+
   const handleGlobalStyleChange = (newStyle: string) => {
     setGlobalStyle(newStyle);
+    if (projectId) {
+      localStorage.setItem(`storyboard-style-${projectId}`, newStyle);
+    }
     const newAssetStyles: Record<string, string> = {};
     assets.forEach((asset) => {
       newAssetStyles[asset.id] = newStyle;
@@ -354,6 +373,7 @@ export default function AssetsPage() {
     if (!opts?.preserveError) {
       setError(null);
     }
+    setAssetsLoadFailed(false);
     try {
       const result = await getAssets(token, projectId);
       setAssets(result);
@@ -419,6 +439,7 @@ export default function AssetsPage() {
         redirectToProjectsOnMissing();
         return;
       }
+      setAssetsLoadFailed(true);
       setError(errorMessage);
     }
   }, [
@@ -610,6 +631,11 @@ export default function AssetsPage() {
     );
 
     let shouldClearPending = false;
+    const selectedStyleName = String(globalStyle || DEFAULT_GLOBAL_STYLE).trim();
+    const stylePromptText = getGlobalStylePrompt(selectedStyleName);
+    const resolvedBackendStyle = STEP3_STYLE_OPTIONS.includes(selectedStyleName as (typeof STEP3_STYLE_OPTIONS)[number])
+      ? selectedStyleName
+      : "真人电影写实";
     try {
       if (modifyingImage && modifyingImage.uiKey === uiKey) {
         const rawRefUrl = (modifyingImage.url || "").trim();
@@ -647,11 +673,13 @@ export default function AssetsPage() {
           }
           // 否则仍提交当前参考地址，由后端结合 PUBLIC_BASE_URL 解析 /static 与 data 图
         }
+        const modificationBasePrompt = String(modificationPrompt || "").trim();
+        const modificationPromptWithStyle = [stylePromptText, modificationBasePrompt].filter(Boolean).join("\n\n");
         const task = await generateAsset(token, projectId, activeAssetId, {
-          prompt: modificationPrompt || undefined,
+          prompt: modificationPromptWithStyle || undefined,
           model: assetModels[activeAssetId] || undefined,
           ref_image_url: refImageUrl,
-          style: assetStyles[activeAssetId] || globalStyle,
+          style: resolvedBackendStyle,
           options: {
             aspect_ratio: assetSizes[activeAssetId] || getAssetDefaultSize(),
             size: "4K",
@@ -688,11 +716,13 @@ export default function AssetsPage() {
           }
         }
 
+        const baseAssetPrompt = String(assetPrompts[activeAssetId] || "").trim();
+        const assetPromptWithStyle = [stylePromptText, baseAssetPrompt].filter(Boolean).join("\n\n");
         const task = await generateAsset(token, projectId, activeAssetId, {
-          prompt: assetPrompts[activeAssetId] || undefined,
+          prompt: assetPromptWithStyle || undefined,
           model: assetModels[activeAssetId] || undefined,
           ref_image_url: refImageUrl,
-          style: assetStyles[activeAssetId] || globalStyle,
+          style: resolvedBackendStyle,
           options: {
             aspect_ratio: assetSizes[activeAssetId] || getAssetDefaultSize(),
             size: "4K",

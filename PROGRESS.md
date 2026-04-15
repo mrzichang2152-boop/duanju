@@ -1497,3 +1497,26 @@
 - 2026-04-13 - 验证 - 测试机容器 `duanju-backend-1/duanju-frontend-1/duanju-nginx-1` 均为 Up；`http://81.70.235.208:8003/health` 返回 `{"status":"ok"}`；`http://81.70.235.208` 返回 200。
 - 2026-04-15 - 修复 - `ScriptEditor.tsx` 新增 `normalizeBackendMediaUrl` 并统一用于素材管理 URL 解析（资产版本/剧本内嵌图片/历史生成图/外部首帧），将同域 `http://...:8003/static/...` 转为当前 `https` 域名资源，修复测试环境素材在 HTTPS 页面下被混合内容拦截导致不显示。
 - 2026-04-15 - 验证 - `ScriptEditor.tsx` lints 为 0；执行 `cd frontend && npm run dev` 启动成功；`/projects/755d8b41-39da-4632-aceb-23a20f2694fe/script/storyboard` 返回 200。
+- 2026-04-15 - 发布 - 已将 `V1.0` 最新修复（commit: `b8c539f`）同步到 `81.70.235.208:/home/ubuntu/video_gen_app`，执行 `sudo docker compose up -d --build backend frontend nginx` 完成测试环境前后端发布。
+- 2026-04-15 - 验证 - 测试机容器 `duanju-backend-1/duanju-frontend-1/duanju-nginx-1` 均为 Up；`http://81.70.235.208:8003/health` 返回 `{"status":"ok"}`；`https://81.70.235.208/projects/755d8b41-39da-4632-aceb-23a20f2694fe/script/storyboard` 返回 200。
+- 2026-04-15 - 修复 - Step3 素材页稳定性优化：`frontend/src/lib/api.ts` 将 `getAssets` 超时从默认 15s 提升到 60s；`assets/page.tsx` 新增 `assetsLoadFailed` 独立状态，避免模型加载等非素材错误误触发“素材加载失败”提示。
+- 2026-04-15 - 修复 - `frontend/src/lib/api.ts` 在浏览器端仅对同源 `state_url` 执行脚本状态补拉取；跨域地址直接回退接口内联内容，消除 COS 跨域报错并避免无效请求。
+- 2026-04-15 - 修复 - Step4 首帧批量生成卡住处理：`backend/app/api/segments.py` 为 `FRAME_GENERATE` 状态查询增加失联任务自动失败（`FRAME_TASK_STALE_SECONDS`，默认 900s）；`frontend/src/lib/api.ts` 的首帧任务轮询改为 `no-store + 时间戳` 防缓存，避免前端长期显示“生成中”。
+- 2026-04-15 - 修复 - 修复 Step4 首帧任务状态接口 500：补齐 `backend/app/api/segments.py` 中 `_FRAME_TASK_STALE_SECONDS` 常量定义，解决已生成首帧后再次生成时报错。
+- 2026-04-16 - 优化 - Step4 批量首帧弹窗：素材库与全局风格卡片图片统一改为 16:9 展示；素材图与自定义风格示例图支持点击预览；图片预览层级提升为 `z-[120]`，修复在全局风格弹窗下方被遮挡问题。
+- 2026-04-16 - 优化 - 修复素材管理弹窗图片比例：`frontend/src/app/components/ScriptEditor.tsx` 中素材库卡片与生成结果卡片统一为 16:9（`aspect-video`），解决“素材管理仍扁长”问题。
+- 2026-04-16 - 优化 - 补充修复素材管理弹窗比例遗漏：`ScriptEditor.tsx` 中视频修改素材卡片（原 `h-24`）同步改为 16:9。
+- 2026-04-16 - 修复 - 批量首帧图生图引用失效：`storyboard/page.tsx` 在提交 `frame-images/generate` 前，自动从提示词 `[AssetID:*]` token 解析素材图，并合并已应用剧本图到 `references`，确保引用图真实传入后端。
+- 2026-04-16 - 配置 - Step4 视频设置默认值调整为：720p、横屏（16:9）、Seedance 2.0、无声（silent）。
+- 2026-04-16 - 修复 - Step4 批量首帧“全部预览”缺图：`storyboard/page.tsx` 的 `batchAllPreviewEntries` 改为优先读取 `appliedImageUrl`，并回退 `scriptAppliedImageUrl`，确保“应用至素材库”的分镜图可正常显示。
+- 2026-04-16 - 修复 - Seedance 鉴权读取修正：`backend/app/core/config.py` 增加 `ark_api_key`/`volcengine_ark_api_key` 配置字段，`linkapi.py` 在 Seedance 分支优先读取配置模型中的 ARK Key，避免 `.env` 已配置但运行时被判未配置。
+- 2026-04-16 - 交互优化 - Step4 Seedance 缺角色音色时报错改为交互弹窗：提示“当前xx角色未在step3中配置音色，是否继续生成”；支持点击蓝色 `step3` 跳转到素材页；选择继续则以无参考音色方式重试生成，取消则关闭弹窗。
+- 2026-04-16 - 缺陷修复 - 修复 Seedance 视频任务轮询鉴权来源：`segments.py` 的 `_resolve_seedance_key` 改为优先读取配置模型中的 `ark_api_key`/`volcengine_ark_api_key`，避免提交成功后轮询阶段因仅依赖 `os.getenv` 导致任务长期停留“生成中”。
+- 2026-04-16 - 风格一致性 - Step4 真人写实首项改为“通用写实风格”并接入统一风格 prompt；新增 `frontend/src/lib/global-style.ts` 统一 Step3/Step4 风格映射；视频生成、视频修改、Step4 首帧生成与 Step3 素材生成统一使用全局风格 prompt，且通过 `storyboard-style-<projectId>` 在 Step3/Step4 联动。
+- 2026-04-16 - 缺陷修复 - 修复 Step4 批量首帧快速通道失败：`linkapi.py` 新增快速通道可重试错误识别（含 HTTP 500/bad_response_body/unexpected end of JSON input），快速通道异常时自动回退常规 Nano Banana 通道；并优化快速通道错误解析，避免前端直接看到截断 JSON 异常。
+- 2026-04-16 - 缺陷修复 - 修复“使用前一条分镜尾帧”在跨表块首行场景下不生效：`ScriptEditor.tsx` 改为基于全局行号计算 previousGlobalRowIndex 并放开可选；`storyboard/page.tsx` 在勾选续接但上一条无可用视频时直接报错，避免静默回退默认首帧。
+- 2026-04-16 - 提示词优化 - 强化 Step4 分镜提示词中“定格画面”硬约束：禁止动态进行描述（如逐渐/远去/起伏/喘息等），必须输出静止终态；并强制补全所有人物、关键道具与场景锚点的前中后景+左右方位+远近层次+遮挡比例+姿势朝向+目光落点+接触关系。
+- 2026-04-16 - 缺陷修复 - 修复生成视频按钮点击报错：`ScriptEditor.tsx` 中 onGenerateKlingRow 误引用未定义变量 previousRow，改为传递 previousGlobalRowIndex。
+- 2026-04-16 - 缺陷修复 - 修复 Step4 Seedance 生成长时间卡住：`segments.py` 增加 Seedance 运行态停滞检测（`updated_at` 长时间不推进自动失败并提示重试），避免前端无限显示生成中。
+- 2026-04-16 - 参数调整 - 将 Seedance 无进展判定默认阈值调整为 240 秒（可由 SEEDANCE_STALL_TIMEOUT_SECONDS 覆盖），缩短“生成中”卡住等待时间。
+- 2026-04-16 - 策略调整 - 按用户要求取消 Seedance 本地超时失败：`segments.py` 移除 Seedance 停滞阈值与超时判定，改为仅在 Seedance 接口明确返回失败/错误时置 FAILED；Kling 仍保留原超时保护。

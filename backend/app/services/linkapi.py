@@ -968,6 +968,29 @@ def _is_retryable_grsai_image_error(exc: BaseException) -> bool:
     return any(m in text for m in markers)
 
 
+def _is_retryable_fast_channel_error(exc: BaseException) -> bool:
+    text = str(exc).strip().lower()
+    if not text:
+        return False
+    markers = (
+        "http 500",
+        "http 502",
+        "http 503",
+        "http 504",
+        "bad_response_body",
+        "unexpected end of json input",
+        "non-json",
+        "empty response",
+        "remoteprotocolerror",
+        "readtimeout",
+        "networkerror",
+        "temporarily",
+        "overload",
+        "try again",
+    )
+    return any(m in text for m in markers)
+
+
 _FAST_CHANNEL_MODEL_MAP: dict[str, str] = {
     "nano-banana-2": "gemini-3.1-flash-image-preview",
     "nano-banana-pro": "gemini-3-pro-image-preview",
@@ -2545,7 +2568,13 @@ async def create_video(
             return text
 
         env_seedance_key = _normalize_seedance_api_key(
-            str(os.getenv("ARK_API_KEY") or os.getenv("VOLCENGINE_ARK_API_KEY") or "")
+            str(
+                getattr(app_settings, "ark_api_key", "")
+                or getattr(app_settings, "volcengine_ark_api_key", "")
+                or os.getenv("ARK_API_KEY")
+                or os.getenv("VOLCENGINE_ARK_API_KEY")
+                or ""
+            )
         )
         configured_seedance_key = _normalize_seedance_api_key(configured_key_normalized)
         seedance_key = env_seedance_key or configured_seedance_key

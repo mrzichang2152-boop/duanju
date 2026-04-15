@@ -304,6 +304,16 @@ const hydrateScriptResponseFromStateUrl = async (payload: ScriptResponse): Promi
   if (!stateUrl) {
     return payload;
   }
+  if (typeof window !== "undefined") {
+    try {
+      const parsed = new URL(stateUrl, window.location.origin);
+      if (parsed.origin !== window.location.origin) {
+        return payload;
+      }
+    } catch {
+      return payload;
+    }
+  }
   try {
     const response = await fetch(stateUrl, { cache: "no-store" });
     if (!response.ok) {
@@ -626,7 +636,7 @@ export type Asset = {
 };
 
 export const getAssets = (token: string, id: string) =>
-  request<Asset[]>(`/projects/${id}/assets?t=${Date.now()}`, { cache: "no-store" }, token);
+  request<Asset[]>(`/projects/${id}/assets?t=${Date.now()}`, { cache: "no-store" }, token, 60000);
 
 export const updateAssetConfig = (
   token: string,
@@ -1157,8 +1167,8 @@ export const generateSegmentFrameImage = (
 
 export const getSegmentFrameImageTaskStatus = (token: string, projectId: string, taskId: string) =>
   request<AsyncTaskStatusResponse>(
-    `/projects/${projectId}/segments/frame-images/tasks/${taskId}`,
-    {},
+    `/projects/${projectId}/segments/frame-images/tasks/${taskId}?t=${Date.now()}`,
+    { cache: "no-store" },
     token
   );
 

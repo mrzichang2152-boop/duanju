@@ -11,6 +11,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_current_user_id
+from app.core.config import settings as app_settings
 from app.core.db import get_db, SessionLocal
 from app.schemas.common import StatusResponse
 from app.schemas.script import AsyncTaskStatusResponse
@@ -59,6 +60,10 @@ _FRAME_TASK_TYPE = "FRAME_GENERATE"
 _SEGMENT_TASK_PROCESSING_TIMEOUT_SECONDS = max(
     300,
     int(str(os.getenv("SEGMENT_TASK_PROCESSING_TIMEOUT_SECONDS", "1800") or "1800").strip() or 1800),
+)
+_FRAME_TASK_STALE_SECONDS = max(
+    300,
+    int(str(os.getenv("FRAME_TASK_STALE_SECONDS", "900") or "900").strip() or 900),
 )
 
 
@@ -140,7 +145,15 @@ async def _resolve_seedance_key(db: AsyncSession, user_id: str) -> str:
             return ""
         return text
 
-    env_key = _normalize_seedance_api_key(str(os.getenv("ARK_API_KEY") or os.getenv("VOLCENGINE_ARK_API_KEY") or ""))
+    env_key = _normalize_seedance_api_key(
+        str(
+            getattr(app_settings, "ark_api_key", "")
+            or getattr(app_settings, "volcengine_ark_api_key", "")
+            or os.getenv("ARK_API_KEY")
+            or os.getenv("VOLCENGINE_ARK_API_KEY")
+            or ""
+        )
+    )
     if env_key:
         return env_key
     configured = _normalize_seedance_api_key(str(await get_api_key(db, user_id) or ""))
@@ -163,9 +176,12 @@ async def _query_seedance_task_status(task_id: str, api_key: str) -> tuple[str, 
         return "FAILED", "", "状态查询返回非 JSON"
     if not isinstance(payload, dict):
         return "FAILED", "", "状态查询返回格式异常"
+
     status_text = str(payload.get("status") or payload.get("task_status") or "").strip().lower()
     task_result = payload.get("task_result") if isinstance(payload.get("task_result"), dict) else {}
     content_obj = payload.get("content") if isinstance(payload.get("content"), dict) else {}
+    error_obj = payload.get("error") if isinstance(payload.get("error"), dict) else {}
+
     video_url = str(content_obj.get("video_url") or "").strip()
     if not video_url:
         videos = task_result.get("videos") if isinstance(task_result.get("videos"), list) else []
@@ -173,12 +189,19 @@ async def _query_seedance_task_status(task_id: str, api_key: str) -> tuple[str, 
             video_url = str(videos[0].get("url") or "").strip()
     if not video_url:
         video_url = str(task_result.get("url") or task_result.get("video_url") or "").strip()
+
     if video_url or status_text in {"succeeded", "success", "completed"}:
         return "COMPLETED", video_url, ""
+
     if status_text in {"failed", "error", "canceled", "cancelled"}:
-        error_obj = payload.get("error") if isinstance(payload.get("error"), dict) else {}
         fail_msg = str(error_obj.get("message") or payload.get("message") or "Seedance 任务失败").strip()
         return "FAILED", "", fail_msg
+
+    if error_obj:
+        fail_msg = str(error_obj.get("message") or payload.get("message") or "Seedance 任务失败").strip()
+        if fail_msg:
+            return "FAILED", "", fail_msg
+
     return "SEEDANCE_PROCESSING", "", ""
 
 
@@ -209,14 +232,11 @@ async def fetch_segments(
             async def check_and_update(v):
                 try:
                     raw_task_id = str(v.task_id or "").strip()
-                    if _is_seedance_task(raw_task_id):
+                    is_seedance = _is_seedance_task(raw_task_id)
+                    if is_seedance:
                         _, tid = raw_task_id.split("|", 1)
                         if not seedance_key:
                             version_status_msg_map[str(v.id)] = "Seedance 鉴权未配置"
-                            if _is_version_processing_timed_out(v):
-                                v.status = "FAILED"
-                                db.add(v)
-                                return True
                             return False
                         new_status, video_url, task_status_msg = await _query_seedance_task_status(tid, seedance_key)
                     else:
@@ -224,7 +244,7 @@ async def fetch_segments(
                         new_status, video_url, task_status_msg = await query_kling_task_status(db, user_id, endpoint, tid)
                     if task_status_msg:
                         version_status_msg_map[str(v.id)] = task_status_msg
-                    if _is_kling_pending_status(new_status) and _is_version_processing_timed_out(v):
+                    if (not is_seedance) and _is_kling_pending_status(new_status) and _is_version_processing_timed_out(v):
                         v.status = "FAILED"
                         version_status_msg_map[str(v.id)] = (
                             f"任务超时：超过 {int(_SEGMENT_TASK_PROCESSING_TIMEOUT_SECONDS // 60)} 分钟仍未完成，请重试"
@@ -245,7 +265,8 @@ async def fetch_segments(
                         return True
                 except Exception:
                     logger.exception("查询视频任务状态异常 version_id=%s", getattr(v, "id", ""))
-                    if _is_version_processing_timed_out(v):
+                    raw_task_id = str(v.task_id or "").strip()
+                    if (not _is_seedance_task(raw_task_id)) and _is_version_processing_timed_out(v):
                         v.status = "FAILED"
                         version_status_msg_map[str(v.id)] = (
                             f"任务超时：状态查询异常且超过 {int(_SEGMENT_TASK_PROCESSING_TIMEOUT_SECONDS // 60)} 分钟，请重试"
@@ -543,11 +564,22 @@ async def get_segment_frame_image_task_status(
     )
     if not task:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="任务不存在")
+
+    status_upper = str(task.status or "PENDING").upper()
+    if status_upper in {"PENDING", "RUNNING"}:
+        now = datetime.utcnow()
+        updated_at = task.updated_at or task.created_at or now
+        stale_seconds = (now - updated_at).total_seconds()
+        if stale_seconds > _FRAME_TASK_STALE_SECONDS:
+            fail_message = "任务状态丢失（服务重启或任务中断），请重新生成"
+            task = await mark_async_task_failed(db, task, fail_message)
+            status_upper = "FAILED"
+
     return AsyncTaskStatusResponse(
         task_id=task.id,
         project_id=project_id,
         task_type=task.task_type,
-        status=str(task.status or "PENDING").upper(),
+        status=status_upper,
         result=parse_task_result(task),
         error=(str(task.error or "").strip() or None),
     )

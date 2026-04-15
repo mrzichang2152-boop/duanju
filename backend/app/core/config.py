@@ -13,6 +13,8 @@ class Settings(BaseSettings):
     foursapi_api_key: str = ""
     suchuang_api_key: str = ""
     grsai_api_key: str = ""
+    ark_api_key: str = ""
+    volcengine_ark_api_key: str = ""
 
     # 腾讯云 COS（可选）：配齐后用户生成的图片/视频等可上传 COS 并返回公网 URL
     tencent_cos_secret_id: str = ""

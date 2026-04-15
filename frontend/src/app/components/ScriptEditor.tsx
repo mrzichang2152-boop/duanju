@@ -2766,9 +2766,10 @@ export function ScriptEditor({
                         const latestVersion = rowVersions[0];
                         const latestStatus = String(latestVersion?.status || "").toUpperCase();
                         const latestFailedMsg = String(latestVersion?.task_status_msg || "").trim();
-                        const previousRow = rowIndex > 0 ? block.rows[rowIndex - 1] : null;
-                        const canUsePreviousEndFrame = Boolean(previousRow);
-                        const defaultUsePreviousEndFrame = isSameSceneAsPreviousRow(block.headers, row, previousRow);
+                        const previousGlobalRowIndex = globalRowIndex > 0 ? globalRowIndex - 1 : undefined;
+                        const previousRowInBlock = rowIndex > 0 ? block.rows[rowIndex - 1] : null;
+                        const canUsePreviousEndFrame = typeof previousGlobalRowIndex === "number" && previousGlobalRowIndex >= 0;
+                        const defaultUsePreviousEndFrame = isSameSceneAsPreviousRow(block.headers, row, previousRowInBlock);
                         const usePreviousEndFrame = Object.prototype.hasOwnProperty.call(usePreviousEndFrameMap, globalRowIndex)
                           ? Boolean(usePreviousEndFrameMap[globalRowIndex])
                           : defaultUsePreviousEndFrame;
@@ -2797,7 +2798,7 @@ export function ScriptEditor({
                                   onClick={() =>
                                     onGenerateKlingRow?.({
                                       globalRowIndex,
-                                      previousGlobalRowIndex: previousRow ? globalRowIndex - 1 : undefined,
+                                      previousGlobalRowIndex,
                                       headers: block.headers,
                                       row: block.headers.map((_, i) => row[i] || ""),
                                       usePreviousSegmentEndFrame: canUsePreviousEndFrame ? usePreviousEndFrame : false,
@@ -3032,7 +3033,7 @@ export function ScriptEditor({
                     onClick={() => insertVideoEditReferenceToken({ assetId: asset.id, name: asset.name, imageUrl: entry.imageUrl, source: "asset" })}
                     className={`overflow-hidden rounded-lg border text-left ${selected ? "border-indigo-500 ring-2 ring-indigo-200" : "border-slate-200"}`}
                   >
-                    <img src={entry.imageUrl} alt={asset.name} className="h-24 w-full object-cover bg-slate-100" />
+                    <img src={entry.imageUrl} alt={asset.name} className="aspect-video w-full object-cover bg-slate-100" />
                     <div className="truncate px-2 py-1 text-xs">{asset.name}</div>
                   </button>
                 );
@@ -3133,7 +3134,7 @@ export function ScriptEditor({
                       onClick={() => setPreviewFrameUrl(entry.imageUrl)}
                       className="block w-full cursor-zoom-in text-left"
                     >
-                      <img src={entry.imageUrl} alt={entry.name} className="h-28 w-full object-cover bg-slate-100" />
+                      <img src={entry.imageUrl} alt={entry.name} className="aspect-video w-full object-cover bg-slate-100" />
                       <div className="truncate px-2 pt-2 text-xs text-slate-700">{entry.name}</div>
                       {entry.description ? <div className="line-clamp-2 px-2 pb-2 text-[11px] text-slate-500">{entry.description}</div> : <div className="px-2 pb-2 text-[11px] text-slate-300">&nbsp;</div>}
                     </button>
@@ -3289,7 +3290,7 @@ export function ScriptEditor({
                               src={imageUrl}
                               alt={FRAME_GENERATE_TAB_META[frameGenerateTab].previewAlt}
                               onClick={() => setPreviewFrameUrl(imageUrl)}
-                              className="h-28 w-full cursor-zoom-in object-cover bg-slate-100"
+                              className="aspect-video w-full cursor-zoom-in object-cover bg-slate-100"
                             />
                             <div className="flex flex-wrap items-center justify-end gap-2 p-2">
                               {frameGenerateTab === "character" ? (
