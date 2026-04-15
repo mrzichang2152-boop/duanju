@@ -1521,3 +1521,4 @@
 - 2026-04-16 - 参数调整 - 将 Seedance 无进展判定默认阈值调整为 240 秒（可由 SEEDANCE_STALL_TIMEOUT_SECONDS 覆盖），缩短“生成中”卡住等待时间。
 - 2026-04-16 - 策略调整 - 按用户要求取消 Seedance 本地超时失败：`segments.py` 移除 Seedance 停滞阈值与超时判定，改为仅在 Seedance 接口明确返回失败/错误时置 FAILED；Kling 仍保留原超时保护。
 - 2026-04-16 - 部署修复 - 去除 `next/font/google` 对 Geist 字体的构建期外网依赖，改为本地系统字体栈，修复测试服 Docker 构建失败（无法访问 fonts.googleapis.com）问题。
+- 2026-04-16 - 缺陷修复 - 补充入库缺失文件 `frontend/src/lib/global-style.ts`，修复服务器 Docker 构建时报错 “Cannot resolve @/lib/global-style”。
