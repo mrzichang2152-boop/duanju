@@ -312,6 +312,36 @@ function escapeRegExp(value: string) {
   return String(value || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
+function normalizeBackendMediaUrl(value: string) {
+  const raw = String(value || "").trim();
+  if (!raw) return "";
+  if (raw.startsWith("data:image")) return raw;
+  if (raw.startsWith("/")) {
+    if (typeof window !== "undefined") {
+      return `${window.location.origin}${raw}`;
+    }
+    const apiBase = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://localhost:3000/api";
+    const backendBase = apiBase.endsWith("/api") ? apiBase.slice(0, -4) : apiBase;
+    return `${backendBase}${raw}`;
+  }
+  if (!/^https?:\/\//i.test(raw)) return raw;
+  try {
+    const parsed = new URL(raw);
+    if (
+      typeof window !== "undefined"
+      && window.location.protocol === "https:"
+      && parsed.protocol === "http:"
+      && parsed.hostname === window.location.hostname
+      && parsed.pathname.startsWith("/static/")
+    ) {
+      return `${window.location.origin}${parsed.pathname}${parsed.search}${parsed.hash}`;
+    }
+  } catch {
+    return raw;
+  }
+  return raw;
+}
+
 const isCompletedVideoVersion = (version: { video_url: string; status: string }) => {
   const status = String(version.status || "").toUpperCase();
   if (!version.video_url) return false;
@@ -1405,28 +1435,22 @@ export function ScriptEditor({
   const resolveAssetImageUrl = useCallback((asset: Asset) => {
     const versions = asset.versions || [];
     const isRemotePublicUrl = (raw: string) => {
-      const url = String(raw || "").trim();
+      const url = normalizeBackendMediaUrl(raw);
       if (!(url.startsWith("http://") || url.startsWith("https://"))) return false;
-      if (
-        url.includes("/static/") &&
-        (url.includes("localhost") || url.includes("127.0.0.1") || url.includes(":8003"))
-      ) {
-        return false;
-      }
       return true;
     };
     const selectedRemote = versions.find(
       (version) => version.is_selected && isRemotePublicUrl(version.image_url || "")
     );
-    if (selectedRemote?.image_url) return String(selectedRemote.image_url).trim();
+    if (selectedRemote?.image_url) return normalizeBackendMediaUrl(String(selectedRemote.image_url).trim());
     const latestRemote = [...versions]
       .reverse()
       .find((version) => isRemotePublicUrl(version.image_url || ""));
-    if (latestRemote?.image_url) return String(latestRemote.image_url).trim();
+    if (latestRemote?.image_url) return normalizeBackendMediaUrl(String(latestRemote.image_url).trim());
     const selectedAny = versions.find((version) => version.is_selected && version.image_url);
-    if (selectedAny?.image_url) return String(selectedAny.image_url).trim();
+    if (selectedAny?.image_url) return normalizeBackendMediaUrl(String(selectedAny.image_url).trim());
     const fallbackAny = versions.find((version) => Boolean(version.image_url));
-    return String(fallbackAny?.image_url || "").trim();
+    return normalizeBackendMediaUrl(String(fallbackAny?.image_url || "").trim());
   }, []);
 
   const resolveAssetType = useCallback((asset: Asset): FrameMaterialTab | null => {
@@ -1502,14 +1526,18 @@ export function ScriptEditor({
           const currentValue = String(row[colIndex] || "");
           const blocksInCell = currentValue.match(materialBlockRegex) || [];
           blocksInCell.forEach((blockText) => {
-            const imageUrl = String(blockText.match(/!\[[^\]]*\]\(([^)]+)\)/)?.[1] || "").trim();
-            if (!imageUrl) return;
+            const rawImageUrl = String(blockText.match(/!\[[^\]]*\]\(([^)]+)\)/)?.[1] || "").trim();
+            if (!rawImageUrl) return;
+            const imageUrl = normalizeBackendMediaUrl(rawImageUrl);
             const materialTypeText = String(blockText.match(/素材类型\s*[：:]\s*([^\n]+)/)?.[1] || "").trim();
             const materialName = String(blockText.match(/素材名\s*[：:]\s*([^\n]+)/)?.[1] || "").trim();
             const materialDescription = String(blockText.match(/素材描述\s*[：:]\s*([^\n]+)/)?.[1] || "").trim();
             const baseCharacterName = String(blockText.match(/基础角色\s*[：:]\s*([^\n]+)/)?.[1] || "").trim();
-            const matchedAsset = (projectAssets || []).find((asset) => resolveAssetImageUrl(asset) === imageUrl);
-            const matchedMeta = frameGeneratedMetaMap[imageUrl];
+            const matchedAsset = (projectAssets || []).find((asset) => {
+              const resolvedAssetImageUrl = resolveAssetImageUrl(asset);
+              return resolvedAssetImageUrl === imageUrl || resolvedAssetImageUrl === rawImageUrl;
+            });
+            const matchedMeta = frameGeneratedMetaMap[rawImageUrl] || frameGeneratedMetaMap[imageUrl];
             const parsedTab = materialTypeText ? resolveFrameMaterialTabFromHeader(materialTypeText) : currentTab;
             appendEntry(parsedTab, {
               id: matchedAsset?.id || `script:${parsedTab}:${imageUrl}:${scriptMaterialIndex}`,
@@ -1539,8 +1567,9 @@ export function ScriptEditor({
       });
       orderedRows.forEach(([rowKey, imageList]) => {
         const ownerRowIndex = Number(rowKey);
-        imageList.forEach((imageUrl, index) => {
-          const meta = frameGeneratedMetaMap[imageUrl];
+        imageList.forEach((rawImageUrl, index) => {
+          const imageUrl = normalizeBackendMediaUrl(rawImageUrl);
+          const meta = frameGeneratedMetaMap[rawImageUrl] || frameGeneratedMetaMap[imageUrl];
           appendEntry(tab, {
             id: `generated:${tab}:${imageUrl}`,
             name: meta?.name || `${FRAME_MATERIAL_TAB_LABEL[tab]}${index + 1}`,
@@ -1563,7 +1592,7 @@ export function ScriptEditor({
         id: entry.id,
         name: entry.name,
         description: String(entry.description || "").trim(),
-        imageUrl: String(entry.imageUrl || "").trim(),
+        imageUrl: normalizeBackendMediaUrl(String(entry.imageUrl || "").trim()),
         source: "generated",
       });
     });
@@ -3726,9 +3755,9 @@ function TableCell({
   const resolveAssetImageUrl = React.useCallback((asset: Asset) => {
     const versions = asset.versions || [];
     const selectedVersion = versions.find((v) => v.is_selected && Boolean((v.image_url || "").trim()));
-    if (selectedVersion?.image_url) return String(selectedVersion.image_url).trim();
+    if (selectedVersion?.image_url) return normalizeBackendMediaUrl(String(selectedVersion.image_url).trim());
     const latestVersion = [...versions].reverse().find((v) => Boolean((v.image_url || "").trim()));
-    if (latestVersion?.image_url) return String(latestVersion.image_url).trim();
+    if (latestVersion?.image_url) return normalizeBackendMediaUrl(String(latestVersion.image_url).trim());
     return "";
   }, []);
 

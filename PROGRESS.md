@@ -1492,3 +1492,8 @@
 - 2026-04-13 - 验证 - `ScriptEditor.tsx` 与 `storyboard/page.tsx` lints 均为 0；执行 `cd /Users/wrf/Documents/视频生成/frontend && npm run dev` 启动成功，分镜页路由返回 200。
 - 2026-04-13 - 修复 - `ScriptEditor.tsx` 修正素材管理“创建素材”生成回写逻辑：生成成功后改为写入草稿展示区（`appendDraftFrameImage`），解决生成完成后不展示图片的问题。
 - 2026-04-13 - 验证 - `ScriptEditor.tsx` lints 为 0；执行 `cd /Users/wrf/Documents/视频生成/frontend && npm run dev` 启动成功，分镜页路由返回 200。
+- 2026-04-13 - 修复 - 远端构建阻塞修复：`frontend/src/app/components/ScriptEditor.tsx` 补齐 `ScriptEditorProps` 的 `globalStyleName/globalStylePromptText/onOpenStyleSelector` 类型声明，解决测试机前端镜像构建 TypeScript 报错。
+- 2026-04-13 - 发布 - 使用 `duanjutest.pem` 将当前 `V1.0` 最新代码（git archive）同步到 `81.70.235.208:/home/ubuntu/video_gen_app`，并执行 `sudo docker compose up -d --build backend frontend nginx` 完成前后端联合发布。
+- 2026-04-13 - 验证 - 测试机容器 `duanju-backend-1/duanju-frontend-1/duanju-nginx-1` 均为 Up；`http://81.70.235.208:8003/health` 返回 `{"status":"ok"}`；`http://81.70.235.208` 返回 200。
+- 2026-04-15 - 修复 - `ScriptEditor.tsx` 新增 `normalizeBackendMediaUrl` 并统一用于素材管理 URL 解析（资产版本/剧本内嵌图片/历史生成图/外部首帧），将同域 `http://...:8003/static/...` 转为当前 `https` 域名资源，修复测试环境素材在 HTTPS 页面下被混合内容拦截导致不显示。
+- 2026-04-15 - 验证 - `ScriptEditor.tsx` lints 为 0；执行 `cd frontend && npm run dev` 启动成功；`/projects/755d8b41-39da-4632-aceb-23a20f2694fe/script/storyboard` 返回 200。
