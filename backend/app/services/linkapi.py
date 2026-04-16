@@ -1134,6 +1134,12 @@ async def _create_image_via_fast_channel(
                 b64_data = str(inline_data.get("data") or "").strip()
                 mime_type = str(inline_data.get("mimeType") or "image/jpeg").strip() or "image/jpeg"
                 if b64_data:
+                    try:
+                        raw_image = base64.b64decode(b64_data, validate=False)
+                    except Exception as exc:
+                        raise RuntimeError(f"快速通道返回图片解码失败：{exc}") from exc
+                    if len(raw_image) < 1024:
+                        raise RuntimeError("快速通道返回无效图片数据：图片数据异常")
                     return {"data": [{"url": f"data:{mime_type};base64,{b64_data}"}]}
 
     raise RuntimeError("快速通道未返回图片数据")
@@ -1211,9 +1217,25 @@ async def create_image(
         "on",
     }
     if quick_channel:
-        return await _create_image_via_fast_channel(
-            session, user_id, prompt, resolved_references, model=raw_model_for_channel
-        )
+        fast_channel_error: Optional[BaseException] = None
+        for attempt in range(2):
+            try:
+                return await _create_image_via_fast_channel(
+                    session, user_id, prompt, resolved_references, model=raw_model_for_channel
+                )
+            except Exception as exc:
+                fast_channel_error = exc
+                if not _is_retryable_fast_channel_error(exc):
+                    raise
+                logger.warning(
+                    "快速通道生成失败，准备重试或降级（attempt=%s/2）: %s",
+                    attempt + 1,
+                    exc,
+                )
+                if attempt < 1:
+                    await asyncio.sleep(0.8)
+        if fast_channel_error is not None:
+            logger.warning("快速通道连续失败，自动降级普通通道继续生成: %s", fast_channel_error)
 
     ratio = _resolve_image_aspect_ratio(payload) or "auto"
     raw_model_str = str(payload.get("model") or "").strip()
@@ -2464,7 +2486,10 @@ async def create_video(
     system_prompt = str(payload.get("system_prompt", "") or "").strip()
     raw_sound = str(payload.get("sound") or "").strip().lower()
     with_audio_requested = bool(payload.get("with_audio", False))
-    require_character_voice = with_audio_requested or raw_sound == "on"
+    skip_voice_reference_audio = bool(
+        payload.get("skip_voice_reference_audio", False) or payload.get("skipVoiceReferenceAudio", False)
+    )
+    require_character_voice = (with_audio_requested or raw_sound == "on") and (not skip_voice_reference_audio)
     default_kling_endpoint = "https://api-beijing.klingai.com/v1/videos/omni-video"
     if is_kling_model:
         if "kling-v1" in model_text_lower:
@@ -2976,11 +3001,16 @@ async def create_video(
                     if character_name:
                         missing_audio_names.append(character_name)
                 dedup_missing_audio_names = list(dict.fromkeys([name for name in missing_audio_names if name]))
-                if dedup_missing_audio_names:
+                if dedup_missing_audio_names and require_character_voice:
                     raise RuntimeError(
                         "Seedance 角色有声视频缺少对应角色音频："
                         + "、".join(dedup_missing_audio_names[:5])
                         + "。请先为对应基础角色上传音频；若当前角色形象是历史生成结果，请重新应用一次角色形象素材后再生成视频。"
+                    )
+                if dedup_missing_audio_names and skip_voice_reference_audio:
+                    logger.warning(
+                        "Seedance 有声生成已跳过角色音频引用，缺失角色=%s",
+                        "、".join(dedup_missing_audio_names[:8]),
                     )
 
             raw_reference_images = payload.get("reference_images")

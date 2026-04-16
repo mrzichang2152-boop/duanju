@@ -1522,3 +1522,10 @@
 - 2026-04-16 - 策略调整 - 按用户要求取消 Seedance 本地超时失败：`segments.py` 移除 Seedance 停滞阈值与超时判定，改为仅在 Seedance 接口明确返回失败/错误时置 FAILED；Kling 仍保留原超时保护。
 - 2026-04-16 - 部署修复 - 去除 `next/font/google` 对 Geist 字体的构建期外网依赖，改为本地系统字体栈，修复测试服 Docker 构建失败（无法访问 fonts.googleapis.com）问题。
 - 2026-04-16 - 缺陷修复 - 补充入库缺失文件 `frontend/src/lib/global-style.ts`，修复服务器 Docker 构建时报错 “Cannot resolve @/lib/global-style”。
+- 2026-04-16 - 测试环境运维 - 在测试服 81.70.235.208 创建账号 `zhang@yuki.com`（若存在则重置密码），并验证 `/api/auth/login` 登录成功。
+- 2026-04-16 - 缺陷修复 - Step4 批量首帧：后端 `linkapi.py` 增加快速通道失败重试与自动降级普通通道，处理 `HTTP 500 bad_response_body` 并补充异常图片数据校验，减少首帧生成失败与白图异常。
+- 2026-04-16 - 缺陷修复 - Step4 批量首帧弹窗：`storyboard/page.tsx` 改为关闭弹窗不清空批量任务会话，并将任务结果按分镜持久化，支持关闭弹窗后任务继续执行与回显。
+- 2026-04-16 - 缺陷修复 - 补充首帧快速通道容错：`linkapi.py` 对 quick channel 增加 2 次重试，失败后自动降级普通通道；并对返回图片字节做基础有效性校验，规避异常空白图。
+- 2026-04-16 - 缺陷修复 - Step4 Seedance 有声生成：`storyboard/page.tsx` 调整为“继续生成（跳过角色音频引用）”时仍保持 `with_audio=true`，并透传 `skip_voice_reference_audio`。
+- 2026-04-16 - 缺陷修复 - Seedance 后端容错：`linkapi.py` 支持 `skip_voice_reference_audio`，在未配置 Step3 音色时允许继续有声生成（不注入角色参考音频），不再强制降为无声。
+- 2026-04-16 - 缺陷修复 - 补充 Step4 有声参数透传：确保 `skip_voice_reference_audio` 已从前端传至后端并生效，避免“继续生成”误转无声。

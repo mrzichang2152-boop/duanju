@@ -947,6 +947,7 @@ export default function ScriptStoryboardPage() {
   const [customStoryboardPrompt, setCustomStoryboardPrompt] = useState("");
   const [customPromptSubmittingEpisodeIndex, setCustomPromptSubmittingEpisodeIndex] = useState<number | null>(null);
   const [batchFirstFrameModalEpisodeIndex, setBatchFirstFrameModalEpisodeIndex] = useState<number | null>(null);
+  const [batchFirstFrameSessionEpisodeIndex, setBatchFirstFrameSessionEpisodeIndex] = useState<number | null>(null);
   const [batchFirstFrameActiveTabIndex, setBatchFirstFrameActiveTabIndex] = useState(0);
   const [batchFirstFrameItems, setBatchFirstFrameItems] = useState<BatchFirstFrameItem[]>([]);
   const [batchFirstFrameModel, setBatchFirstFrameModel] = useState("nano-banana-2");
@@ -962,6 +963,7 @@ export default function ScriptStoryboardPage() {
   const lastSavedContentRef = useRef("");
   const lastSavedStoryboardRef = useRef("");
   const lastSavedEpisodesRef = useRef<Episode[]>([]);
+  const batchFirstFrameSessionEpisodeRef = useRef<number | null>(null);
   const hydratingRef = useRef(false);
   const storyboardPollTimerRef = useRef<NodeJS.Timeout | null>(null);
   const storyboardStartInFlightRef = useRef<Set<number>>(new Set());
@@ -1865,6 +1867,11 @@ export default function ScriptStoryboardPage() {
   const getBatchPersistItemKey = (episodeIndex: number, rowIndex: number) => `${episodeIndex}:${rowIndex}`;
 
   const openBatchFirstFrameModal = (episodeIndex: number) => {
+    if (batchFirstFrameSessionEpisodeIndex === episodeIndex && batchFirstFrameItems.length > 0) {
+      batchFirstFrameSessionEpisodeRef.current = episodeIndex;
+      setBatchFirstFrameModalEpisodeIndex(episodeIndex);
+      return;
+    }
     const episode = episodes[episodeIndex];
     if (!episode) return;
     const context = parseEpisodeTableContext(String(episode.storyboard || ""));
@@ -1910,6 +1917,8 @@ export default function ScriptStoryboardPage() {
       };
     });
     setBatchFirstFrameItems(initialItems);
+    setBatchFirstFrameSessionEpisodeIndex(episodeIndex);
+    batchFirstFrameSessionEpisodeRef.current = episodeIndex;
     setBatchFirstFrameModalEpisodeIndex(episodeIndex);
     setBatchFirstFrameActiveTabIndex(0);
     setBatchFirstFrameMaterialTab("first");
@@ -1917,8 +1926,6 @@ export default function ScriptStoryboardPage() {
 
   const closeBatchFirstFrameModal = () => {
     setBatchFirstFrameModalEpisodeIndex(null);
-    setBatchFirstFrameItems([]);
-    setBatchFirstFrameActiveTabIndex(0);
     setBatchFirstFrameShowAllPreview(false);
     setBatchImagePreviewUrl(null);
   };
@@ -2111,7 +2118,8 @@ export default function ScriptStoryboardPage() {
   };
 
   const handleBatchGenerateFirstFrame = async (tabIndex: number) => {
-    if (!projectId || batchFirstFrameModalEpisodeIndex === null) return;
+    const targetEpisodeIndex = batchFirstFrameSessionEpisodeIndex ?? batchFirstFrameModalEpisodeIndex;
+    if (!projectId || targetEpisodeIndex === null) return;
     const token = getToken();
     if (!token) return;
     const targetItem = batchFirstFrameItems[tabIndex];
@@ -2158,12 +2166,33 @@ export default function ScriptStoryboardPage() {
       });
       const imageUrl = await waitForBatchFirstFrameTask(task.task_id);
       const nextImages = Array.from(new Set([...(targetItem.generatedImages || []), imageUrl]));
+
+      const persistMap = readBatchFirstFramePersist(projectId);
+      const persistKey = getBatchPersistItemKey(targetEpisodeIndex, targetItem.rowIndex);
+      const existingPersist = persistMap[persistKey];
+      persistMap[persistKey] = {
+        prompt: String(targetItem.prompt || ""),
+        generatedImages: Array.from(new Set([...(existingPersist?.generatedImages || []), ...nextImages].map((url) => String(url || "").trim()).filter(Boolean))),
+        appliedImageUrl: String(existingPersist?.appliedImageUrl || targetItem.appliedImageUrl || "").trim() || undefined,
+        scriptAppliedImageUrl: String(existingPersist?.scriptAppliedImageUrl || targetItem.scriptAppliedImageUrl || "").trim() || undefined,
+        references: Array.from(new Set([...(existingPersist?.references || []), ...references].map((url) => String(url || "").trim()).filter(Boolean))),
+      };
+      writeBatchFirstFramePersist(projectId, persistMap);
+
+      if (batchFirstFrameSessionEpisodeRef.current !== targetEpisodeIndex) {
+        setMessage(`${targetItem.tabLabel} 首帧图后台生成完成`);
+        return;
+      }
       setBatchFirstFrameItems((prev) => prev.map((item, index) => (
         index === tabIndex ? { ...item, status: "success", generatedImages: nextImages, error: "" } : item
       )));
       setMessage(`已生成 ${targetItem.tabLabel} 首帧图`);
     } catch (error) {
       const errorMsg = error instanceof Error ? error.message : "生成失败";
+      if (batchFirstFrameSessionEpisodeRef.current !== targetEpisodeIndex) {
+        setMessage(`${targetItem.tabLabel} 首帧图后台任务失败：${errorMsg}`);
+        return;
+      }
       setBatchFirstFrameItems((prev) => prev.map((item, index) => (
         index === tabIndex ? { ...item, status: "failed", error: errorMsg } : item
       )));
@@ -2286,7 +2315,7 @@ export default function ScriptStoryboardPage() {
       const duration = normalizeKlingDuration(totalDurationSeconds);
       const modelToUse = resolveStep4VideoModel(selectedVideoModel);
       requestedWithAudio = videoAudioMode === "with_audio";
-      const withAudio = skipVoiceReferenceAudio ? false : requestedWithAudio;
+      const withAudio = requestedWithAudio;
       const targetRowIndex = globalRowIndex;
       pendingRowIndex = targetRowIndex;
       setSeedanceMissingVoicePrompt(null);
@@ -2406,6 +2435,7 @@ export default function ScriptStoryboardPage() {
         aspect_ratio: videoAspectRatio,
         with_audio: withAudio,
         sound: withAudio ? "on" : "off",
+        skip_voice_reference_audio: Boolean(skipVoiceReferenceAudio),
         system_prompt: systemPrompt,
       };
       if (usePreviousTailFrame) {
@@ -2751,10 +2781,10 @@ export default function ScriptStoryboardPage() {
   const currentBatchPromptAssetIds = useMemo(() => extractAssetTokensFromCell(currentBatchItem?.prompt || ""), [currentBatchItem?.prompt]);
 
   useEffect(() => {
-    if (!projectId || batchFirstFrameModalEpisodeIndex === null) return;
+    if (!projectId || batchFirstFrameSessionEpisodeIndex === null) return;
     const persist = readBatchFirstFramePersist(projectId);
     batchFirstFrameItems.forEach((item) => {
-      const key = getBatchPersistItemKey(batchFirstFrameModalEpisodeIndex, item.rowIndex);
+      const key = getBatchPersistItemKey(batchFirstFrameSessionEpisodeIndex, item.rowIndex);
       persist[key] = {
         prompt: String(item.prompt || ""),
         generatedImages: Array.from(new Set((item.generatedImages || []).map((url) => String(url || "").trim()).filter(Boolean))),
@@ -2764,7 +2794,7 @@ export default function ScriptStoryboardPage() {
       };
     });
     writeBatchFirstFramePersist(projectId, persist);
-  }, [projectId, batchFirstFrameItems, batchFirstFrameModalEpisodeIndex]);
+  }, [projectId, batchFirstFrameItems, batchFirstFrameSessionEpisodeIndex]);
 
   const serializeBatchPromptEditor = (editor: HTMLDivElement) => {
     const cloned = editor.cloneNode(true) as HTMLDivElement;
@@ -2812,12 +2842,12 @@ export default function ScriptStoryboardPage() {
     if (trailingText) editor.appendChild(document.createTextNode(trailingText));
   }, [currentBatchItem?.prompt, projectAssets]);
   const batchSyntheticFirstFrameAssets = useMemo(() => {
-    if (batchFirstFrameModalEpisodeIndex === null) return [] as Asset[];
+    if (batchFirstFrameSessionEpisodeIndex === null) return [] as Asset[];
     return batchFirstFrameItems
       .map((item, index) => {
         const imageUrl = String(item.appliedImageUrl || "").trim();
         if (!imageUrl) return null;
-        const syntheticId = `batch-first-frame:${batchFirstFrameModalEpisodeIndex}:${item.rowIndex}`;
+        const syntheticId = `batch-first-frame:${batchFirstFrameSessionEpisodeIndex}:${item.rowIndex}`;
         const name = `${item.tabLabel || `分镜${index + 1}`}首帧`;
         const description = removeAssetTokensFromText(item.prompt || "") || null;
         return {
@@ -2833,7 +2863,7 @@ export default function ScriptStoryboardPage() {
         } as Asset;
       })
       .filter((item): item is Asset => Boolean(item));
-  }, [batchFirstFrameItems, batchFirstFrameModalEpisodeIndex]);
+  }, [batchFirstFrameItems, batchFirstFrameSessionEpisodeIndex]);
 
   const batchMaterialAssets = useMemo(() => {
     const merged: Asset[] = [];
@@ -2867,7 +2897,7 @@ export default function ScriptStoryboardPage() {
       }
     });
     return Array.from(merged.values());
-  }, [projectId, batchFirstFrameItems, batchFirstFrameModalEpisodeIndex]);
+  }, [projectId, batchFirstFrameItems, batchFirstFrameSessionEpisodeIndex]);
 
   const batchAllPreviewEntries = useMemo(
     () => batchFirstFrameItems.map((item, index) => ({
