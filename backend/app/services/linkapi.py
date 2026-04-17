@@ -987,6 +987,9 @@ def _is_retryable_fast_channel_error(exc: BaseException) -> bool:
         "temporarily",
         "overload",
         "try again",
+        "http 429",
+        "quota exceeded",
+        "too many requests",
     )
     return any(m in text for m in markers)
 
@@ -1235,6 +1238,9 @@ async def create_image(
                 if attempt < 1:
                     await asyncio.sleep(0.8)
         if fast_channel_error is not None:
+            # 如果是限流错误，不再自动降级，而是直接抛出给用户，以便用户知晓额度情况
+            if "429" in str(fast_channel_error) or "quota" in str(fast_channel_error).lower():
+                raise fast_channel_error
             logger.warning("快速通道连续失败，自动降级普通通道继续生成: %s", fast_channel_error)
 
     ratio = _resolve_image_aspect_ratio(payload) or "auto"

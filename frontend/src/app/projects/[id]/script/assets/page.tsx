@@ -22,7 +22,6 @@ import {
 import { extractDrawModels } from "@/lib/models";
 import { getToken } from "@/lib/auth";
 import { VoiceSelector } from "@/app/components/VoiceSelector";
-import { applyTemplate } from "@/lib/templates";
 import { DEFAULT_GLOBAL_STYLE, DIRECTOR_STYLE_OPTIONS, STEP3_STYLE_OPTIONS, getGlobalStylePrompt } from "@/lib/global-style";
 
 const normalizeRoleKey = (name: string) => {
@@ -318,9 +317,6 @@ export default function AssetsPage() {
     hint: string;
   } | null>(null);
   const uploadInputRef = useRef<HTMLInputElement | null>(null);
-  const defaultTemplate =
-    "为{{type_cn}} {{name}} 生成高质量、写实风格的参考图，包含细节描述、风格、光照与色调。{{description}}";
-
   const getAssetTypeLabel = useCallback((assetType: string) => {
     if (assetType === "CHARACTER") {
       return "角色";
@@ -342,25 +338,6 @@ export default function AssetsPage() {
     []
   );
 
-  const renderAssetTemplate = useCallback(
-    (template: string, asset: Asset) =>
-      applyTemplate(template, {
-        name: getAssetDisplayName(asset.name),
-        type: asset.type,
-        type_cn: getAssetTypeLabel(asset.type),
-        description: asset.description ?? "",
-      }),
-    [getAssetTypeLabel]
-  );
-
-  const buildCharacterPrompt = useCallback((description?: string | null) => {
-    return description?.trim() || "";
-  }, []);
-
-  const buildCharacterLookPrompt = useCallback((description?: string | null) => {
-    return description?.trim() || "";
-  }, []);
-
   const loadAssets = useCallback(async (opts?: { preserveError?: boolean }) => {
     if (!projectId) {
       return;
@@ -381,21 +358,17 @@ export default function AssetsPage() {
       setAssetPrompts((prev) => {
         const next = { ...prev };
         result.forEach((asset) => {
-          if (asset.prompt) {
+          // 如果后端已经有显式保存的 prompt（不包含 null 或 undefined），则始终使用后端值
+          if (asset.prompt !== null && asset.prompt !== undefined) {
             next[asset.id] = asset.prompt;
-          } else {
-            const current = next[asset.id];
-            if (!current || !current.trim()) {
-              if (asset.type === "CHARACTER") {
-                const characterPrompt = buildCharacterPrompt(asset.description);
-                next[asset.id] = characterPrompt || renderAssetTemplate(defaultTemplate, asset);
-              } else if (asset.type === "CHARACTER_LOOK") {
-                const lookPrompt = buildCharacterLookPrompt(asset.description);
-                next[asset.id] = lookPrompt || renderAssetTemplate(defaultTemplate, asset);
-              } else {
-                next[asset.id] = renderAssetTemplate(defaultTemplate, asset);
-              }
-            }
+          } 
+          // 只有当本地状态没有该素材的 prompt，且后端也没有 prompt 时，才使用 description 兜底
+          else if (next[asset.id] === undefined && asset.description) {
+            next[asset.id] = asset.description.trim();
+          } 
+          // 其他情况保留本地状态或兜底为空
+          else {
+            next[asset.id] = next[asset.id] ?? "";
           }
         });
         return next;
@@ -442,14 +415,7 @@ export default function AssetsPage() {
       setAssetsLoadFailed(true);
       setError(errorMessage);
     }
-  }, [
-    buildCharacterLookPrompt,
-    buildCharacterPrompt,
-    defaultTemplate,
-    projectId,
-    redirectToProjectsOnMissing,
-    renderAssetTemplate,
-  ]);
+  }, [projectId, redirectToProjectsOnMissing]);
 
   useEffect(() => {
     void loadAssets();
@@ -631,8 +597,7 @@ export default function AssetsPage() {
     );
 
     let shouldClearPending = false;
-    const selectedStyleName = String(globalStyle || DEFAULT_GLOBAL_STYLE).trim();
-    const stylePromptText = getGlobalStylePrompt(selectedStyleName);
+    const selectedStyleName = String(assetStyles[activeAssetId] || globalStyle || DEFAULT_GLOBAL_STYLE).trim();
     const resolvedBackendStyle = STEP3_STYLE_OPTIONS.includes(selectedStyleName as (typeof STEP3_STYLE_OPTIONS)[number])
       ? selectedStyleName
       : "真人电影写实";
@@ -674,9 +639,8 @@ export default function AssetsPage() {
           // 否则仍提交当前参考地址，由后端结合 PUBLIC_BASE_URL 解析 /static 与 data 图
         }
         const modificationBasePrompt = String(modificationPrompt || "").trim();
-        const modificationPromptWithStyle = [stylePromptText, modificationBasePrompt].filter(Boolean).join("\n\n");
         const task = await generateAsset(token, projectId, activeAssetId, {
-          prompt: modificationPromptWithStyle || undefined,
+          prompt: modificationBasePrompt || undefined,
           model: assetModels[activeAssetId] || undefined,
           ref_image_url: refImageUrl,
           style: resolvedBackendStyle,
@@ -717,9 +681,13 @@ export default function AssetsPage() {
         }
 
         const baseAssetPrompt = String(assetPrompts[activeAssetId] || "").trim();
-        const assetPromptWithStyle = [stylePromptText, baseAssetPrompt].filter(Boolean).join("\n\n");
+        if (!baseAssetPrompt) {
+          setError("请输入生成描述后再点击“生成素材”");
+          setStatus(null);
+          return;
+        }
         const task = await generateAsset(token, projectId, activeAssetId, {
-          prompt: assetPromptWithStyle || undefined,
+          prompt: baseAssetPrompt || undefined,
           model: assetModels[activeAssetId] || undefined,
           ref_image_url: refImageUrl,
           style: resolvedBackendStyle,

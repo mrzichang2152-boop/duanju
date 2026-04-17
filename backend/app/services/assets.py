@@ -823,10 +823,13 @@ async def extract_assets_from_script(
                         type="CHARACTER",
                         name=name,
                         description=desc,
+                        prompt=desc,  # 默认将描述填充为提示词
                     )
                 )
             elif incoming_desc and not latest_desc:
                 latest_asset.description = desc
+                if not latest_asset.prompt:
+                    latest_asset.prompt = desc
         else:
             assets.append(
                 Asset(
@@ -834,6 +837,7 @@ async def extract_assets_from_script(
                     type="CHARACTER",
                     name=name,
                     description=desc,
+                    prompt=desc,  # 默认将描述填充为提示词
                 )
             )
 
@@ -866,10 +870,13 @@ async def extract_assets_from_script(
                         type="CHARACTER_LOOK",
                         name=look_name,
                         description=full_desc,
+                        prompt=full_desc,  # 默认将描述填充为提示词
                     )
                 )
             elif incoming_desc and not latest_desc:
                 latest_asset.description = full_desc
+                if not latest_asset.prompt:
+                    latest_asset.prompt = full_desc
         else:
             assets.append(
                 Asset(
@@ -877,6 +884,7 @@ async def extract_assets_from_script(
                     type="CHARACTER_LOOK",
                     name=look_name,
                     description=full_desc,
+                    prompt=full_desc,  # 默认将描述填充为提示词
                 )
             )
 
@@ -904,10 +912,13 @@ async def extract_assets_from_script(
                         type="PROP",
                         name=name,
                         description=desc,
+                        prompt=desc,  # 默认将描述填充为提示词
                     )
                 )
             elif incoming_desc and not latest_desc:
                 latest_asset.description = desc
+                if not latest_asset.prompt:
+                    latest_asset.prompt = desc
         else:
             assets.append(
                 Asset(
@@ -915,6 +926,7 @@ async def extract_assets_from_script(
                     type="PROP",
                     name=name,
                     description=desc,
+                    prompt=desc,  # 默认将描述填充为提示词
                 )
             )
 
@@ -942,10 +954,13 @@ async def extract_assets_from_script(
                         type="SCENE",
                         name=name,
                         description=desc,
+                        prompt=desc,  # 默认将描述填充为提示词
                     )
                 )
             elif incoming_desc and not latest_desc:
                 latest_asset.description = desc
+                if not latest_asset.prompt:
+                    latest_asset.prompt = desc
         else:
             assets.append(
                 Asset(
@@ -953,6 +968,7 @@ async def extract_assets_from_script(
                     type="SCENE",
                     name=name,
                     description=desc,
+                    prompt=desc,  # 默认将描述填充为提示词
                 )
             )
 

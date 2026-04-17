@@ -465,12 +465,8 @@ async def _generate_asset_sync(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="未配置腾讯云 COS，已禁止将生成图片落盘到服务器",
         )
-    if payload.prompt:
-        prompt = payload.prompt
-    else:
-        prompt = f"{asset.type}:{asset.name}"
-        if asset.description:
-            prompt = f"{prompt}，{asset.description}"
+    user_prompt = str(payload.prompt or "").strip()
+    prompt = user_prompt
     
     request_payload = payload.options.copy() if payload.options else {}
     # 透传前端 model，由 linkapi.create_image 映射为 GRSAI draw 文档中的合法 model
@@ -561,7 +557,7 @@ async def _generate_asset_sync(
     selected_style_name = payload.style or "真人电影写实"
     logger.info(f"Asset Generation: Asset={asset.name} ({asset.type}), Style={selected_style_name}, PayloadStyle={payload.style}")
     
-    selected_style = next((p for p in style_prompts if p["style"] == selected_style_name), None)
+    selected_style = next((p for p in style_prompts if p.get("style") == selected_style_name), None)
     if not selected_style and style_prompts:
         logger.warning(f"Style '{selected_style_name}' not found in prompts. Defaulting to first style.")
         selected_style = style_prompts[0]
@@ -569,11 +565,15 @@ async def _generate_asset_sync(
     style_system_prompt = ""
     if selected_style:
         if asset.type in ["CHARACTER", "CHARACTER_LOOK"]:
-            style_system_prompt = selected_style.get("character_prompt", "")
+            style_system_prompt = str(selected_style.get("character_prompt", "") or "").strip()
         elif asset.type == "PROP":
-            style_system_prompt = selected_style.get("prop_prompt", "")
+            style_system_prompt = str(selected_style.get("prop_prompt", "") or "").strip()
         elif asset.type == "SCENE":
-            style_system_prompt = selected_style.get("scene_front_view", "")
+            style_system_prompt = str(
+                selected_style.get("scene_front_view")
+                or selected_style.get("scene_prompt")
+                or ""
+            ).strip()
     
     logger.info(f"Selected Style Prompt: {style_system_prompt[:50]}...")
     
@@ -621,7 +621,6 @@ async def _generate_asset_sync(
                     break
             ref_image_url = selected_url
 
-        base_desc = next((item.description for item in base_assets if item.description), "")
         if not ref_image_url:
             logger.warning(f"No reference image found for role: {role_name}")
             raise HTTPException(
@@ -642,37 +641,15 @@ async def _generate_asset_sync(
         if asset.type == "CHARACTER_LOOK":
             logger.info(f"Found reference image for {role_name}: {ref_image_url}")
 
-    if asset.type == "CHARACTER_LOOK":
-        if not payload.prompt:
-            look_desc = asset.description or ""
-            parts = [
-                style_system_prompt,
-                "在同一角色基础上生成新的形象。",
-                f"角色描述：{base_desc}" if base_desc else "",
-                f"形象要求：{look_desc}" if look_desc else "",
-            ]
-            prompt = " ".join(part for part in parts if part)
-        else:
-            prompt = f"{style_system_prompt}, {payload.prompt}"
+    # 按类型拼接：仅系统风格词 + 输入框 prompt（不再注入角色描述/模板默认词）
+    if not user_prompt:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="请输入生成描述后再点击“生成素材”",
+        )
 
-    # Special handling for CHARACTER prompt suffix
-    elif asset.type == "CHARACTER":
-        if not payload.prompt:
-            prompt = f"{style_system_prompt}, {asset.name}, {asset.description or ''}"
-        else:
-            prompt = f"{style_system_prompt}, {payload.prompt}"
-
-    elif asset.type == "PROP":
-        if not payload.prompt:
-            prompt = f"{style_system_prompt}, {asset.name}, {asset.description or ''}"
-        else:
-            prompt = f"{style_system_prompt}, {payload.prompt}"
-            
-    elif asset.type == "SCENE":
-        if not payload.prompt:
-            prompt = f"{style_system_prompt}, {asset.name}, {asset.description or ''}"
-        else:
-            prompt = f"{style_system_prompt}, {payload.prompt}"
+    if asset.type in {"CHARACTER", "CHARACTER_LOOK", "PROP", "SCENE"}:
+        prompt = ", ".join(part for part in [style_system_prompt, user_prompt] if part)
 
     # Sanitize prompt to remove potential control characters
     if prompt:

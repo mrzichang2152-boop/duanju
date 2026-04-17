@@ -1529,3 +1529,11 @@
 - 2026-04-16 - 缺陷修复 - Step4 Seedance 有声生成：`storyboard/page.tsx` 调整为“继续生成（跳过角色音频引用）”时仍保持 `with_audio=true`，并透传 `skip_voice_reference_audio`。
 - 2026-04-16 - 缺陷修复 - Seedance 后端容错：`linkapi.py` 支持 `skip_voice_reference_audio`，在未配置 Step3 音色时允许继续有声生成（不注入角色参考音频），不再强制降为无声。
 - 2026-04-16 - 缺陷修复 - 补充 Step4 有声参数透传：确保 `skip_voice_reference_audio` 已从前端传至后端并生效，避免“继续生成”误转无声。
+- 2026-04-17 - 缺陷修复 - Step3 素材生成提示词生效修复：`assets/page.tsx` 改为仅透传用户输入提示词，移除前端重复拼接风格长文；并按素材维度读取风格（优先 `assetStyles`）。
+- 2026-04-17 - 缺陷修复 - Step3 快速通道 429 限流优化：识别 `HTTP 429` / `Quota Exceeded` 错误，实现自动跳过重试并降级至普通通道生成。
+- 2026-04-17 - 体验优化 - 前端错误提示：针对快速通道限流提供更友好的中文提示，引导用户手动切换通道或等待。
+- 2026-04-17 - 验证 - 检查后端 `linkapi.py` 逻辑正确。
+- 2026-04-17 - 缺陷修复 - Step3 提示词拼接收敛：前端 `assets/page.tsx` 取消自动用角色描述/模板预填 prompt，改为仅使用用户输入框内容；并在空输入时阻止提交生成，避免“输入无关图”。
+- 2026-04-17 - 缺陷修复 - Step3 后端强约束：`api/assets.py` 统一按“类型风格系统词 + 输入框 prompt”组装（CHARACTER/CHARACTER_LOOK/PROP/SCENE），移除角色形象在空 prompt 时自动注入角色描述逻辑；补充空 prompt 400 提示。
+- 2026-04-17 - 验证 - 执行 `npm run dev`（修复并清理 Next dev 锁冲突后可正常 Ready）、`npm run lint && npm run typecheck`、`python3 -m compileall backend/app/api/assets.py` 均通过（lint 仅历史 warning）。
+- 2026-04-17 - 部署 - 将代码推送至 Git 分支 `V1.0` 并同步部署至测试环境 `81.70.235.208`。

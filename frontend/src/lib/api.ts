@@ -15,6 +15,13 @@ const formatApiErrorDetail = (detail: ApiError["detail"]) => {
     return null;
   }
   if (typeof detail === "string") {
+    const lowerDetail = detail.toLowerCase();
+    if (lowerDetail.includes("429") || lowerDetail.includes("quota exceeded") || lowerDetail.includes("too many requests")) {
+      if (lowerDetail.includes("快速通道")) {
+        return "快速通道生成服务限流（Gemini 额度已达上限），请尝试关闭“快速通道”后再次生成，或等待一段时间后重试。";
+      }
+      return "生成服务限流中，请稍后再试。";
+    }
     return detail;
   }
   if (Array.isArray(detail)) {

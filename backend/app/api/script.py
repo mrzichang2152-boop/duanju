@@ -279,6 +279,102 @@ def _normalize_mode_model(mode: str, model: Optional[str]) -> str:
     return _OPENROUTER_TEXT_MODEL
 
 
+def _is_upstream_rate_limited(message: str) -> bool:
+    text = str(message or "").strip().lower()
+    if not text:
+        return False
+    return (
+        "http 429" in text
+        or " 429 " in f" {text} "
+        or "quota exceeded" in text
+        or "request limit per minute" in text
+        or "rate limit" in text
+        or "too many requests" in text
+    )
+
+
+async def _collect_storyboard_stream_output(
+    session: AsyncSession,
+    user_id: str,
+    model: str,
+    attempt_user_prompt: str,
+    temperature: float,
+) -> tuple[str, str]:
+    content_chunks: list[str] = []
+    reasoning_chunks: list[str] = []
+    async for chunk in create_chat_completion_stream(
+        session,
+        user_id,
+        {
+            "model": model,
+            "messages": [
+                {"role": "system", "content": PROMPT_STORYBOARD},
+                {"role": "user", "content": attempt_user_prompt},
+            ],
+            "temperature": temperature,
+            "max_tokens": 120000,
+            "thinking": {"type": "disabled"},
+        },
+    ):
+        if isinstance(chunk, str):
+            if chunk.startswith("Error:"):
+                raise RuntimeError(chunk[6:].strip() or "分镜生成失败")
+            continue
+        if not isinstance(chunk, dict):
+            continue
+        choices = chunk.get("choices") if isinstance(chunk, dict) else None
+        if not choices:
+            continue
+        first_choice = choices[0] if isinstance(choices[0], dict) else {}
+        delta = first_choice.get("delta") if isinstance(first_choice, dict) else None
+        piece = None
+        reason_piece = None
+        if isinstance(delta, dict):
+            piece = delta.get("content")
+            reason_piece = delta.get("reasoning_content")
+        if isinstance(first_choice.get("message"), dict):
+            msg_obj = first_choice.get("message")
+            if not piece:
+                piece = msg_obj.get("content")
+            if not reason_piece:
+                reason_piece = msg_obj.get("reasoning_content")
+        if piece:
+            content_chunks.append(str(piece))
+        if reason_piece:
+            reasoning_chunks.append(str(reason_piece))
+    return "".join(content_chunks), "".join(reasoning_chunks)
+
+
+async def _collect_storyboard_stream_output_with_retry(
+    session: AsyncSession,
+    user_id: str,
+    model: str,
+    attempt_user_prompt: str,
+    temperature: float,
+    max_retries: int = 3,
+) -> tuple[str, str]:
+    retries = max(1, int(max_retries))
+    for index in range(retries):
+        try:
+            return await _collect_storyboard_stream_output(session, user_id, model, attempt_user_prompt, temperature)
+        except Exception as exc:
+            if not _is_upstream_rate_limited(str(exc)):
+                raise
+            if index >= retries - 1:
+                raise RuntimeError(f"分镜生成失败：上游限流（429），请稍后重试。原始错误：{exc}") from exc
+            delay_seconds = min(12, 2 * (index + 1))
+            logger.warning(
+                "Storyboard rate limit, retrying task user=%s attempt=%s/%s delay=%ss error=%s",
+                user_id,
+                index + 1,
+                retries,
+                delay_seconds,
+                str(exc)[:300],
+            )
+            await asyncio.sleep(delay_seconds)
+    raise RuntimeError("分镜生成失败：上游限流（429），请稍后重试")
+
+
 def _cn_numeral_to_int(raw: str) -> Optional[int]:
     text = str(raw or "").strip()
     if not text:
@@ -879,51 +975,15 @@ async def _run_storyboard_task(task_id: str) -> None:
                         "禁止输出解释、思考、过程描述、标题、段落、代码块标记。"
                     )
                 attempt_user_prompt = f"{user_prompt}{retry_tip}"
-                content_chunks: list[str] = []
-                reasoning_chunks: list[str] = []
-                async for chunk in create_chat_completion_stream(
+                request_temperature = 0.2 if attempt == 0 else 0.1
+                raw_content, raw_reasoning = await _collect_storyboard_stream_output_with_retry(
                     session,
-                    task["user_id"],
-                    {
-                        "model": task["model"],
-                        "messages": [
-                            {"role": "system", "content": PROMPT_STORYBOARD},
-                            {"role": "user", "content": attempt_user_prompt},
-                        ],
-                        "temperature": 0.2 if attempt == 0 else 0.1,
-                        "max_tokens": 120000,
-                        "thinking": {"type": "disabled"},
-                    },
-                ):
-                    if isinstance(chunk, str):
-                        if chunk.startswith("Error:"):
-                            raise RuntimeError(chunk[6:].strip() or "分镜生成失败")
-                        continue
-                    if not isinstance(chunk, dict):
-                        continue
-                    choices = chunk.get("choices") if isinstance(chunk, dict) else None
-                    if not choices:
-                        continue
-                    first_choice = choices[0] if isinstance(choices[0], dict) else {}
-                    delta = first_choice.get("delta") if isinstance(first_choice, dict) else None
-                    piece = None
-                    reason_piece = None
-                    if isinstance(delta, dict):
-                        piece = delta.get("content")
-                        reason_piece = delta.get("reasoning_content")
-                    if isinstance(first_choice.get("message"), dict):
-                        msg_obj = first_choice.get("message")
-                        if not piece:
-                            piece = msg_obj.get("content")
-                        if not reason_piece:
-                            reason_piece = msg_obj.get("reasoning_content")
-                    if piece:
-                        content_chunks.append(str(piece))
-                    if reason_piece:
-                        reasoning_chunks.append(str(reason_piece))
-
-                raw_content = "".join(content_chunks)
-                raw_reasoning = "".join(reasoning_chunks)
+                    str(task["user_id"]),
+                    str(task["model"]),
+                    attempt_user_prompt,
+                    temperature=request_temperature,
+                    max_retries=3,
+                )
                 thinking_candidate = _extract_storyboard_thinking_text(raw_content, raw_reasoning)
                 generated_candidate = _sanitize_storyboard_markdown(raw_content)
                 if (not generated_candidate or not _contains_markdown_table(generated_candidate)) and thinking_candidate:
