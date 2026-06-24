@@ -129,13 +129,26 @@ const LEGACY_KLING_COLUMN = "Kling视频生成";
 const STEP4_VIDEO_MODEL_OPTIONS = [
   { value: "klingv3omni", label: "Kling v3 Omni" },
   { value: "seedance2.0", label: "Seedance 2.0" },
+  { value: "seedance2.0fast", label: "Seedance 2.0 Fast" },
 ] as const;
 const MAX_VIDEO_REFERENCE_IMAGES = 8;
 type Step4VideoModel = (typeof STEP4_VIDEO_MODEL_OPTIONS)[number]["value"];
 
+function isStep4SeedanceVideoModel(model: Step4VideoModel): boolean {
+  return model === "seedance2.0" || model === "seedance2.0fast";
+}
+
 function resolveStep4VideoModel(model: Step4VideoModel): string {
   if (model === "klingv3omni") return "kling-v3-omni";
+  if (model === "seedance2.0fast") return "doubao-seedance-2-0-fast-260128";
   return "doubao-seedance-2-0-260128";
+}
+
+const STEP4_VIDEO_EDIT_MODEL = "doubao-seedance-2-0-260128";
+
+function normalizeSeedanceEditDuration(rawDuration: number): number {
+  const rounded = Math.round(Number(rawDuration) || 0);
+  return Math.max(4, Math.min(15, rounded || 5));
 }
 
 function isSeedanceMissingVoiceErrorMessage(message: string): boolean {
@@ -950,9 +963,8 @@ export default function ScriptStoryboardPage() {
   const [batchFirstFrameSessionEpisodeIndex, setBatchFirstFrameSessionEpisodeIndex] = useState<number | null>(null);
   const [batchFirstFrameActiveTabIndex, setBatchFirstFrameActiveTabIndex] = useState(0);
   const [batchFirstFrameItems, setBatchFirstFrameItems] = useState<BatchFirstFrameItem[]>([]);
-  const [batchFirstFrameModel, setBatchFirstFrameModel] = useState("nano-banana-2");
+  const [batchFirstFrameModel, setBatchFirstFrameModel] = useState("gpt-image-2");
   const [batchFirstFrameAspectRatio, setBatchFirstFrameAspectRatio] = useState<"9:16" | "3:4" | "1:1" | "4:3" | "16:9">("16:9");
-  const [batchFirstFrameQuickChannel, setBatchFirstFrameQuickChannel] = useState(false);
   const [batchFirstFrameMaterialTab, setBatchFirstFrameMaterialTab] = useState<BatchFirstFrameMaterialTab>("first");
   const [batchFirstFrameShowAllPreview, setBatchFirstFrameShowAllPreview] = useState(false);
   const [batchImagePreviewUrl, setBatchImagePreviewUrl] = useState<string | null>(null);
@@ -1100,7 +1112,7 @@ export default function ScriptStoryboardPage() {
     if (!projectId) return;
     const key = `storyboard-video-model-${projectId}`;
     const saved = localStorage.getItem(key);
-    if (saved === "klingv3omni" || saved === "seedance2.0") {
+    if (saved === "klingv3omni" || saved === "seedance2.0" || saved === "seedance2.0fast") {
       setSelectedVideoModel(saved);
     }
   }, [projectId]);
@@ -2162,7 +2174,6 @@ export default function ScriptStoryboardPage() {
         frame_type: "first",
         aspect_ratio: batchFirstFrameAspectRatio,
         model: batchFirstFrameModel,
-        quick_channel: batchFirstFrameQuickChannel,
       });
       const imageUrl = await waitForBatchFirstFrameTask(task.task_id);
       const nextImages = Array.from(new Set([...(targetItem.generatedImages || []), imageUrl]));
@@ -2483,7 +2494,7 @@ export default function ScriptStoryboardPage() {
         });
       }
       const text = error instanceof Error ? error.message : "视频生成失败";
-      if (!skipVoiceReferenceAudio && requestedWithAudio && selectedVideoModel === "seedance2.0" && isSeedanceMissingVoiceErrorMessage(text)) {
+      if (!skipVoiceReferenceAudio && requestedWithAudio && isStep4SeedanceVideoModel(selectedVideoModel) && isSeedanceMissingVoiceErrorMessage(text)) {
         const roleNamesText = extractSeedanceMissingVoiceRoleNames(text);
         setSeedanceMissingVoicePrompt({
           roleNamesText,
@@ -2511,6 +2522,7 @@ export default function ScriptStoryboardPage() {
     headers,
     row,
     currentVideoUrl,
+    currentVideoDurationSeconds,
     instruction,
     referenceImageUrls,
     keepOriginalSound,
@@ -2519,6 +2531,7 @@ export default function ScriptStoryboardPage() {
     headers: string[];
     row: string[];
     currentVideoUrl: string;
+    currentVideoDurationSeconds: number;
     instruction: string;
     referenceImageUrls: string[];
     keepOriginalSound: boolean;
@@ -2612,26 +2625,31 @@ export default function ScriptStoryboardPage() {
       ].join("\n");
 
       const references = Array.from(new Set(referenceImageUrls.map((item) => String(item || "").trim()).filter(Boolean))).slice(0, 4);
+      const editDuration = normalizeSeedanceEditDuration(currentVideoDurationSeconds);
       const prompt = [
-        "请基于<<<video_1>>>对当前分镜视频做定向修改。",
+        "请基于当前提供的参考视频，对当前分镜视频做定向修改。",
+        "保持原视频的主体身份、镜头顺序、动作衔接与叙事时序连续，不要改成全新视频。",
         "【字段定义】",
         ...rowFieldMeaningLines,
         "【字段取值】",
         ...rowFieldValueLines,
         "【用户修改要求】",
         instruction,
+        keepOriginalSound
+          ? "【音频要求】尽量延续参考视频原有对白节奏、环境氛围与声音感觉；若模型无法完全保留原声，以画面修改准确性优先。"
+          : "【音频要求】无需保留原视频原声，可按当前分镜内容重新生成或保持静音。",
       ].join("\n");
 
-      const modelToUse = resolveStep4VideoModel(selectedVideoModel);
       const withAudio = videoAudioMode === "with_audio";
       await generateSegment(token, projectId, {
         segment_id: segment.id,
         prompt,
-        model: modelToUse,
+        model: STEP4_VIDEO_EDIT_MODEL,
         options: {
-          model: modelToUse,
+          model: STEP4_VIDEO_EDIT_MODEL,
           mode: videoResolution === "1080p" ? "pro" : "std",
           aspect_ratio: videoAspectRatio,
+          duration: editDuration,
           with_audio: withAudio,
           sound: withAudio ? "on" : "off",
           system_prompt: systemPrompt,
@@ -3551,19 +3569,9 @@ export default function ScriptStoryboardPage() {
                               onChange={(e) => setBatchFirstFrameModel(e.target.value)}
                               className="rounded border border-slate-300 bg-white px-2 py-1 text-xs text-slate-700"
                             >
-                              <option value="nano-banana-2">nano-banana-2</option>
-                              <option value="nano-banana-pro">nano-banana-pro</option>
+                              <option value="gpt-image-2">gpt-image-2</option>
                             </select>
                           </div>
-                          <label className="inline-flex items-center gap-2 text-xs text-slate-600">
-                            <input
-                              type="checkbox"
-                              checked={batchFirstFrameQuickChannel}
-                              onChange={(e) => setBatchFirstFrameQuickChannel(e.target.checked)}
-                              className="h-3.5 w-3.5 rounded border-slate-300"
-                            />
-                            快速通道
-                          </label>
                           <div className="flex items-center gap-2 text-xs text-slate-600">
                             <span>风格</span>
                             <button

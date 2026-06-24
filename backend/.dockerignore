@@ -1,0 +1,11 @@
+.env
+.pytest_cache
+__pycache__/
+*.pyc
+*.pyo
+*.sqlite3
+*.db
+venv/
+venv311/
+static/
+app/static/

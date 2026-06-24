@@ -28,6 +28,16 @@ export default function TopNav() {
   }, []);
 
   const initial = useMemo(() => buildInitial(email), [email]);
+  const isAdmin = useMemo(() => {
+    const normalized = String(email || "").trim().toLowerCase();
+    const raw = String(process.env.NEXT_PUBLIC_ADMIN_EMAILS || "");
+    const adminEmails = raw
+      .split(",")
+      .map((item) => item.trim().toLowerCase())
+      .filter(Boolean);
+    if (adminEmails.length === 0) return false;
+    return adminEmails.includes(normalized);
+  }, [email]);
 
   const logout = () => {
     clearToken();
@@ -49,6 +59,14 @@ export default function TopNav() {
           </div>
           <div className="pointer-events-none absolute right-0 top-8 pt-2 opacity-0 transition-opacity group-hover:pointer-events-auto group-hover:opacity-100">
             <div className="min-w-[120px] rounded-lg border border-slate-200 bg-white py-2 text-sm text-slate-700 shadow-sm">
+              <a href="/usage" className="block px-3 py-1 hover:bg-slate-50">
+                我的用量
+              </a>
+              {isAdmin ? (
+                <a href="/admin/usage" className="block px-3 py-1 hover:bg-slate-50">
+                  管理后台
+                </a>
+              ) : null}
               <a href="/settings" className="block px-3 py-1 hover:bg-slate-50">
                 设置
               </a>

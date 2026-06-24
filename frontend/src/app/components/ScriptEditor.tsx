@@ -38,6 +38,7 @@ interface ScriptEditorProps {
     headers: string[];
     row: string[];
     currentVideoUrl: string;
+    currentVideoDurationSeconds: number;
     instruction: string;
     referenceImageUrls: string[];
     keepOriginalSound: boolean;
@@ -199,7 +200,7 @@ const VOICE_TAG_GROUPS: VoiceTagGroup[] = [
 const KLING_COLUMN = "生成视频";
 const LEGACY_KLING_COLUMN = "Kling视频生成";
 const STORYBOARD_SYSTEM_COLUMNS = ["场景", "道具", "远景位置关系图", "首帧图片", KLING_COLUMN] as const;
-const FRAME_DEFAULT_IMAGE_MODEL = "nano-banana-2";
+const FRAME_DEFAULT_IMAGE_MODEL = "gpt-image-2";
 const getFrameStateStorageKey = (projectId: string) => `script_editor_frame_state_v2:${projectId}`;
 const FRAME_STATE_UPDATED_EVENT = "script-editor-frame-state-updated";
 const FRAME_PENDING_MAX_AGE_MS = 30 * 60 * 1000;
@@ -498,6 +499,7 @@ export function ScriptEditor({
   const [videoEditTab, setVideoEditTab] = useState<FrameMaterialTab>("character");
   const [videoEditReferences, setVideoEditReferences] = useState<FrameReference[]>([]);
   const [videoEditPromptInput, setVideoEditPromptInput] = useState("");
+  const [videoEditDurationSeconds, setVideoEditDurationSeconds] = useState(0);
   const [videoEditKeepOriginalSound, setVideoEditKeepOriginalSound] = useState(true);
   const [videoEditError, setVideoEditError] = useState("");
   const [frameModalRowIndex, setFrameModalRowIndex] = useState<number | null>(null);
@@ -513,7 +515,6 @@ export function ScriptEditor({
   const [frameGeneratingType, setFrameGeneratingType] = useState<FrameGenerationTab | null>(null);
   const [frameImageModels, setFrameImageModels] = useState<string[]>([FRAME_DEFAULT_IMAGE_MODEL]);
   const [frameImageModel, setFrameImageModel] = useState(FRAME_DEFAULT_IMAGE_MODEL);
-  const [frameQuickChannel, setFrameQuickChannel] = useState(false);
   const [frameCharacterImageMap, setFrameCharacterImageMap] = useState<Record<number, string[]>>({});
   const [frameFirstImageMap, setFrameFirstImageMap] = useState<Record<number, string[]>>({});
   const [frameLastImageMap, setFrameLastImageMap] = useState<Record<number, string[]>>({});
@@ -1792,12 +1793,13 @@ export function ScriptEditor({
   const openVideoEditModal = async (globalRowIndex: number, currentVideoUrl: string) => {
     try {
       const duration = await readVideoDurationSeconds(currentVideoUrl);
-      if (duration < 3 || duration > 10) {
-        window.alert(`当前视频时长为 ${duration.toFixed(1)}s，仅支持修改 3-10s 的视频。`);
+      if (duration < 4 || duration > 15) {
+        window.alert(`当前视频时长为 ${duration.toFixed(1)}s，仅支持修改 4-15s 的视频。`);
         return;
       }
+      setVideoEditDurationSeconds(duration);
     } catch {
-      window.alert("无法读取当前视频时长，仅支持修改 3-10s 的视频。");
+      window.alert("无法读取当前视频时长，仅支持修改 4-15s 的视频。");
       return;
     }
     setVideoEditModalRowIndex(globalRowIndex);
@@ -1817,6 +1819,7 @@ export function ScriptEditor({
   const closeVideoEditModal = () => {
     setVideoEditModalRowIndex(null);
     setVideoEditCurrentUrl("");
+    setVideoEditDurationSeconds(0);
     setVideoEditReferences([]);
     setVideoEditPromptInput("");
     setVideoEditError("");
@@ -1857,6 +1860,7 @@ export function ScriptEditor({
       headers,
       row,
       currentVideoUrl: videoEditCurrentUrl,
+      currentVideoDurationSeconds: videoEditDurationSeconds,
       instruction,
       referenceImageUrls: references,
       keepOriginalSound: videoEditKeepOriginalSound,
@@ -2084,7 +2088,6 @@ export function ScriptEditor({
         frame_type: frameType,
         aspect_ratio: "16:9",
         model: frameImageModel,
-        quick_channel: frameQuickChannel,
       });
       const generated = await waitForFrameTask(task.task_id);
       appendDraftFrameImage(rowIndex, frameType, generated, {
@@ -2597,7 +2600,6 @@ export function ScriptEditor({
         frame_type: editTarget.frameType,
         aspect_ratio: "16:9",
         model: frameImageModel,
-        quick_channel: frameQuickChannel,
       });
       const generated = await waitForFrameTask(task.task_id);
       appendDraftFrameImage(rowIndex, editTarget.frameType, generated, {
@@ -3206,15 +3208,6 @@ export function ScriptEditor({
                             </option>
                           ))}
                         </select>
-                      </label>
-                      <label className="ml-1 inline-flex items-center gap-1 text-xs text-slate-600">
-                        <input
-                          type="checkbox"
-                          checked={frameQuickChannel}
-                          onChange={(event) => setFrameQuickChannel(event.target.checked)}
-                          className="h-3.5 w-3.5"
-                        />
-                        快速通道
                       </label>
                       <div className="ml-1 flex items-center gap-1 text-xs text-slate-600">
                         <span>风格</span>

@@ -747,6 +747,35 @@ def _probe_has_audio_stream(path: str) -> bool:
         return False
 
 
+def _write_concat_file(concat_txt_path: str, paths: list[str]) -> None:
+    concat_lines: list[str] = []
+    for path in paths:
+        escaped_path = path.replace("'", "'\\''")
+        concat_lines.append(f"file '{escaped_path}'")
+    with open(concat_txt_path, "w", encoding="utf-8") as file:
+        file.write("\n".join(concat_lines))
+
+
+def _concat_videos_with_stream_copy(concat_txt_path: str, output_path: str) -> Optional[str]:
+    return _run_subprocess_detail(
+        [
+            "ffmpeg",
+            "-f",
+            "concat",
+            "-safe",
+            "0",
+            "-i",
+            concat_txt_path,
+            "-c",
+            "copy",
+            "-movflags",
+            "+faststart",
+            "-y",
+            output_path,
+        ]
+    )
+
+
 def _should_rebuild_merged_cache(merged_path: str, clip_urls: list[str]) -> bool:
     if not os.path.exists(merged_path) or os.path.getsize(merged_path) <= 0:
         return True
@@ -915,10 +944,17 @@ async def _read_metadata(project_id: str, job_id: str) -> dict[str, Any]:
 
 
 def _merge_local_videos(temp_dir: str, local_paths: list[str], output_path: str) -> None:
+    direct_concat_txt_path = os.path.join(temp_dir, "concat_original.txt")
+    _write_concat_file(direct_concat_txt_path, local_paths)
+    direct_copy_error = _concat_videos_with_stream_copy(direct_concat_txt_path, output_path)
+    if direct_copy_error is None and os.path.exists(output_path) and os.path.getsize(output_path) > 0:
+        return
+
     normalized_paths: list[str] = []
     for index, path in enumerate(local_paths, start=1):
         normalized_path = os.path.join(temp_dir, f"normalized_{index:03d}.mp4")
         if _probe_has_audio_stream(path):
+            # 优先保留原始视频与音频流，避免“合并前先压一遍”导致清晰度下降。
             _run_subprocess(
                 [
                     "ffmpeg",
@@ -929,19 +965,9 @@ def _merge_local_videos(temp_dir: str, local_paths: list[str], output_path: str)
                     "-map",
                     "0:a:0",
                     "-c:v",
-                    "libx264",
-                    "-preset",
-                    "veryfast",
-                    "-crf",
-                    "23",
-                    "-pix_fmt",
-                    "yuv420p",
+                    "copy",
                     "-c:a",
-                    "aac",
-                    "-ac",
-                    "1",
-                    "-ar",
-                    "44100",
+                    "copy",
                     "-movflags",
                     "+faststart",
                     "-y",
@@ -964,19 +990,15 @@ def _merge_local_videos(temp_dir: str, local_paths: list[str], output_path: str)
                     "-map",
                     "1:a:0",
                     "-c:v",
-                    "libx264",
-                    "-preset",
-                    "veryfast",
-                    "-crf",
-                    "23",
-                    "-pix_fmt",
-                    "yuv420p",
+                    "copy",
                     "-c:a",
                     "aac",
+                    "-b:a",
+                    "192k",
                     "-ac",
-                    "1",
+                    "2",
                     "-ar",
-                    "44100",
+                    "48000",
                     "-shortest",
                     "-movflags",
                     "+faststart",
@@ -986,13 +1008,12 @@ def _merge_local_videos(temp_dir: str, local_paths: list[str], output_path: str)
                 "补齐静音轨失败",
             )
         normalized_paths.append(normalized_path)
-    concat_txt_path = os.path.join(temp_dir, "concat.txt")
-    concat_lines: list[str] = []
-    for path in normalized_paths:
-        escaped_path = path.replace("'", "'\\''")
-        concat_lines.append(f"file '{escaped_path}'")
-    with open(concat_txt_path, "w", encoding="utf-8") as file:
-        file.write("\n".join(concat_lines))
+    concat_txt_path = os.path.join(temp_dir, "concat_normalized.txt")
+    _write_concat_file(concat_txt_path, normalized_paths)
+    normalized_copy_error = _concat_videos_with_stream_copy(concat_txt_path, output_path)
+    if normalized_copy_error is None and os.path.exists(output_path) and os.path.getsize(output_path) > 0:
+        return
+
     encode_cmd = [
         "ffmpeg",
         "-f",
@@ -1004,17 +1025,19 @@ def _merge_local_videos(temp_dir: str, local_paths: list[str], output_path: str)
         "-c:v",
         "libx264",
         "-preset",
-        "veryfast",
+        "medium",
         "-crf",
-        "23",
+        "17",
         "-pix_fmt",
         "yuv420p",
         "-c:a",
         "aac",
+        "-b:a",
+        "192k",
         "-ac",
-        "1",
+        "2",
         "-ar",
-        "44100",
+        "48000",
         "-movflags",
         "+faststart",
         "-y",
@@ -1026,7 +1049,13 @@ def _merge_local_videos(temp_dir: str, local_paths: list[str], output_path: str)
             stderr_text = str(encode_result.stderr or "").strip()
             lines = [line.strip() for line in stderr_text.splitlines() if line.strip()]
             detail = lines[-1] if lines else "命令执行失败"
-            raise RuntimeError(f"合并失败：{detail[:300]}")
+            extra_details = []
+            if direct_copy_error:
+                extra_details.append(f"原片直拷贝失败：{direct_copy_error}")
+            if normalized_copy_error:
+                extra_details.append(f"规范化后直拷贝失败：{normalized_copy_error}")
+            merged_detail = " | ".join([*extra_details, f"重编码失败：{detail[:300]}"])
+            raise RuntimeError(f"合并失败：{merged_detail[:500]}")
     except FileNotFoundError:
         raise RuntimeError("合并失败：找不到 ffmpeg 命令")
 
@@ -1164,7 +1193,6 @@ async def merge_episode_download(
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="视频地址格式不合法")
 
     temp_dir = tempfile.mkdtemp(prefix="episode_merge_")
-    concat_txt_path = os.path.join(temp_dir, "concat.txt")
     output_path = os.path.join(temp_dir, "output.mp4")
     try:
         local_paths: list[str] = []
@@ -1173,13 +1201,6 @@ async def merge_episode_download(
             await _download_video(url, local_path)
             local_paths.append(local_path)
 
-        concat_lines: list[str] = []
-        for path in local_paths:
-            escaped_path = path.replace("'", "'\\''")
-            concat_lines.append(f"file '{escaped_path}'")
-        async with aiofiles.open(concat_txt_path, "w", encoding="utf-8") as file:
-            await file.write("\n".join(concat_lines))
-
         try:
             probe = await asyncio.to_thread(subprocess.run, ["ffmpeg", "-version"], capture_output=True, text=True)
             if probe.returncode != 0:
@@ -1187,56 +1208,7 @@ async def merge_episode_download(
         except FileNotFoundError:
             raise RuntimeError("系统未安装 ffmpeg 或未配置环境变量")
 
-        copy_cmd = [
-            "ffmpeg",
-            "-f",
-            "concat",
-            "-safe",
-            "0",
-            "-i",
-            concat_txt_path,
-            "-c",
-            "copy",
-            "-movflags",
-            "+faststart",
-            "-y",
-            output_path,
-        ]
-        try:
-            copy_result = await asyncio.to_thread(subprocess.run, copy_cmd, capture_output=True, text=True)
-        except FileNotFoundError:
-            raise RuntimeError("找不到 ffmpeg 命令")
-        if copy_result.returncode != 0:
-            encode_cmd = [
-                "ffmpeg",
-                "-f",
-                "concat",
-                "-safe",
-                "0",
-                "-i",
-                concat_txt_path,
-                "-c:v",
-                "libx264",
-                "-preset",
-                "veryfast",
-                "-crf",
-                "23",
-                "-c:a",
-                "aac",
-                "-movflags",
-                "+faststart",
-                "-y",
-                output_path,
-            ]
-            try:
-                encode_result = await asyncio.to_thread(subprocess.run, encode_cmd, capture_output=True, text=True)
-                if encode_result.returncode != 0:
-                    stderr_text = str(encode_result.stderr or copy_result.stderr or "").strip()
-                    lines = [line.strip() for line in stderr_text.splitlines() if line.strip()]
-                    detail = lines[-1] if lines else "命令执行失败"
-                    raise RuntimeError(f"合并失败：{detail[:300]}")
-            except FileNotFoundError:
-                raise RuntimeError("找不到 ffmpeg 命令")
+        await asyncio.to_thread(_merge_local_videos, temp_dir, local_paths, output_path)
 
         if not os.path.exists(output_path) or os.path.getsize(output_path) <= 0:
             raise RuntimeError("合并失败：未生成有效视频文件")

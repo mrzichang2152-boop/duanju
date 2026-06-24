@@ -54,7 +54,7 @@ from app.services.async_tasks import (
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
-OPENROUTER_IMAGE_MODEL = "nano-banana-2"
+OPENROUTER_IMAGE_MODEL = "gpt-image-2"
 _GEMINI_REFERENCE_IMAGE_LIMIT = 16
 _FRAME_TASK_TYPE = "FRAME_GENERATE"
 _SEGMENT_TASK_PROCESSING_TIMEOUT_SECONDS = max(
@@ -386,8 +386,24 @@ async def generate_segments(
         if video_url:
             video_url = await media_storage.mirror_http_url_to_cos(project_id, "segment_videos", video_url, strict=True)
 
+        raw_duration = request_payload.get("duration")
+        duration_seconds = None
+        try:
+            parsed_duration = float(raw_duration) if raw_duration is not None else None
+            if parsed_duration and parsed_duration > 0:
+                duration_seconds = parsed_duration
+        except Exception:
+            duration_seconds = None
         version_status = "PROCESSING" if not video_url and task_id else "COMPLETED"
-        await create_segment_version(db, target.id, video_url, prompt, task_id=task_id, status=version_status)
+        await create_segment_version(
+            db,
+            target.id,
+            video_url,
+            prompt,
+            task_id=task_id,
+            duration_seconds=duration_seconds,
+            status=version_status,
+        )
         return StatusResponse(status="ready")
     except HTTPException:
         raise

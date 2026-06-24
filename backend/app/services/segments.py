@@ -218,14 +218,26 @@ async def sync_segments_with_script(session: AsyncSession, project_id: str) -> l
 
 
 async def create_segment_version(
-    session: AsyncSession, segment_id: str, video_url: str, prompt: Optional[str] = None, task_id: Optional[str] = None, status: str = "COMPLETED"
+    session: AsyncSession,
+    segment_id: str,
+    video_url: str,
+    prompt: Optional[str] = None,
+    task_id: Optional[str] = None,
+    duration_seconds: Optional[float] = None,
+    status: str = "COMPLETED",
 ) -> SegmentVersion:
     result = await session.execute(select(SegmentVersion).where(SegmentVersion.segment_id == segment_id))
     existing_versions = list(result.scalars().all())
     for existing in existing_versions:
         existing.is_selected = False
     version = SegmentVersion(
-        segment_id=segment_id, video_url=video_url, prompt=prompt, task_id=task_id, status=status, is_selected=True
+        segment_id=segment_id,
+        video_url=video_url,
+        prompt=prompt,
+        task_id=task_id,
+        duration_seconds=duration_seconds,
+        status=status,
+        is_selected=True,
     )
     session.add(version)
     await session.commit()

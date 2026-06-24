@@ -3,7 +3,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_current_user_id
 from app.core.db import get_db
+from app.schemas.admin import UsageSelfResponse, UsageSummaryResponse
 from app.schemas.settings import SettingsResponse, SettingsUpdate
+from app.services.admin_stats import get_current_user_usage, get_usage_summary
 from app.services.settings import get_or_create_settings, update_settings
 
 router = APIRouter()
@@ -49,3 +51,19 @@ async def save_settings(
         allow_sync=settings.allow_sync,
         has_key=bool(settings.api_key_encrypted),
     )
+
+
+@router.get("/usage-summary", response_model=UsageSelfResponse)
+async def fetch_current_user_usage_summary(
+    user_id: str = Depends(get_current_user_id),
+    db: AsyncSession = Depends(get_db),
+) -> UsageSelfResponse:
+    return await get_current_user_usage(db, user_id)
+
+
+@router.get("/admin/usage-summary", response_model=UsageSummaryResponse)
+async def fetch_admin_usage_summary(
+    user_id: str = Depends(get_current_user_id),
+    db: AsyncSession = Depends(get_db),
+) -> UsageSummaryResponse:
+    return await get_usage_summary(db, user_id)

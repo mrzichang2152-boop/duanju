@@ -1,11 +1,13 @@
-from contextlib import asynccontextmanager
 import logging
 import shutil
+from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, APIRouter
-from fastapi.staticfiles import StaticFiles
-from fastapi.middleware.cors import CORSMiddleware
 import os
+from sqlalchemy import inspect, text
+
+from fastapi import APIRouter, FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 
 from app.api import assets, auth, eleven_labs, final, fish_audio, health, linkapi, projects, script, segments, settings as settings_api, templates, voices
 from app.core.config import settings as app_settings
@@ -13,10 +15,21 @@ from app.core.db import engine
 from app.models import Base
 
 
+def _ensure_runtime_schema(sync_conn) -> None:
+    inspector = inspect(sync_conn)
+    try:
+        segment_version_columns = {str(item.get("name") or "").strip() for item in inspector.get_columns("segment_versions")}
+    except Exception:
+        segment_version_columns = set()
+    if "duration_seconds" not in segment_version_columns:
+        sync_conn.execute(text("ALTER TABLE segment_versions ADD COLUMN duration_seconds FLOAT"))
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        await conn.run_sync(_ensure_runtime_schema)
     yield
 
 

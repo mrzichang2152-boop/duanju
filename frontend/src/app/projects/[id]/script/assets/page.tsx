@@ -156,7 +156,7 @@ type AggregatedAsset = Omit<Asset, "versions"> & {
   versions: AggregatedVersion[];
 };
 
-const OPENROUTER_IMAGE_MODEL = "nano-banana-2";
+const OPENROUTER_IMAGE_MODEL = "gpt-image-2";
 
 const isProjectMissingError = (message: string) => {
   const normalized = (message || "").toLowerCase();
@@ -218,7 +218,6 @@ export default function AssetsPage() {
     ...DIRECTOR_STYLE_OPTIONS,
   ];
   const [globalStyle, setGlobalStyle] = useState<string>(DEFAULT_GLOBAL_STYLE);
-  const [quickChannel, setQuickChannel] = useState<boolean>(false);
   const [assetStyles, setAssetStyles] = useState<Record<string, string>>({});
   const [voicesByCharacter, setVoicesByCharacter] = useState<Record<string, CharacterVoice>>({});
 
@@ -647,7 +646,6 @@ export default function AssetsPage() {
           options: {
             aspect_ratio: assetSizes[activeAssetId] || getAssetDefaultSize(),
             size: "4K",
-            quick_channel: quickChannel,
           },
         });
         pushPendingAssetGenJob(projectId, {
@@ -694,7 +692,6 @@ export default function AssetsPage() {
           options: {
             aspect_ratio: assetSizes[activeAssetId] || getAssetDefaultSize(),
             size: "4K",
-            quick_channel: quickChannel,
           },
         });
         pushPendingAssetGenJob(projectId, {
@@ -944,7 +941,7 @@ export default function AssetsPage() {
             if (
               currentModel &&
               !selectOptions.some((m) => m === currentModel) &&
-              ["nano-banana-2", "nano-banana-pro"].includes(currentModel)
+              currentModel === OPENROUTER_IMAGE_MODEL
             ) {
               selectOptions.unshift(currentModel);
             }
@@ -964,7 +961,7 @@ export default function AssetsPage() {
                 }}
                 disabled={configLoading && imageModels.length === 0}
                 className="w-full rounded-lg border border-slate-200 px-3 py-2 text-xs md:w-44"
-                title="绘画模型（由后端映射为 GRSAI 接口 model）"
+                title="图片模型（固定使用 4spai 的 gpt-image-2）"
               >
                 {selectOptions.map((m) => (
                   <option key={m} value={m}>
@@ -1314,15 +1311,6 @@ export default function AssetsPage() {
                 </option>
               ))}
             </select>
-            <label className="ml-2 inline-flex cursor-pointer items-center gap-2 text-xs text-slate-600">
-              <input
-                type="checkbox"
-                checked={quickChannel}
-                onChange={(e) => setQuickChannel(e.target.checked)}
-                className="h-4 w-4"
-              />
-              快速通道
-            </label>
           </div>
         </div>
         {status ? <div className="mt-2 text-blue-600">{status}</div> : null}

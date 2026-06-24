@@ -4,6 +4,14 @@ type ApiErrorDetailItem = {
   type?: string;
 };
 
+const redirectToLoginPage = async (redirectPath?: string | null) => {
+  if (typeof window === "undefined") {
+    return;
+  }
+  const { redirectToLogin } = await import("@/lib/navigation");
+  redirectToLogin(redirectPath);
+};
+
 export type ApiError = {
   detail?: string | ApiErrorDetailItem[] | Record<string, unknown>;
   message?: string;
@@ -177,7 +185,7 @@ const request = async <T>(
     if (shouldForceLogout && typeof window !== "undefined") {
       const { clearToken } = await import("@/lib/auth");
       clearToken();
-      window.location.href = "/login";
+      await redirectToLoginPage();
     }
     throw new Error(authMessage);
   }
@@ -544,7 +552,7 @@ export const generateScriptStream = async (
     if (typeof window !== "undefined") {
       const { clearToken } = await import("@/lib/auth");
       clearToken();
-      window.location.href = "/login";
+      await redirectToLoginPage();
     }
     throw new Error("无效 Token，请重新登录");
   }
@@ -1769,6 +1777,43 @@ export type SettingsUpdate = {
   allow_sync?: boolean;
 };
 
+export type AdminUsageSummaryTotals = {
+  account_count: number;
+  project_count: number;
+  text_characters: number;
+  image_count: number;
+  video_count: number;
+  video_seconds: number;
+  estimated_video_count: number;
+};
+
+export type AdminUsageSummaryAccount = {
+  user_id: string;
+  email: string;
+  created_at?: string | null;
+  project_count: number;
+  text_characters: number;
+  image_count: number;
+  video_count: number;
+  video_seconds: number;
+  estimated_video_count: number;
+};
+
+export type AdminUsageSummaryResponse = {
+  generated_at: string;
+  admin_email: string;
+  totals: AdminUsageSummaryTotals;
+  accounts: AdminUsageSummaryAccount[];
+  notes: string[];
+};
+
+export type CurrentUserUsageResponse = {
+  generated_at: string;
+  email: string;
+  account: AdminUsageSummaryAccount;
+  notes: string[];
+};
+
 export const getSettings = (token: string) =>
   request<SettingsResponse>("/settings", {}, token);
 
@@ -1784,6 +1829,12 @@ export const updateSettings = (token: string, payload: SettingsUpdate) =>
 
 export const getModels = (token: string) =>
   request<unknown>("/linkapi/models", {}, token);
+
+export const getCurrentUserUsageSummary = (token: string) =>
+  request<CurrentUserUsageResponse>("/settings/usage-summary", {}, token);
+
+export const getAdminUsageSummary = (token: string) =>
+  request<AdminUsageSummaryResponse>("/settings/admin/usage-summary", {}, token);
 
 export type Template = {
   id: string;

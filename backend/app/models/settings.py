@@ -20,7 +20,7 @@ class UserSettings(Base):
         String(128), default="gemini-3.1-pro-preview"
     )
     default_model_image: Mapped[str] = mapped_column(
-        String(128), default="nano-banana-2"
+        String(128), default="gpt-image-2"
     )
     default_model_video: Mapped[str] = mapped_column(String(128), default="sora2")
     allow_sync: Mapped[bool] = mapped_column(Boolean, default=False)

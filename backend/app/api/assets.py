@@ -64,7 +64,7 @@ from app.services.async_tasks import (
 )
 
 router = APIRouter()
-OPENROUTER_IMAGE_MODEL = "nano-banana-2"
+OPENROUTER_IMAGE_MODEL = "gpt-image-2"
 _ASSET_GENERATE_TASK_TYPE = "ASSET_GENERATE"
 
 
@@ -649,7 +649,8 @@ async def _generate_asset_sync(
         )
 
     if asset.type in {"CHARACTER", "CHARACTER_LOOK", "PROP", "SCENE"}:
-        prompt = ", ".join(part for part in [style_system_prompt, user_prompt] if part)
+        # 将用户提示词放在前面，系统风格词放在后面，确保 AI 优先关注用户描述
+        prompt = ", ".join(part for part in [user_prompt, style_system_prompt] if part)
 
     # Sanitize prompt to remove potential control characters
     if prompt:
@@ -662,18 +663,18 @@ async def _generate_asset_sync(
         # Normalize whitespace (handles \n, \t, \r, \xa0, etc.)
         prompt = " ".join(prompt.split())
 
-    # Limit prompt length to 800 characters to prevent API errors
-    if len(prompt) > 800:
-        logger.warning(f"Prompt truncated from {len(prompt)} to 800 chars")
-        prompt = prompt[:800]
+    # 提高提示词长度限制，避免长描述被截断
+    if len(prompt) > 2000:
+        logger.warning(f"Prompt truncated from {len(prompt)} to 2000 chars")
+        prompt = prompt[:2000]
 
     request_payload["prompt"] = prompt
 
     logger.info(
-        "Generating image with model=%s, aspect_ratio=%s, prompt_len=%s",
+        "Generating image with model=%s, aspect_ratio=%s, final_prompt=%s",
         request_payload.get("model"),
         request_payload.get("aspect_ratio"),
-        len(prompt),
+        prompt,
     )
     logger.info(f"Request Payload Keys: {list(request_payload.keys())}")
     

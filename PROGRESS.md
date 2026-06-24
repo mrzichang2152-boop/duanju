@@ -238,6 +238,8 @@
 - 2026-04-06 - 验证 - 前端执行 `npm run lint` 通过（0 error / 26 warning）、`npm run typecheck` 通过；后端执行 `python3 -m py_compile backend/app/services/segments.py backend/app/services/linkapi.py backend/app/api/assets.py` 通过；执行 `npm run dev` 时检测到现有 Next 开发实例占用锁，进一步确认 `http://localhost:3000` 返回 200。
 - 2026-03-19 - 后端 - 强化分镜空间参照规则：在“镜头调度与内容融合”中新增坐标原点与轴线强制说明，禁止“左侧2米/右侧8米”无参照写法，要求量化距离绑定参照物并补充可执行坐标示例。
 - 2026-03-19 - 验证 - 后端执行 `python3 -m py_compile backend/app/core/script_prompts.py` 通过；前端执行 `npm run lint && npm run typecheck` 通过（0 error，存在历史 warning）。
+- 2026-04-30 - 前端 - Step4 视频修改链路改为固定使用 Seedance 提交，不再沿用 Kling 模型选择与 `<<<video_1>>>` 占位符提示格式。
+- 2026-04-30 - 前端 - Step4 视频修改弹窗按 Seedance 约束调整为仅支持 4~15 秒，并将当前视频时长透传到后端用于保持编辑结果时长。
 - 2026-03-19 - 后端 - 强化分镜时长策略：明确禁止将7~8秒作为默认折中时长，要求同场景连续内容优先合并为10~15秒长镜头，并在连续7~8秒分段时强制备注切分原因；同时在分镜生成接口追加同规则提醒。
 - 2026-03-19 - 验证 - 后端执行 `python3 -m py_compile backend/app/core/script_prompts.py backend/app/api/script.py` 通过；前端执行 `npm run lint && npm run typecheck` 通过（0 error，存在历史 warning）。
 - 2026-03-19 - 前端 - 修复 Step4 素材选择弹窗类型错误：统一 `pickerAssetData` 返回结构，移除空数据分支的数组返回，恢复素材列表与映射类型稳定性。
@@ -320,6 +322,14 @@
 - 2026-04-04 - 前端 - 调整 Step4 素材管理弹窗：素材区新增“基础角色”并改正“角色形象”来源；上方素材卡片支持“应用至剧本”；生成区域默认折叠；所有首尾帧/场景/道具/远景生成图同步回流到上方素材区；下方生成图新增 COS 删除按钮。
 - 2026-04-04 - 后端 - Step4 帧图生成改为直接镜像上传腾讯云 COS，不再落地服务器；新增生成帧图 COS 删除接口与 COS URL 识别/删除能力。
 - 2026-04-04 - 验证 - 前端执行 `npm run lint -- src/app/components/ScriptEditor.tsx src/lib/api.ts`（0 error，保留 6 条历史/框架 warning）与 `npm run typecheck` 通过；后端执行 `python3 -m py_compile app/api/segments.py app/services/media_storage.py app/schemas/segments.py` 通过；执行 `npm run dev` 后 `http://127.0.0.1:3000` 返回 `200`。
+- 2026-04-30 - 前端 - Step4 视频修改链路改为固定使用 Seedance 提交，不再沿用 Kling 模型选择与 `<<<video_1>>>` 占位符提示格式。
+- 2026-04-30 - 前端 - Step4 视频修改弹窗按 Seedance 约束调整为仅支持 4~15 秒，并将当前视频时长透传到后端用于保持编辑结果时长。
+- 2026-04-30 - 后端 - Step3 与 Step4 图片生成统一切换为 4spai `gpt-image-2`：`create_image` 固定走 `https://4sapi.com/v1/images/generations`，图片模型统一收敛为 `gpt-image-2`，接入 `FOURSAPI_IMAGE_API_KEY` 专用密钥。
+- 2026-04-30 - 前端 - Step3/Step4 图片模型选项统一收口为 `gpt-image-2`，移除旧 `nano-banana` 相关展示与“快速通道”入口，避免界面与实际调用链路不一致。
+- 2026-04-30 - 验证 - 后端执行 `python -m py_compile app/services/linkapi.py app/core/config.py app/models/settings.py app/services/settings.py app/api/assets.py app/api/segments.py` 通过；本地真实调用 `create_image()` 返回 `b64_json`，确认 `4spai gpt-image-2` 链路可用；前端 `npm run typecheck` 通过、`npm run lint` 0 error（保留历史 warning）。
+- 2026-04-30 - 后端 - 补齐 4spai `gpt-image-2` 图生图编辑链路：当 Step3/Step4 存在参考图时，`create_image` 改为走 `https://4sapi.com/v1/images/edits` 的 multipart 请求，并兼容 `image[]/image` 字段名回退；同时新增旧尺寸值到 `gpt-image-2` 尺寸参数的映射，兼容 `4K/2K/1K` 与比例值。
+- 2026-04-30 - 正式环境 - 已将本次图片生成改动同步到 `82.156.124.215:/root/video-gen`，并在正式环境 `backend/.env` 注入 `FOURSAPI_IMAGE_ENDPOINT`、`FOURSAPI_IMAGE_EDITS_ENDPOINT`、`FOURSAPI_IMAGE_API_KEY` 后执行 `docker compose up -d --build backend frontend nginx` 重建发布。
+- 2026-04-30 - 验证 - 本地执行 `python -m py_compile app/services/linkapi.py` 通过；本地真实调用 `create_image()` 双场景验证通过：文生图与带参考图的 `edits` 均返回图片数据；正式环境容器健康检查 `http://127.0.0.1:8003/health`、`http://127.0.0.1:3001`、公网 `http://82.156.124.215/api/health` 均正常，且容器内执行 `verify_gpt_image_2_prod.py` 双场景真实生成成功返回图片 URL。
 - 2026-03-20 - 后端 - Step5 调整“应用分割点”为追加模式：每次应用当前双线区间都会新建一条分段记录（递增 `seg-xxx`），不再覆盖已有分段；并保留历史分段的人声提取与 S2S 结果。
 - 2026-03-20 - 后端 - Step5 初次提取配音不再预置默认分段，分段列表仅在用户点击“应用分割点”后开始生成，避免首次即出现占位分段导致后续追加语义不一致。
 - 2026-03-20 - 验证 - 后端执行 `python3 -m py_compile app/api/final.py` 通过；前端执行 `npm run lint`（0 error，17 warnings）与 `npm run typecheck` 通过。
@@ -331,6 +341,8 @@
 - 2026-03-20 - 后端 - Step5 新增原始音轨人声提取接口 `/episodes/audio-pipeline/extract-original-vocal`：调用 ElevenLabs 人声分离并回写 `original_isolated_audio_url`，同时将分段裁切输入切换为该提取人声音轨。
 - 2026-03-20 - 前端 - Step5 音轨区改为“原始音轨提取人声”流程：新增原始音轨“提取人声”按钮，提取成功后在原始音轨下方展示“提取人声音轨”，并将“播放选中区域/应用分割点”迁移到该人声音轨；移除分段区“提取人声”按钮与调用链。
 - 2026-03-20 - 验证 - 后端执行 `python3 -m py_compile backend/app/api/final.py` 通过；前端执行 `npm run lint`（0 error，17 warnings）与 `npm run typecheck` 通过。
+- 2026-04-30 - 后端 - 修复 Step4 一键合成视频先重编码导致的压缩与卡顿：分集合并改为优先原片 `concat + copy`，缺音轨时仅补静音并保持视频流直拷贝。
+- 2026-04-30 - 后端 - 调整合并兜底策略：仅在直拷贝全部失败时才启用高质量重编码，并将重编码参数收紧为 `libx264 + crf 17 + preset medium`，同时统一 `merge-store` 与 `merge-download` 逻辑。
 - 2026-03-20 - 后端 - Step5 移除分段人声提取接口与请求模型；分段 S2S 改为直接使用分段 `source_audio_url`（由“提取人声音轨”分割产生），彻底去除分段级“提取人声”依赖。
 - 2026-03-20 - 验证 - 后端执行 `python3 -m py_compile backend/app/api/final.py` 通过；前端执行 `npm run lint`（0 error，17 warnings）与 `npm run typecheck` 通过。
 - 2026-03-20 - 前端 - Step5 分段 S2S 音色选择改为严格仅使用非 `library` 音色；若当前已选音色不可用，自动回退到首个可用自有/克隆音色并继续执行，避免再次触发套餐限制错误。
@@ -1537,3 +1549,23 @@
 - 2026-04-17 - 缺陷修复 - Step3 后端强约束：`api/assets.py` 统一按“类型风格系统词 + 输入框 prompt”组装（CHARACTER/CHARACTER_LOOK/PROP/SCENE），移除角色形象在空 prompt 时自动注入角色描述逻辑；补充空 prompt 400 提示。
 - 2026-04-17 - 验证 - 执行 `npm run dev`（修复并清理 Next dev 锁冲突后可正常 Ready）、`npm run lint && npm run typecheck`、`python3 -m compileall backend/app/api/assets.py` 均通过（lint 仅历史 warning）。
 - 2026-04-17 - 部署 - 将代码推送至 Git 分支 `V1.0` 并同步部署至测试环境 `81.70.235.208`。
+- 2026-04-17 - 功能增强 - 全链路降级策略实现：
+    - Step 3/4 图片生成：勾选快速通道失败（含 429）后，自动降级至 GRSAI 接口尝试，且保持用户选择的模型不变。
+    - Step 2/4 文本生成：`4sapi` 请求失败后，自动降级至 `grsai` 文本端点尝试，且保持用户选择的模型（如 Gemini 3.1 Pro）不变。
+- 2026-04-17 - 验证 - 已将降级逻辑部署至测试环境 `81.70.235.208` 并重启服务。
+- 2026-05-13 - 配置 - Step4 Seedance 切换为新的 `ARK_API_KEY`；已更新正式环境 `82.156.124.215` 的 `backend/.env` 并重建 `backend`，随后通过真实 `create_video()` 提交拿到 `task_id`，且调用 Seedance 官方状态接口返回 `HTTP 200/running`，确认新 key 在提交与查询链路均生效。
+- 2026-05-13 - 功能增强 - Step4 视频模型选择新增 `Seedance 2.0 Fast`；前端 `storyboard/page.tsx` 增加下拉选项与本地持久化兼容，并映射到官方模型 `doubao-seedance-2-0-fast-260128`，后端 `linkapi.py` 同步补充 Fast 别名归一化。
+- 2026-05-13 - 功能增强 - 新增账号用量统计后台：后端 `settings/admin/usage-summary` 按账号汇总剧本文字字符数、素材图片张数、视频条数与视频秒数；前端新增 `settings/admin/usage` 页面展示总览和账号明细；`segment_versions` 同步补充 `duration_seconds` 字段，新生成视频按真实时长落库，历史旧视频按当前分镜时间轴或默认 5 秒兜底估算。
+- 2026-05-13 - 功能调整 - 用量统计改为双独立页面：新增客户前端页面 `/usage` 查看当前账号的文字/图片/视频秒数；新增独立管理员页面 `/admin/usage` 查看各账号汇总；顶部导航增加“我的用量”，并通过 `NEXT_PUBLIC_ADMIN_EMAILS` 控制管理员“管理后台”入口显示；移除原 `settings/admin/usage` 嵌套路由页面。
+- 2026-05-13 - 部署配置 - 为正式环境前端构建补充 `NEXT_PUBLIC_ADMIN_EMAILS` 参数透传：`frontend/Dockerfile` 新增该构建参数并导出环境变量，`docker-compose.yml` 的 `frontend.build.args` 同步增加 `NEXT_PUBLIC_ADMIN_EMAILS`，用于线上展示管理员入口并配合用量后台访问控制。
+- 2026-05-13 - 部署修复 - 新增 `backend/.dockerignore`，排除本地 `app.db`、`venv311`、`static/` 与 `app/static/` 等非镜像必需内容，避免正式环境 `docker compose build backend` 因构建上下文过大触发磁盘空间不足。
+- 2026-05-13 - 缺陷修复 - 前端登录回跳补齐：新增 `frontend/src/lib/navigation.ts` 统一构造 `/login?redirect=...`，未登录访问 `/usage` 与 `/admin/usage` 时保留原目标页，登录成功后优先跳回原页面；同时补齐 token 失效时的强制登录跳转回传。
+- 2026-05-13 - 测试环境修复 - 用量统计兼容历史脏数据：`backend/app/services/admin_stats.py` 在聚合脚本/素材/视频数据时跳过“项目所属用户已不存在”的孤儿记录，修复测试环境 `81.70.235.208` 上管理员统计接口因 `KeyError` 返回 500。
+- 2026-05-13 - 测试环境发布 - 已将用量统计前后端与登录回跳修复同步到 `81.70.235.208:/home/ubuntu/video_gen_app`，执行 `sudo docker compose up -d --build backend frontend nginx` 与后续 `sudo docker compose up -d --build backend` 完成发布。
+- 2026-05-13 - 测试环境验证 - 测试服 `https://81.70.235.208/admin/usage`、`https://81.70.235.208/usage`、`https://81.70.235.208/login?redirect=%2Fadmin%2Fusage` 返回 200；机内与公网 `GET /api/settings/admin/usage-summary`、机内 `GET /api/settings/usage-summary` 均返回 200，且管理员汇总已包含 `chu@hong.com` 与 `zhang@yuki.com` 的真实统计结果。
+- 2026-05-13 - 测试环境配置 - 按要求将 `81.70.235.208:/home/ubuntu/video_gen_app/backend/.env` 中的 `ARK_API_KEY` 切换为 `4c852244-b8ac-4d24-ba6a-7c0352fef0a2`，并执行 `sudo docker compose up -d --force-recreate backend` 使测试环境后端容器加载新 Seedance key。
+- 2026-05-13 - 测试环境验证 - 测试服容器内 `ARK_API_KEY` 已更新为新值；机内 `GET http://127.0.0.1:8003/health` 返回 `{"status":"ok"}`；并使用测试服 `.env` 中的新 key 成功创建 Seedance 任务 `cgt-20260515144200-gz7j7`，轮询状态返回 `running`，确认测试环境已切换到新 key 且可正常提交视频生成任务。
+- 2026-05-13 - 测试环境排查 - Step3 使用 `gpt-image-2` 报错定位为测试环境 `FOURSAPI_IMAGE_API_KEY` 无 `gpt-image` 分组权限；直接对 `https://4sapi.com/v1/images/generations` 发起最小请求时，上游返回 `403` 与 `无权访问 gpt-iamge 分组`，确认并非前端或业务代码异常。
+- 2026-05-13 - 测试环境配置 - 按要求将 `81.70.235.208:/home/ubuntu/video_gen_app/backend/.env` 中的 `FOURSAPI_IMAGE_API_KEY` 切换为新的 4sapi 图片 key，并执行 `sudo docker compose up -d --force-recreate backend` 使测试环境后端容器加载新配置。
+- 2026-05-13 - 测试环境验证 - 新图片 key 直接调用 `4sapi gpt-image-2` 返回 `200`；测试服容器内 `FOURSAPI_IMAGE_API_KEY` 已更新为新值；Step3 真实链路调用 `POST /api/projects/ad7c7894-8f0c-43b2-84c6-9b8acb583077/assets/578d872a-84c2-4ff9-8ede-7d179f10d353/generate` 成功创建任务 `ff5d4b2a-d926-4e93-a58e-af87f92d3462`，后续查询状态返回 `COMPLETED`，且后端日志显示 `4sapi gpt-image-2` 上游响应 `status=200`。
+- 2026-06-24 - 缺陷修复 - 修复 `/usage` 与 `/admin/usage` 页面初始化 effect 中同步 setState 触发的 React Hooks lint 错误，保证发布前前端 lint 可通过。

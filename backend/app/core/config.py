@@ -11,10 +11,12 @@ class Settings(BaseSettings):
     elevenlabs_api_key: str = ""
     openrouter_api_key: str = ""
     foursapi_api_key: str = ""
+    foursapi_image_api_key: str = ""
     suchuang_api_key: str = ""
     grsai_api_key: str = ""
     ark_api_key: str = ""
     volcengine_ark_api_key: str = ""
+    admin_emails: str = ""
 
     # 腾讯云 COS（可选）：配齐后用户生成的图片/视频等可上传 COS 并返回公网 URL
     tencent_cos_secret_id: str = ""

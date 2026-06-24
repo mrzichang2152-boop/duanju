@@ -3,6 +3,7 @@
 import { useState } from "react";
 import { login } from "@/lib/api";
 import { setEmail, setToken } from "@/lib/auth";
+import { resolvePostLoginPath } from "@/lib/navigation";
 
 export default function LoginPage() {
   const [email, setEmailValue] = useState("");
@@ -17,7 +18,9 @@ export default function LoginPage() {
       const result = await login({ email, password });
       setToken(result.access_token);
       setEmail(email);
-      window.location.href = "/projects";
+      const redirectParam =
+        typeof window === "undefined" ? null : new URLSearchParams(window.location.search).get("redirect");
+      window.location.href = resolvePostLoginPath(redirectParam);
     } catch (err) {
       setError(err instanceof Error ? err.message : "登录失败");
     } finally {

@@ -3,7 +3,7 @@ from typing import Optional, Union
 from datetime import datetime
 from uuid import uuid4
 
-from sqlalchemy import Boolean, DateTime, String, Text
+from sqlalchemy import Boolean, DateTime, Float, String, Text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.models.base import Base
@@ -17,6 +17,7 @@ class SegmentVersion(Base):
     video_url: Mapped[str] = mapped_column(Text)
     task_id: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
     prompt: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    duration_seconds: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
     status: Mapped[str] = mapped_column(String(32), default="COMPLETED")
     is_selected: Mapped[bool] = mapped_column(Boolean, default=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)

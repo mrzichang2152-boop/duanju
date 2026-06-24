@@ -19,6 +19,7 @@ from urllib.parse import urlparse, quote
 
 import httpx
 import aiofiles
+import requests
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -36,20 +37,11 @@ logger = logging.getLogger(__name__)
 _KLING_ELEMENT_CACHE_TTL_SECONDS = 24 * 60 * 60
 _KLING_ELEMENT_CACHE: dict[str, tuple[str, float]] = {}
 _OPENROUTER_TEXT_MODEL = "gemini-3.1-pro-preview"
-_OPENROUTER_IMAGE_MODEL = "nano-banana-2"
+_OPENROUTER_IMAGE_MODEL = "gpt-image-2"
 _GEMINI_REFERENCE_IMAGE_LIMIT = 16
 
-# GRSAI /v1/draw/nano-banana 文档列出的绘画 model 值（用于 /linkapi/models 与前端 datalist）
-_GRSAI_DRAW_MODEL_ENTRIES: tuple[tuple[str, str], ...] = (
-    ("nano-banana-2", "Nano Banana 2（4K 请选 imageSize，勿用 -4k-cl 专线）"),
-    ("nano-banana-2-cl", "Nano Banana 2 CL（仅 1K/2K）"),
-    ("nano-banana-fast", "Nano Banana Fast"),
-    ("nano-banana", "Nano Banana"),
-    ("nano-banana-pro", "Nano Banana Pro"),
-    ("nano-banana-pro-vt", "Nano Banana Pro VT"),
-    ("nano-banana-pro-cl", "Nano Banana Pro CL"),
-    ("nano-banana-pro-vip", "Nano Banana Pro VIP（仅 1K/2K）"),
-    ("nano-banana-pro-4k-vip", "Nano Banana Pro 4K VIP（仅 4K）"),
+_FOURSAPI_IMAGE_MODEL_ENTRIES: tuple[tuple[str, str], ...] = (
+    ("gpt-image-2", "GPT Image 2"),
 )
 
 
@@ -100,7 +92,7 @@ async def fetch_models(session: AsyncSession, user_id: str) -> dict[str, Any]:
             "kind": "chat",
         },
     ]
-    for mid, label in _GRSAI_DRAW_MODEL_ENTRIES:
+    for mid, label in _FOURSAPI_IMAGE_MODEL_ENTRIES:
         data.append({"id": mid, "name": label, "kind": "draw"})
     return {"data": data}
 
@@ -109,14 +101,29 @@ def _map_openrouter_model(model: str) -> str:
     return _OPENROUTER_TEXT_MODEL
 
 
-async def _resolve_openrouter_key(session: AsyncSession, user_id: str) -> str:
+async def _resolve_grsai_text_key(session: AsyncSession, user_id: str) -> str:
+    """专门为 GRSAI 文本生成解析 API Key。"""
+    env_key = (
+        os.getenv("GRSAI_API_KEY", "").strip()
+        or str(getattr(app_settings, "grsai_api_key", "") or "").strip()
+    )
+    if env_key:
+        return env_key
+    try:
+        configured_key = await get_api_key(session, user_id)
+    except Exception as exc:
+        logger.warning("读取用户配置 API Key 失败，回退到环境变量: %s", exc)
+        configured_key = ""
+    return str(configured_key or "").strip()
+
+
+async def _resolve_foursapi_text_key(session: AsyncSession, user_id: str) -> str:
+    """专门为 4sapi 文本生成解析 API Key。"""
     env_key = (
         os.getenv("FOURSAPI_API_KEY", "").strip()
         or str(getattr(app_settings, "foursapi_api_key", "") or "").strip()
         or app_settings.suchuang_api_key.strip()
         or os.getenv("SUCHUANG_API_KEY", "").strip()
-        or str(getattr(app_settings, "grsai_api_key", "") or "").strip()
-        or os.getenv("GRSAI_API_KEY", "").strip()
     )
     if env_key:
         return env_key
@@ -141,6 +148,23 @@ async def _resolve_grsai_draw_key(session: AsyncSession, user_id: str) -> str:
         configured_key = await get_api_key(session, user_id)
     except Exception as exc:
         logger.warning("读取用户配置 API Key 失败，回退到环境变量: %s", exc)
+        configured_key = ""
+    return str(configured_key or "").strip()
+
+
+async def _resolve_foursapi_image_key(session: AsyncSession, user_id: str) -> str:
+    env_key = (
+        os.getenv("FOURSAPI_IMAGE_API_KEY", "").strip()
+        or str(getattr(app_settings, "foursapi_image_api_key", "") or "").strip()
+        or os.getenv("FOURSAPI_API_KEY", "").strip()
+        or str(getattr(app_settings, "foursapi_api_key", "") or "").strip()
+    )
+    if env_key:
+        return env_key
+    try:
+        configured_key = await get_api_key(session, user_id)
+    except Exception as exc:
+        logger.warning("读取用户配置图片 API Key 失败，回退到环境变量: %s", exc)
         configured_key = ""
     return str(configured_key or "").strip()
 
@@ -289,26 +313,34 @@ async def create_chat_completion(
     session: AsyncSession, user_id: str, payload: dict[str, Any]
 ) -> dict[str, Any]:
     await get_or_create_settings(session, user_id)
-    api_key = await _resolve_openrouter_key(session, user_id)
-    if not api_key:
-        raise RuntimeError("GRSAI_API_KEY 未配置，请先在后端环境变量中设置")
-    request_model = _map_openrouter_model(str(payload.get("model") or ""))
-    endpoint = str(
-        os.getenv(
-            "FOURSAPI_TEXT_ENDPOINT",
-            os.getenv("GRSAI_TEXT_ENDPOINT", "https://4sapi.com/v1/chat/completions"),
-        )
-    ).strip()
+
+    # 获取不同 Provider 对应的 API Key
+    foursapi_key = await _resolve_foursapi_text_key(session, user_id)
+    grsai_key = await _resolve_grsai_text_key(session, user_id)
+
+    request_model = str(payload.get("model") or "gemini-3.1-pro").strip()
+
+    # 定义端点列表，支持自动降级
+    endpoints = []
+    foursapi_endpoint = str(os.getenv("FOURSAPI_TEXT_ENDPOINT", "https://4sapi.com/v1/chat/completions")).strip()
+    grsai_endpoint = str(os.getenv("GRSAI_TEXT_ENDPOINT", "https://grsai.dakka.com.cn/v1/chat/completions")).strip()
+
+    # 优先使用 4sapi，失败后降级到 grsai
+    if foursapi_key:
+        endpoints.append(("4sapi", foursapi_endpoint, foursapi_key))
+    if grsai_key and grsai_endpoint:
+        endpoints.append(("grsai", grsai_endpoint, grsai_key))
+
+    if not endpoints:
+        raise RuntimeError("未配置任何文本生成端点（FOURSAPI_API_KEY 或 GRSAI_API_KEY）")
+
     request_messages = payload.get("messages")
     if not isinstance(request_messages, list) or len(request_messages) == 0:
         content = _build_suchuang_content(payload)
         if not content:
-            raise RuntimeError("请求内容为空，无法调用 Gemini3.1Pro")
+            raise RuntimeError("请求内容为空，无法调用对话模型")
         request_messages = [{"role": "user", "content": content}]
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-    }
+
     request_payload: dict[str, Any] = {
         "model": request_model,
         "stream": False,
@@ -320,6 +352,7 @@ async def create_chat_completion(
         request_payload["max_tokens"] = payload.get("max_tokens")
     if payload.get("thinking") is not None:
         request_payload["thinking"] = payload.get("thinking")
+
     timeout_seconds_raw = str(
         os.getenv("GRSAI_TIMEOUT_SECONDS", os.getenv("SUCHUANG_TIMEOUT_SECONDS", "120"))
     ).strip()
@@ -329,6 +362,7 @@ async def create_chat_completion(
         timeout_seconds = 120.0
     timeout_seconds = max(30.0, min(180.0, timeout_seconds))
     timeout = httpx.Timeout(timeout_seconds, connect=15.0)
+
     retryable_network_exceptions = (
         httpx.ReadTimeout,
         httpx.ConnectTimeout,
@@ -337,92 +371,119 @@ async def create_chat_completion(
         httpx.WriteError,
         httpx.NetworkError,
     )
-    for content_attempt in range(3):
-        last_exc: Exception | None = None
-        response: httpx.Response | None = None
-        for trust_env_mode in (False, True):
-            for network_attempt in range(2):
-                try:
-                    async with httpx.AsyncClient(timeout=timeout, trust_env=trust_env_mode) as client:
-                        response = await client.post(endpoint, headers=headers, json=request_payload)
-                    break
-                except retryable_network_exceptions as exc:
-                    last_exc = exc
-                    logger.warning(
-                        "Gemini3.1Pro 请求网络异常(attempt=%s/3 trust_env=%s retry=%s/2): %s",
-                        content_attempt + 1,
-                        trust_env_mode,
-                        network_attempt + 1,
-                        exc,
-                    )
-                    await asyncio.sleep(0.6)
-            if response is not None:
-                break
-        if response is None:
-            if isinstance(last_exc, (httpx.ReadTimeout, httpx.ConnectTimeout)):
-                raise RuntimeError(f"Gemini3Pro 调用超时（>{int(timeout_seconds)}秒）") from last_exc
-            raise RuntimeError(f"Gemini3Pro 网络异常：{last_exc or 'unknown error'}") from last_exc
 
-        if response.status_code != 200:
-            response_text = str(response.text or "")
-            if (
-                response.status_code == 400
-                and "Invalid project resource name projects/projects/" in response_text
-                and content_attempt < 2
-            ):
-                logger.warning(
-                    "Gemini3.1Pro 命中上游无效项目名通道错误，自动重试(attempt=%s/3): %s",
-                    content_attempt + 1,
-                    response_text[:300],
-                )
+    last_error_msg = ""
+    for provider_name, endpoint, api_key in endpoints:
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        }
+        for content_attempt in range(3):
+            last_exc: Exception | None = None
+            response: httpx.Response | None = None
+            for trust_env_mode in (False, True):
+                for network_attempt in range(2):
+                    try:
+                        async with httpx.AsyncClient(timeout=timeout, trust_env=trust_env_mode) as client:
+                            response = await client.post(endpoint, headers=headers, json=request_payload)
+                        break
+                    except retryable_network_exceptions as exc:
+                        last_exc = exc
+                        logger.warning(
+                            "%s %s 请求网络异常(attempt=%s/3 trust_env=%s retry=%s/2): %s",
+                            provider_name,
+                            request_model,
+                            content_attempt + 1,
+                            trust_env_mode,
+                            network_attempt + 1,
+                            exc,
+                        )
+                        await asyncio.sleep(0.6)
+                if response is not None:
+                    break
+
+            if response is None:
+                last_error_msg = f"{provider_name} 网络异常：{last_exc or 'unknown error'}"
+                continue
+
+            if response.status_code != 200:
+                response_text = str(response.text or "")
+                # 记录错误并决定是否继续重试或切换 provider
+                last_error_msg = f"{provider_name} 调用失败：HTTP {response.status_code} {response_text}"
+
+                # 如果命中特定 400 错误，进行重试
+                if (
+                    response.status_code == 400
+                    and "Invalid project resource name projects/projects/" in response_text
+                    and content_attempt < 2
+                ):
+                    logger.warning(
+                        "%s %s 命中上游无效项目名通道错误，自动重试(attempt=%s/3)",
+                        provider_name,
+                        request_model,
+                        content_attempt + 1,
+                    )
+                    await asyncio.sleep(0.8 * (content_attempt + 1))
+                    continue
+
+                # 如果是限流 (429) 或其他非 200，尝试下一个 provider 或重试
+                logger.error("%s 文本生成失败: %s", provider_name, last_error_msg)
+                break # 跳出当前 provider 的重试，尝试下一个 provider
+
+            try:
+                response_json = response.json()
+            except Exception as exc:
+                last_error_msg = f"{provider_name} 返回非 JSON 响应：{response.text}"
+                break
+
+            code = response_json.get("code") if isinstance(response_json, dict) else None
+            if code not in (None, 0, 200):
+                last_error_msg = f"{provider_name} 业务错误: {response_json.get('msg') or response_json}"
+                break
+
+            if isinstance(response_json, dict) and not response_json.get("choices"):
+                data_obj = response_json.get("data")
+                if isinstance(data_obj, dict) and data_obj.get("choices"):
+                    response_json = data_obj
+
+            content_text = _extract_suchuang_primary_content(response_json)
+            if not content_text and isinstance(response_json, dict):
+                content_text = _extract_suchuang_primary_content(response_json.get("data"))
+            reasoning_text = _extract_suchuang_reasoning_text(response_json)
+            if not reasoning_text and isinstance(response_json, dict):
+                reasoning_text = _extract_suchuang_reasoning_text(response_json.get("data"))
+
+            if content_text:
+                message_payload: dict[str, Any] = {
+                    "role": "assistant",
+                    "content": content_text,
+                }
+                if reasoning_text:
+                    message_payload["reasoning_content"] = reasoning_text
+                return {
+                    "choices": [
+                        {
+                            "index": 0,
+                            "message": message_payload,
+                            "finish_reason": "stop",
+                        }
+                    ]
+                }
+
+            logger.warning(
+                "%s %s empty content response(attempt=%s/3)",
+                provider_name,
+                request_model,
+                content_attempt + 1,
+            )
+            if content_attempt < 2:
                 await asyncio.sleep(0.8 * (content_attempt + 1))
                 continue
-            raise RuntimeError(f"Gemini3.1Pro 调用失败：HTTP {response.status_code} {response_text}")
-        try:
-            response_json = response.json()
-        except Exception as exc:
-            raise RuntimeError(f"Gemini3.1Pro 返回非 JSON 响应：{response.text}") from exc
 
-        code = response_json.get("code") if isinstance(response_json, dict) else None
-        if code not in (None, 0, 200):
-            raise RuntimeError(str(response_json.get("msg") or response_json))
-        if isinstance(response_json, dict) and not response_json.get("choices"):
-            data_obj = response_json.get("data")
-            if isinstance(data_obj, dict) and data_obj.get("choices"):
-                response_json = data_obj
+        # 如果当前 provider 彻底失败，会进入下一个 provider 的循环
+        logger.warning("%s 文本生成完全失败，尝试下一个端点（如有）", provider_name)
 
-        content_text = _extract_suchuang_primary_content(response_json)
-        if not content_text and isinstance(response_json, dict):
-            content_text = _extract_suchuang_primary_content(response_json.get("data"))
-        reasoning_text = _extract_suchuang_reasoning_text(response_json)
-        if not reasoning_text and isinstance(response_json, dict):
-            reasoning_text = _extract_suchuang_reasoning_text(response_json.get("data"))
-        if content_text:
-            message_payload: dict[str, Any] = {
-                "role": "assistant",
-                "content": content_text,
-            }
-            if reasoning_text:
-                message_payload["reasoning_content"] = reasoning_text
-            return {
-                "choices": [
-                    {
-                        "index": 0,
-                        "message": message_payload,
-                        "finish_reason": "stop",
-                    }
-                ]
-            }
-
-        logger.warning(
-            "Gemini3.1Pro empty content response(attempt=%s/3): %s",
-            content_attempt + 1,
-            str(response_json)[:1200],
-        )
-        if content_attempt < 2:
-            await asyncio.sleep(0.8 * (content_attempt + 1))
-            continue
-        raise RuntimeError("Gemini3.1Pro 未返回可用内容")
+    raise RuntimeError(f"所有端点调用均失败。最后一次错误：{last_error_msg}")
 
 
 async def create_chat_completion_stream(
@@ -676,7 +737,7 @@ async def _extract_video_tail_frame_base64(video_url: str) -> str:
                 raise RuntimeError("未检测到 ffmpeg，无法提取视频尾帧")
         except FileNotFoundError:
             raise RuntimeError("未检测到 ffmpeg，无法提取视频尾帧")
-        
+
         try:
             cmd = [
                 "ffmpeg",
@@ -994,167 +1055,180 @@ def _is_retryable_fast_channel_error(exc: BaseException) -> bool:
     return any(m in text for m in markers)
 
 
-_FAST_CHANNEL_MODEL_MAP: dict[str, str] = {
-    "nano-banana-2": "gemini-3.1-flash-image-preview",
-    "nano-banana-pro": "gemini-3-pro-image-preview",
-}
+def _normalize_foursapi_image_model(raw_model: Optional[str]) -> str:
+    lower = str(raw_model or "").strip().lower().replace("_", "-")
+    if lower in {"", "gpt-image-2", "gptimage2", "gpt-image2"}:
+        return "gpt-image-2"
+    return "gpt-image-2"
 
 
-async def _create_image_via_fast_channel(
-    session: AsyncSession,
-    user_id: str,
-    prompt: str,
-    references: Optional[list[str]] = None,
+def _resolve_foursapi_image_size(payload: dict[str, Any]) -> str:
+    ratio = _resolve_image_aspect_ratio(payload)
+    raw_size = str(payload.get("size") or "").strip().lower()
+
+    ratio_size_1k = {
+        "1:1": "1024x1024",
+        "16:9": "1536x1024",
+        "9:16": "1024x1536",
+        "4:3": "1536x1024",
+        "3:4": "1024x1536",
+        "3:2": "1536x1024",
+        "2:3": "1024x1536",
+    }
+    ratio_size_2k = {
+        "1:1": "2048x2048",
+        "16:9": "2048x1152",
+        "9:16": "2160x3840",
+        "4:3": "2048x1536",
+        "3:4": "1536x2048",
+        "3:2": "2048x1360",
+        "2:3": "1360x2048",
+    }
+    ratio_size_4k = {
+        "1:1": "3840x3840",
+        "16:9": "3840x2160",
+        "9:16": "2160x3840",
+        "4:3": "3840x2880",
+        "3:4": "2880x3840",
+        "3:2": "3840x2560",
+        "2:3": "2560x3840",
+    }
+
+    if raw_size in {"1024x1024", "1536x1024", "1024x1536", "2048x2048", "2048x1152", "3840x2160", "2160x3840"}:
+        return raw_size
+    if raw_size in {"1k", "1024"}:
+        return ratio_size_1k.get(ratio or "1:1", "1024x1024")
+    if raw_size in {"2k", "2048"}:
+        return ratio_size_2k.get(ratio or "1:1", "2048x2048")
+    if raw_size in {"4k", "3840"}:
+        return ratio_size_4k.get(ratio or "16:9", "3840x2160")
+    if raw_size in {"1:1", "16:9", "9:16", "4:3", "3:4", "3:2", "2:3"}:
+        return ratio_size_2k.get(raw_size, "2048x2048")
+    if ratio:
+        return ratio_size_2k.get(ratio, "2048x2048")
+    return "auto"
+
+
+async def _download_reference_image_bytes(image_url: str) -> tuple[bytes, str, str]:
+    async with httpx.AsyncClient(
+        timeout=httpx.Timeout(60.0, connect=20.0),
+        trust_env=False,
+        follow_redirects=True,
+    ) as client:
+        response = await client.get(image_url)
+        response.raise_for_status()
+    content = response.content
+    if not content:
+        raise RuntimeError("参考图下载为空")
+    content_type = str(response.headers.get("content-type") or "").split(";", 1)[0].strip().lower()
+    if content_type not in {"image/png", "image/jpeg", "image/jpg", "image/webp"}:
+        lower_url = image_url.lower()
+        if lower_url.endswith(".png"):
+            content_type = "image/png"
+        elif lower_url.endswith(".webp"):
+            content_type = "image/webp"
+        else:
+            content_type = "image/jpeg"
+    extension = ".jpg"
+    if content_type == "image/png":
+        extension = ".png"
+    elif content_type == "image/webp":
+        extension = ".webp"
+    return content, content_type, extension
+
+
+async def _create_image_via_foursapi_edits(
     *,
-    model: str = "",
+    api_key: str,
+    endpoint: str,
+    prompt: str,
+    model: str,
+    size: str,
+    quality: str,
+    output_format: str,
+    instructions: str,
+    references: list[str],
 ) -> dict[str, Any]:
-    env_override = os.getenv("FOURSAPI_IMAGE_ENDPOINT", "").strip()
-    if env_override:
-        endpoint = env_override
-    else:
-        gemini_model = _FAST_CHANNEL_MODEL_MAP.get(
-            model.lower().strip(), "gemini-3-pro-image-preview"
-        )
-        endpoint = f"https://4sapi.com/v1beta/models/{gemini_model}:generateContent"
-    api_key = (
-        os.getenv("FOURSAPI_API_KEY", "").strip()
-        or await _resolve_openrouter_key(session, user_id)
-    )
-    if not api_key:
-        raise RuntimeError("FOURSAPI_API_KEY 未配置，无法使用快速通道")
+    data: list[tuple[str, str]] = [
+        ("model", model),
+        ("prompt", prompt[:1000]),
+        ("n", "1"),
+        ("size", size),
+        ("quality", quality),
+        ("output_format", output_format),
+    ]
+    if instructions:
+        data.append(("instructions", instructions))
+    files: list[tuple[str, tuple[str, bytes, str]]] = []
+    for index, ref_url in enumerate(references[: min(len(references), _GEMINI_REFERENCE_IMAGE_LIMIT)], start=1):
+        content, content_type, extension = await _download_reference_image_bytes(ref_url)
+        files.append(("image[]", (f"reference_{index}{extension}", content, content_type)))
 
-    def _infer_ref_mime(url_text: str) -> str:
-        lower = str(url_text or "").strip().lower()
-        if lower.endswith(".png"):
-            return "image/png"
-        if lower.endswith(".webp"):
-            return "image/webp"
-        if lower.endswith(".gif"):
-            return "image/gif"
-        return "image/jpeg"
-
-    parts: list[dict[str, Any]] = [{"text": prompt}]
-    for ref in (references or [])[:_GEMINI_REFERENCE_IMAGE_LIMIT]:
-        ref_url = str(ref or "").strip()
-        if not ref_url:
-            continue
-        if ref_url.startswith("data:image"):
-            header, _, b64_data = ref_url.partition(",")
-            mime_type = "image/jpeg"
-            header_match = re.match(r"^data:(image/[a-zA-Z0-9.+-]+);base64$", header)
-            if header_match:
-                mime_type = str(header_match.group(1) or "image/jpeg").strip() or "image/jpeg"
-            if b64_data:
-                parts.append({"inlineData": {"mimeType": mime_type, "data": b64_data}})
-            continue
-        if ref_url.startswith(("http://", "https://")):
-            # Gemini API 的 fileData.fileUri 只接受 gs:// 或 File API URI，
-            # 不支持任意公网 HTTP URL，必须先下载图片转 base64 通过 inlineData 传入
-            try:
-                async with httpx.AsyncClient(
-                    timeout=httpx.Timeout(30.0, connect=10.0), trust_env=False
-                ) as _dl:
-                    _resp = await _dl.get(ref_url)
-                    _resp.raise_for_status()
-                ct = (_resp.headers.get("content-type") or "").split(";")[0].strip()
-                _mime = ct if ct.startswith("image/") else _infer_ref_mime(ref_url)
-                _b64 = base64.b64encode(_resp.content).decode("ascii")
-                parts.append({"inlineData": {"mimeType": _mime, "data": _b64}})
-            except Exception as _dl_exc:
-                logger.warning("快速通道下载参考图失败 url=%s: %s", ref_url, _dl_exc)
-
-    req_payload: dict[str, Any] = {
-        "contents": [
-            {
-                "parts": parts,
-            }
-        ]
-    }
     headers = {
-        "x-goog-api-key": api_key,
-        "Content-Type": "application/json",
-        "Connection": "close",
+        "Authorization": f"Bearer {api_key}",
+        "Accept": "application/json",
     }
-
-    retryable_network_exceptions = (
-        httpx.ReadTimeout,
-        httpx.ConnectTimeout,
-        httpx.RemoteProtocolError,
-        httpx.ReadError,
-        httpx.WriteError,
-        httpx.NetworkError,
-    )
-    response: httpx.Response | None = None
-    last_exc: Exception | None = None
-    for trust_env_mode in (False, True):
-        for network_attempt in range(2):
-            try:
-                async with httpx.AsyncClient(
-                    timeout=httpx.Timeout(300.0, connect=30.0),
-                    trust_env=trust_env_mode,
-                    http1=True,
-                    http2=False,
-                ) as client:
-                    response = await client.post(endpoint, headers=headers, json=req_payload)
-                break
-            except retryable_network_exceptions as exc:
-                last_exc = exc
-                logger.warning(
-                    "快速通道请求网络异常 trust_env=%s retry=%s/2 type=%s: %s",
-                    trust_env_mode,
-                    network_attempt + 1,
-                    type(exc).__name__,
-                    exc,
+    timeout_seconds = float(str(os.getenv("FOURSAPI_IMAGE_TIMEOUT_SECONDS", "300")).strip() or "300")
+    timeout_seconds = max(60.0, min(600.0, timeout_seconds))
+    last_error = ""
+    for image_field_name in ("image[]", "image"):
+        request_files = [
+            (image_field_name, file_tuple)
+            for _, file_tuple in files
+        ]
+        try:
+            def _send_request():
+                return requests.post(
+                    endpoint,
+                    headers=headers,
+                    data=data,
+                    files=request_files,
+                    timeout=timeout_seconds,
+                    proxies={"http": None, "https": None},
                 )
-                await asyncio.sleep(0.6)
-        if response is not None:
-            break
 
-    if response is None:
-        logger.error("快速通道请求异常（网络重试后仍失败）last=%s", last_exc)
-        raise RuntimeError(f"快速通道请求失败：{type(last_exc).__name__ if last_exc else 'NetworkError'}: {last_exc or 'unknown error'}") from last_exc
-    if response.status_code != 200:
-        raise RuntimeError(f"快速通道调用失败：HTTP {response.status_code} {response.text}")
-
-    try:
-        body = response.json()
-    except Exception as exc:
-        raise RuntimeError(f"快速通道返回非 JSON：{response.text}") from exc
-
-    candidates = body.get("candidates") if isinstance(body, dict) else None
-    if isinstance(candidates, list):
-        for candidate in candidates:
-            if not isinstance(candidate, dict):
-                continue
-            content = candidate.get("content") if isinstance(candidate.get("content"), dict) else {}
-            parts = content.get("parts") if isinstance(content, dict) else None
-            if not isinstance(parts, list):
-                continue
-            for part in parts:
-                if not isinstance(part, dict):
-                    continue
-                inline_data = part.get("inlineData") if isinstance(part.get("inlineData"), dict) else {}
-                b64_data = str(inline_data.get("data") or "").strip()
-                mime_type = str(inline_data.get("mimeType") or "image/jpeg").strip() or "image/jpeg"
-                if b64_data:
-                    try:
-                        raw_image = base64.b64decode(b64_data, validate=False)
-                    except Exception as exc:
-                        raise RuntimeError(f"快速通道返回图片解码失败：{exc}") from exc
-                    if len(raw_image) < 1024:
-                        raise RuntimeError("快速通道返回无效图片数据：图片数据异常")
-                    return {"data": [{"url": f"data:{mime_type};base64,{b64_data}"}]}
-
-    raise RuntimeError("快速通道未返回图片数据")
+            response = await asyncio.to_thread(_send_request)
+        except Exception as exc:
+            last_error = f"4sapi gpt-image-2 edits 请求异常：{exc}"
+            continue
+        logger.info(
+            "4sapi gpt-image-2 edits 响应 field=%s status=%s body=%s",
+            image_field_name,
+            response.status_code,
+            response.text[:2000],
+        )
+        if response.status_code != 200:
+            last_error = f"gpt-image-2 edits 调用失败：HTTP {response.status_code} {response.text}"
+            continue
+        try:
+            result_json = response.json()
+        except Exception as exc:
+            last_error = f"gpt-image-2 edits 返回非 JSON：{response.text}"
+            logger.warning("gpt-image-2 edits JSON 解析失败 field=%s error=%s", image_field_name, exc)
+            continue
+        data_list = result_json.get("data") if isinstance(result_json, dict) else None
+        if isinstance(data_list, list) and data_list:
+            first_item = data_list[0]
+            if isinstance(first_item, dict):
+                b64_value = str(first_item.get("b64_json") or "").strip()
+                if b64_value:
+                    return {"data": [{"b64_json": b64_value}]}
+                direct_url = str(first_item.get("url") or "").strip()
+                if direct_url:
+                    return {"data": [{"url": direct_url}]}
+        last_error = f"gpt-image-2 edits 未返回图片数据：{result_json}"
+    raise RuntimeError(last_error or "gpt-image-2 edits 调用失败")
 
 
 async def create_image(
     session: AsyncSession, user_id: str, payload: dict[str, Any]
 ) -> dict[str, Any]:
-    api_key = await _resolve_grsai_draw_key(session, user_id)
+    api_key = await _resolve_foursapi_image_key(session, user_id)
     if not api_key:
-        raise RuntimeError("GRSAI_API_KEY 未配置，请先在后端环境变量中设置")
-    endpoint = str(os.getenv("GRSAI_DRAW_ENDPOINT", "https://grsai.dakka.com.cn/v1/draw/nano-banana")).strip()
+        raise RuntimeError("FOURSAPI_IMAGE_API_KEY 未配置，请先在后端环境变量中设置")
+    endpoint = str(
+        os.getenv("FOURSAPI_IMAGE_ENDPOINT", "https://4sapi.com/v1/images/generations")
+    ).strip()
     payload = payload.copy()
 
     resolved_references: list[str] = []
@@ -1206,132 +1280,88 @@ async def create_image(
     if unresolved_reference_errors and resolved_references:
         logger.warning("部分图生图参考图已忽略，继续使用可用参考图: %s", unresolved_reference_errors[0])
 
-    # resolved_references 已是经过 _resolve_image_url 处理过的公网可访问 URL，
-    # 直接透传给 GRSAI（GRSAI 文档：urls 支持 http(s) URL，不做 Base64 内联，
-    # 避免 GRSAI 侧处理 data URL 异常导致任务卡在 running 状态）。
-
     prompt = str(payload.get("prompt") or "").strip() or "生成一张高质量图片"
-    raw_model_for_channel = str(payload.get("model") or "").strip()
-    quick_channel_raw = payload.pop("quick_channel", False)
-    quick_channel = quick_channel_raw is True or str(quick_channel_raw).strip().lower() in {
-        "1",
-        "true",
-        "yes",
-        "on",
-    }
-    if quick_channel:
-        fast_channel_error: Optional[BaseException] = None
-        for attempt in range(2):
-            try:
-                return await _create_image_via_fast_channel(
-                    session, user_id, prompt, resolved_references, model=raw_model_for_channel
-                )
-            except Exception as exc:
-                fast_channel_error = exc
-                if not _is_retryable_fast_channel_error(exc):
-                    raise
-                logger.warning(
-                    "快速通道生成失败，准备重试或降级（attempt=%s/2）: %s",
-                    attempt + 1,
-                    exc,
-                )
-                if attempt < 1:
-                    await asyncio.sleep(0.8)
-        if fast_channel_error is not None:
-            # 如果是限流错误，不再自动降级，而是直接抛出给用户，以便用户知晓额度情况
-            if "429" in str(fast_channel_error) or "quota" in str(fast_channel_error).lower():
-                raise fast_channel_error
-            logger.warning("快速通道连续失败，自动降级普通通道继续生成: %s", fast_channel_error)
-
-    ratio = _resolve_image_aspect_ratio(payload) or "auto"
     raw_model_str = str(payload.get("model") or "").strip()
-    draw_model = _normalize_grsai_draw_model(raw_model_str or None)
-    draw_model = _outgoing_grsai_draw_model_must_be_nano_banana_2(draw_model, payload)
-    image_size = _coerce_grsai_draw_image_size(draw_model, payload)
+    draw_model = _normalize_foursapi_image_model(raw_model_str or None)
+    size = _resolve_foursapi_image_size(payload)
+    quality = str(payload.get("quality") or "").strip() or "auto"
+    output_format = str(payload.get("output_format") or "").strip() or "png"
+    instructions = str(payload.get("instructions") or "").strip()
     request_payload: dict[str, Any] = {
         "model": draw_model,
-        "prompt": prompt,
-        "aspectRatio": ratio,
-        "imageSize": image_size,
-        "webHook": "-1",
-        "shutProgress": False,
+        "prompt": prompt[:1000],
+        "n": 1,
+        "response_format": "b64_json",
+        "size": size,
+        "quality": quality,
+        "output_format": output_format,
     }
+    if instructions:
+        request_payload["instructions"] = instructions
+
     ref_preview = ""
     if resolved_references:
-        u0 = str(resolved_references[0] or "").strip()
-        ref_preview = (u0[:160] + "…") if len(u0) > 160 else u0
+        first_ref = str(resolved_references[0] or "").strip()
+        ref_preview = (first_ref[:160] + "…") if len(first_ref) > 160 else first_ref
     logger.info(
-        "GRSAI draw 请求 user_id=%s raw_model=%s outgoing_model=%s imageSize=%s aspectRatio=%s ref_count=%d ref_preview=%s",
+        "4sapi gpt-image-2 请求 user_id=%s raw_model=%s outgoing_model=%s size=%s quality=%s ref_count=%d ref_preview=%s",
         user_id,
         raw_model_str or "(empty)",
         draw_model,
-        image_size,
-        ratio,
+        str(request_payload.get("size") or "auto"),
+        quality,
         len(resolved_references),
         ref_preview,
     )
-    if resolved_references:
-        request_payload["urls"] = resolved_references[:14]
 
     headers = {
         "Authorization": f"Bearer {api_key}",
+        "Accept": "application/json",
         "Content-Type": "application/json",
     }
-    poll_result_endpoint = str(os.getenv("GRSAI_DRAW_RESULT_ENDPOINT", "https://grsai.dakka.com.cn/v1/draw/result")).strip()
-    # 单次请求读超时：GRSAI 文生图/图生图一般 1~3 分钟完成，默认 3 分钟
-    _draw_timeout = float(str(os.getenv("GRSAI_DRAW_TIMEOUT_SECONDS", "180")).strip() or "180")
-    _draw_timeout = max(120.0, min(300.0, _draw_timeout))
-    max_retries = 1  # 图生图失败直接展示错误，不重试
+    timeout_seconds = float(str(os.getenv("FOURSAPI_IMAGE_TIMEOUT_SECONDS", "300")).strip() or "300")
+    timeout_seconds = max(60.0, min(600.0, timeout_seconds))
+    if resolved_references:
+        edits_endpoint = str(
+            os.getenv("FOURSAPI_IMAGE_EDITS_ENDPOINT", "https://4sapi.com/v1/images/edits")
+        ).strip()
+        return await _create_image_via_foursapi_edits(
+            api_key=api_key,
+            endpoint=edits_endpoint,
+            prompt=prompt,
+            model=draw_model,
+            size=size,
+            quality=quality,
+            output_format=output_format,
+            instructions=instructions,
+            references=resolved_references,
+        )
     try:
-        retry_base_delay = float(str(os.getenv("GRSAI_IMAGE_RETRY_DELAY_SECONDS", "8")).strip() or "8")
-    except Exception:
-        retry_base_delay = 8.0
-    retry_base_delay = max(2.0, min(60.0, retry_base_delay))
-
-    last_exc: Optional[BaseException] = None
-    for attempt in range(max_retries):
-        try:
-            async with httpx.AsyncClient(
-                timeout=httpx.Timeout(_draw_timeout, connect=30.0),
-                trust_env=True,
-            ) as client:
-                response = await client.post(endpoint, headers=headers, json=request_payload)
-                logger.info(
-                    "GRSAI draw 响应 status=%s body=%s",
-                    response.status_code,
-                    response.text[:2000],
-                )
-                if response.status_code != 200:
-                    raise RuntimeError(f"Nano Banana 调用失败：HTTP {response.status_code} {response.text}")
-                try:
-                    start_json = response.json()
-                except Exception as exc:
-                    raise RuntimeError(f"Nano Banana 返回非 JSON 响应：{response.text}") from exc
-                code = start_json.get("code")
-                if code not in (None, 0, 200):
-                    raise RuntimeError(str(start_json.get("msg") or start_json))
-                direct_urls = _extract_suchuang_image_urls(start_json)
-                preferred_direct_url = _pick_preferred_image_url(direct_urls)
-                if preferred_direct_url:
-                    return {"data": [{"url": preferred_direct_url}]}
-                data = start_json.get("data") if isinstance(start_json, dict) else {}
-                task_id = ""
-                if isinstance(data, dict):
-                    task_id = str(data.get("id") or data.get("task_id") or data.get("taskId") or "").strip()
-                if not task_id:
-                    raise RuntimeError(f"Nano Banana 未返回任务ID：{start_json}")
-                result_url = await _poll_suchuang_image_result(
-                    client,
-                    api_key,
-                    task_id,
-                    result_endpoint=poll_result_endpoint,
-                )
-                return {"data": [{"url": result_url}]}
-        except RuntimeError:
-            raise
-        except Exception as exc:
-            raise RuntimeError(f"Nano Banana 请求异常：{exc}") from exc
-    raise RuntimeError("Nano Banana 失败")
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(timeout_seconds, connect=30.0),
+            trust_env=False,
+        ) as client:
+            response = await client.post(endpoint, headers=headers, json=request_payload)
+    except Exception as exc:
+        raise RuntimeError(f"4sapi gpt-image-2 请求异常：{exc}") from exc
+    logger.info("4sapi gpt-image-2 响应 status=%s body=%s", response.status_code, response.text[:2000])
+    if response.status_code != 200:
+        raise RuntimeError(f"gpt-image-2 调用失败：HTTP {response.status_code} {response.text}")
+    try:
+        result_json = response.json()
+    except Exception as exc:
+        raise RuntimeError(f"gpt-image-2 返回非 JSON：{response.text}") from exc
+    data_list = result_json.get("data") if isinstance(result_json, dict) else None
+    if isinstance(data_list, list) and data_list:
+        first_item = data_list[0]
+        if isinstance(first_item, dict):
+            b64_value = str(first_item.get("b64_json") or "").strip()
+            if b64_value:
+                return {"data": [{"b64_json": b64_value}]}
+            direct_url = str(first_item.get("url") or "").strip()
+            if direct_url:
+                return {"data": [{"url": direct_url}]}
+    raise RuntimeError(f"gpt-image-2 未返回图片数据：{result_json}")
 
 
 def _resolve_image_aspect_ratio(payload: dict[str, Any]) -> str:
@@ -2485,7 +2515,15 @@ async def create_video(
     model_text_lower = model_text.lower()
     is_kling_model = model_text_lower.startswith("kling")
     is_seedance_model = ("seedance" in model_text_lower) or model_text_lower.startswith("doubao-seedance")
-    if is_seedance_model and model_text_lower in {"seedance2.0", "seedance2", "seedance"}:
+    if is_seedance_model and model_text_lower in {
+        "seedance2.0fast",
+        "seedance2fast",
+        "seedance2.0-fast",
+        "seedance-fast",
+        "doubao-seedance-2-0-fast",
+    }:
+        model = "doubao-seedance-2-0-fast-260128"
+    elif is_seedance_model and model_text_lower in {"seedance2.0", "seedance2", "seedance"}:
         model = "doubao-seedance-2-0-260128"
     is_kling_o1_model = model_text_lower == "kling-video-o1"
     is_video_edit_mode = bool(reference_video_url)
@@ -2504,7 +2542,7 @@ async def create_video(
                 default_kling_endpoint = "https://api-beijing.klingai.com/v1/videos/multi-image2video"
             else:
                 default_kling_endpoint = "https://api-beijing.klingai.com/v1/videos/text2video"
-    
+
     default_video_endpoint = "https://api.magic666.cn/api/v1/video/generations"
     default_seedance_endpoint = "https://ark.cn-beijing.volces.com/api/v3/contents/generations/tasks"
     configured_endpoint = str(settings.endpoint or "").strip()

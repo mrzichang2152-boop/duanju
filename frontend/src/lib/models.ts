@@ -26,9 +26,9 @@ export const extractModels = (raw: unknown): string[] => {
 };
 
 /** 前端允许展示的绘画模型白名单 */
-const ALLOWED_DRAW_MODELS = new Set(["nano-banana-2", "nano-banana-pro"]);
+const ALLOWED_DRAW_MODELS = new Set(["gpt-image-2"]);
 
-/** 从 /linkapi/models 响应中提取 GRSAI 绘画模型（kind=draw 或 id 以 nano-banana 开头），仅保留白名单模型 */
+/** 从 /linkapi/models 响应中提取图片模型，仅保留前端允许展示的白名单模型 */
 export const extractDrawModels = (raw: unknown): string[] => {
   const ordered: string[] = [];
   const seen = new Set<string>();
@@ -49,7 +49,7 @@ export const extractDrawModels = (raw: unknown): string[] => {
       const id = typeof r.id === "string" ? r.id : "";
       if (!id.trim()) continue;
       const kind = String(r.kind || "").toLowerCase();
-      if (kind === "draw" || id.toLowerCase().startsWith("nano-banana")) {
+      if (kind === "draw" || id.toLowerCase().includes("image")) {
         push(id.trim());
       }
     }
@@ -82,7 +82,8 @@ export const filterModels = (models: string[], kind: "text" | "image" | "video")
         value.includes("midjourney") ||
         value.includes("dall-e") ||
         value.includes("nano-banana") ||
-        value.includes("nanobanana")
+        value.includes("nanobanana") ||
+        value.includes("gpt-image")
       );
     }
     if (kind === "video") {
